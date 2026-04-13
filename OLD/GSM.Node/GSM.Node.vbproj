@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <!--
+      GSM.Node
+      The game server node service. Runs on any machine (Windows or Linux)
+      that hosts game servers. Exposes the REST API defined in NodeApiContract.
+
+      Microsoft.NET.Sdk.Web: includes ASP.NET Core automatically.
+      No need to add Microsoft.AspNetCore.* packages manually for .NET 8.
+
+      net8.0: targets .NET 8 runtime (cross-platform).
+      Publish separately for Windows (win-x64) and Linux (linux-x64).
+    -->
+    <OutputType>Exe</OutputType>
+    <RootNamespace></RootNamespace>
+    <AssemblyName>GSM.Node</AssemblyName>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UserSecretsId>gsm-node-secrets</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Reference the shared contracts -->
+    <ProjectReference Include="..\GSM.Contracts\GSM.Contracts.vbproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      NuGet packages.
+      Microsoft.Data.Sqlite: raw SQLite for the node's local state database.
+      Microsoft.Extensions.Hosting.WindowsServices: run as a Windows Service.
+      Microsoft.Extensions.Hosting.Systemd: integrate with Linux systemd.
+    -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="nodesettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

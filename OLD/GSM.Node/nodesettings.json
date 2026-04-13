@@ -1,0 +1,17 @@
+{
+  "Node": {
+    "AuthToken": "vOTh5VCUKiRiq2QU9YHtj3CGd9skykdIJdN4d7l06+aByuWF",
+    "Port": 8765,
+    "DataDirectory": "data",
+    "RingBufferCapacity": 10000,
+    "DefaultGracefulStopTimeoutMs": 30000
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning",
+      "Microsoft.AspNetCore.Hosting.Diagnostics": "Warning"
+    }
+  },
+  "AllowedHosts": "*"
+}

@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      GSM.Contracts
+      Contains all shared interface definitions:
+        - IGamePlugin, IAutomationRule, INotificationPlugin (plugin contracts)
+        - NodeApiContract (request/response DTOs for node REST API)
+      
+      Referenced by both GSM.Node and GSM.Manager.
+      Also referenced at runtime by Roslyn when compiling plugin .vb files -
+      plugin authors import this assembly so their code can implement the interfaces.
+      
+      Target: net8.0 (cross-platform - used by both Windows manager and Linux node)
+    -->
+    <OutputType>Library</OutputType>
+    <RootNamespace></RootNamespace>
+    <AssemblyName>GSM.Contracts</AssemblyName>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <!--
+    No explicit <Compile> items needed.
+    The .NET SDK automatically includes all .vb files in this folder.
+    No NuGet dependencies on purpose - keeping Contracts lean means
+    plugin authors don't need heavy packages just to implement an interface.
+  -->
+
+</Project>

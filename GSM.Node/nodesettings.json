@@ -1,0 +1,17 @@
+{
+  "Node": {
+    "NodeId": "",
+    "ListenPort": 8765,
+    "AuthToken": "CHANGE_ME_BEFORE_FIRST_RUN",
+    "DataDirectory": "./data",
+    "MaxConcurrentInstalls": 2,
+    "LogRetentionDays": 30,
+    "MetricsIntervalSeconds": 5
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  }
+}
