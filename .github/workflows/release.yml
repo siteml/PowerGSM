@@ -194,14 +194,29 @@ jobs:
       # "To build a project targeting Windows on this operating
       # system, set the EnableWindowsTargeting property to true."
       # On Windows runners the flag is a no-op.
+      #
+      # PublishDir overridden for the same reason as Manager on the
+      # Windows job: the pubxml's path doesn't reliably win against
+      # the SDK's RID-aware default. Lands at
+      # GSM.Node/publish/node-linux-x64/ relative to the project.
       - name: Publish Node (linux-x64)
-        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" -p:EnableWindowsTargeting=true --no-restore
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" -p:EnableWindowsTargeting=true -p:PublishDir=publish/node-linux-x64/ --no-restore
 
       # See build-windows for why -f is explicit. Linux build uses
       # the net8.0 (non-Windows) TFM — the .vbproj's <Compile Remove>
       # rule excludes the WinForms files when net8.0 is targeted.
+      #
+      # NodeDeploymentDir overridden so NodeSetup's DeployToNodeFolder
+      # target copies into the new Node publish location set above.
+      # Default in the pubxml points at the SDK-pubxml path that we
+      # just stopped using. Absolute path because relative paths
+      # would be relative to NodeSetup's project, not the workspace.
       - name: Publish NodeSetup into Node folder (linux-x64)
-        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0 -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Linux64.pubxml" --no-restore
+        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0 -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Linux64.pubxml" -p:NodeDeploymentDir=$GITHUB_WORKSPACE/GSM.Node/publish/node-linux-x64/ --no-restore
+
+      # Diagnostic listing — same rationale as the Windows job.
+      - name: List Node publish output
+        run: ls -la GSM.Node/publish/node-linux-x64/
 
       # zip is preinstalled on ubuntu-latest. Using zip rather than
       # tar.gz keeps the artifact format consistent with the Windows
@@ -209,7 +224,7 @@ jobs:
       - name: Zip Node artifact
         run: |
           version="${{ steps.version.outputs.version }}"
-          cd GSM.Node/bin/Release/net8.0/publish/linux64
+          cd GSM.Node/publish/node-linux-x64
           zip -r -9 "${GITHUB_WORKSPACE}/PowerGSM-Node-${version}-linux-x64.zip" .
 
       - name: Upload Linux artifacts
