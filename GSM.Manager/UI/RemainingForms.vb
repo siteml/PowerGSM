@@ -8,6 +8,7 @@ Imports Microsoft.Extensions.DependencyInjection
 Imports GSM.Manager
 Imports GSM.Manager.Core
 Imports GSM.Manager.Data
+Imports GSM.Node.Api
 Imports GSM.Plugin
 Imports GSM.Automation
 
@@ -57,6 +58,7 @@ Namespace GSM.Manager.UI
             _pluginListView.Columns.Add("Game ID", 150)
             _pluginListView.Columns.Add("Display Name", 200)
             _pluginListView.Columns.Add("Status", 100)
+            _pluginListView.Columns.Add("Contracts", 75)
             _pluginListView.Columns.Add("Install Methods", 180)
             Me.Controls.Add(_pluginListView)
 
@@ -83,11 +85,36 @@ Namespace GSM.Manager.UI
             Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
             If registry Is Nothing Then Return
 
+            Dim runningContracts = NodeApiContract.ContractsVersion
+
             _pluginListView.Items.Clear()
             For Each gamePlugin In registry.GetAllPlugins()
                 Dim item As New ListViewItem(gamePlugin.GameId)
                 item.SubItems.Add(gamePlugin.DisplayName)
                 item.SubItems.Add("Loaded")
+
+                ' Phase 5f-3 — declared contracts version. Renders
+                ' as a plain integer when matched, "v1 (old)" when
+                ' the plugin targets an older version than the
+                ' running manager so the user can spot a stale
+                ' plugin at a glance, and "—" when the registry
+                ' didn't record one (only happens if
+                ' GetDeclaredContractsVersion is called for a plugin
+                ' that wasn't in the last reload, which shouldn't
+                ' occur via this UI path but is handled defensively).
+                Dim declared = registry.GetDeclaredContractsVersion(gamePlugin.GameId)
+                Dim contractsCell As String
+                If declared.HasValue Then
+                    If declared.Value < runningContracts Then
+                        contractsCell = $"v{declared.Value} (old)"
+                    Else
+                        contractsCell = $"v{declared.Value}"
+                    End If
+                Else
+                    contractsCell = "—"
+                End If
+                item.SubItems.Add(contractsCell)
+
                 Dim methods = gamePlugin.GetSupportedInstallMethods()
                 item.SubItems.Add(String.Join(", ", methods.Select(Function(m) m.ToString())))
                 _pluginListView.Items.Add(item)

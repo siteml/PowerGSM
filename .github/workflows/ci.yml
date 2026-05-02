@@ -1,0 +1,44 @@
+# PowerGSM CI workflow.
+#
+# Builds the solution on every push to main and on every PR. Verifies
+# that nothing's broken without paying the cost of a full publish.
+# Pre-release validation only — Release builds and artifact zips
+# happen in release.yml on tag push.
+#
+# Windows-only because GSM.Manager is WinForms (net8.0-windows). The
+# release workflow's build-linux job exercises the cross-platform
+# Node + NodeSetup paths on tag push, so any Linux-specific build
+# breakage gets caught when it actually matters (releasing).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build solution
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore solution
+        run: dotnet restore PowerGSM.sln
+
+      # Release config so CI catches the same code paths the release
+      # workflow exercises — Debug-only build success doesn't prove
+      # the release will work, since publish toggles like
+      # PublishReadyToRun and PublishSingleFile only kick in in
+      # Release. --no-restore because restore happened above.
+      - name: Build solution
+        run: dotnet build PowerGSM.sln -c Release --no-restore --nologo

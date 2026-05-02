@@ -88,12 +88,43 @@ Namespace GSM.Manager.UI
         Private _nameLabel As Label
         Private _hostLabel As Label
         Private _statusLabel As Label
+        Private _compatLabel As Label
         Private _installationsListView As ListView
+
+        ' Cancellation source for the on-load /api/version fetch.
+        ' Tripped from Dispose so the async resumption sees the
+        ' cancellation and bails out before touching disposed
+        ' controls. Belt-and-braces: the resumption ALSO checks
+        ' Me.IsDisposed before touching any UI state.
+        '
+        ' Fully qualified type name (rather than `Imports
+        ' System.Threading`) because importing that namespace
+        ' makes `Timer` ambiguous with `System.Threading.Timer`
+        ' across the rest of this file's WinForms timers.
+        Private _versionFetchCts As System.Threading.CancellationTokenSource
 
         Public Sub New(nodeId As String)
             _nodeId = nodeId
             InitializeControls()
             LoadNodeData()
+            ' Fire-and-forget the protocol-version fetch. Constructor
+            ' returns immediately; the async method resumes on the UI
+            ' SyncContext (captured from this thread) so its label
+            ' writes don't need an explicit BeginInvoke marshal.
+            _versionFetchCts = New System.Threading.CancellationTokenSource()
+            Dim _unused = LoadProtocolVersionAsync(_versionFetchCts.Token)
+        End Sub
+
+        Protected Overrides Sub Dispose(disposing As Boolean)
+            If disposing AndAlso _versionFetchCts IsNot Nothing Then
+                Try
+                    _versionFetchCts.Cancel()
+                    _versionFetchCts.Dispose()
+                Catch
+                End Try
+                _versionFetchCts = Nothing
+            End If
+            MyBase.Dispose(disposing)
         End Sub
 
         Private Sub InitializeControls()
@@ -113,18 +144,38 @@ Namespace GSM.Manager.UI
             _statusLabel.AutoSize = True
             _statusLabel.Location = New Point(2, 75)
 
+            ' Phase 5f-2 — protocol-compatibility line. Sits
+            ' between Status and the Installations heading. Starts
+            ' as a placeholder "Checking node version..." rendered
+            ' in grey; the on-load /api/version fetch fills it in
+            ' green/yellow/red based on the comparison against
+            ' NodeApiContract.ProtocolVersion. Cap the max width so
+            ' a long mismatch message wraps instead of running off
+            ' the right edge of the header.
+            _compatLabel = New Label()
+            _compatLabel.Font = New Font("Segoe UI", 9)
+            _compatLabel.AutoSize = True
+            _compatLabel.MaximumSize = New Size(700, 0)
+            _compatLabel.Location = New Point(2, 98)
+            _compatLabel.Text = "Checking node version..."
+            _compatLabel.ForeColor = SystemColors.GrayText
+
             Dim installLabel As New Label()
             installLabel.Text = "Installations"
             installLabel.Font = New Font("Segoe UI", 11, FontStyle.Bold)
             installLabel.AutoSize = True
-            installLabel.Location = New Point(0, 110)
+            installLabel.Location = New Point(0, 130)
 
             ' Header section docked to top holds the info labels.
+            ' Height bumped from 140 to 160 to accommodate the
+            ' compat row and keep the installations heading at
+            ' the same visual offset relative to the bottom of
+            ' the header section.
             Dim header As New Panel()
             header.Dock = DockStyle.Top
-            header.Height = 140
+            header.Height = 160
             header.Controls.AddRange(New Control() {
-                _nameLabel, _hostLabel, _statusLabel, installLabel
+                _nameLabel, _hostLabel, _statusLabel, _compatLabel, installLabel
             })
 
             _installationsListView = New ListView()
@@ -180,6 +231,139 @@ Namespace GSM.Manager.UI
                 Next
             End Using
         End Sub
+
+        ''' <summary>
+        ''' Fetch the node's /api/version response, compare its
+        ''' protocol version against the manager's compiled-in
+        ''' value, render the compatibility indicator, and write
+        ''' the observed version back to the NodeEntity.
+        '''
+        ''' Five visual states:
+        '''   - In flight: "Checking node version..." (grey)
+        '''     — set by InitializeControls before this runs.
+        '''   - Connect failure: "Could not contact node" (red).
+        '''     Auth/HTTP failures end up here too because the
+        '''     unauthenticated /api/version is the easiest call
+        '''     to succeed; if it fails, the node is genuinely
+        '''     unreachable from the manager's network position.
+        '''   - Same protocol: "Protocol v{n} (compatible)" (green).
+        '''   - Manager newer: "Manager is newer than node..." (orange).
+        '''   - Node newer: "Node is newer than manager..." (orange).
+        '''
+        ''' Persistence: a successful fetch updates
+        ''' NodeEntity.LastSeenProtocolVersion in the DB so other
+        ''' consumers (future feature-gating, status panels) can
+        ''' read the cached value without a round trip. Failures
+        ''' don't clear the column — a transient outage shouldn't
+        ''' make us forget what we knew last time.
+        ''' </summary>
+        Private Async Function LoadProtocolVersionAsync(token As System.Threading.CancellationToken) As Task
+            Dim factory = ManagerProgram.Services.GetService(Of NodeHttpClientFactory)()
+            If factory Is Nothing Then Return
+
+            Dim hostAddress As String = Nothing
+            Dim port As Integer = 0
+            Dim authToken As String = Nothing
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim nodeEntity = db.Nodes.Find(_nodeId)
+                If nodeEntity Is Nothing Then Return
+                hostAddress = nodeEntity.HostAddress
+                port = nodeEntity.Port
+                authToken = nodeEntity.AuthToken
+            End Using
+
+            Dim client = factory.GetClient(_nodeId, hostAddress, port, authToken)
+
+            Dim response As NodeVersionResponse = Nothing
+            Try
+                response = Await client.GetApiVersionAsync(force:=False,
+                                                            cancellation:=token)
+            Catch ex As OperationCanceledException
+                ' Panel disposed mid-flight — nothing to render.
+                Return
+            Catch ex As Exception
+                ' Connection or API failure. Surface as red on the
+                ' panel; don't propagate — a transient failure
+                ' shouldn't crash the panel host.
+            End Try
+
+            If token.IsCancellationRequested OrElse Me.IsDisposed Then Return
+
+            ApplyCompatLabel(response)
+
+            ' Persist back to the DB so a future feature-gating
+            ' check (or another panel render) doesn't have to wait
+            ' on a round trip. Wrapped in Try — a stale entity row
+            ' or DB write failure shouldn't take the panel down.
+            If response IsNot Nothing Then
+                Try
+                    Using scope = ManagerProgram.Services.CreateScope()
+                        Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                        Dim nodeEntity = db.Nodes.Find(_nodeId)
+                        If nodeEntity IsNot Nothing AndAlso
+                           nodeEntity.LastSeenProtocolVersion <> response.ProtocolVersion Then
+                            nodeEntity.LastSeenProtocolVersion = response.ProtocolVersion
+                            db.SaveChanges()
+                        End If
+                    End Using
+                Catch
+                End Try
+            End If
+        End Function
+
+        ''' <summary>
+        ''' Render the compat indicator from a /api/version
+        ''' response (or Nothing on connect failure). Pulled out
+        ''' so the rendering logic is unit-testable in spirit
+        ''' even if no test harness exists yet.
+        ''' </summary>
+        Private Sub ApplyCompatLabel(response As NodeVersionResponse)
+            If response Is Nothing Then
+                _compatLabel.Text = "Could not contact node (connection or version endpoint failure)"
+                _compatLabel.ForeColor = Color.Firebrick
+                Return
+            End If
+
+            Dim managerProtocol = NodeApiContract.ProtocolVersion
+            Dim nodeProtocol = response.ProtocolVersion
+
+            If nodeProtocol = managerProtocol Then
+                _compatLabel.Text = $"Protocol v{nodeProtocol} (compatible) — node build {SafeBuild(response)}"
+                _compatLabel.ForeColor = Color.DarkGreen
+            ElseIf managerProtocol > nodeProtocol Then
+                ' Treat zero specially: a pre-5f-1 node didn't carry
+                ' protocolVersion in /api/version at all, and JSON
+                ' deserialised the missing field as 0. Friendlier
+                ' to say so explicitly than to render "Node v0".
+                If nodeProtocol = 0 Then
+                    _compatLabel.Text =
+                        "Node is older than this manager (no protocol version reported) — some features may not work."
+                Else
+                    _compatLabel.Text =
+                        $"Node is older than this manager (Manager v{managerProtocol}, Node v{nodeProtocol}) — some features may not work."
+                End If
+                _compatLabel.ForeColor = Color.DarkOrange
+            Else
+                _compatLabel.Text =
+                    $"Node is newer than this manager (Manager v{managerProtocol}, Node v{nodeProtocol}) — newer node features won't be used."
+                _compatLabel.ForeColor = Color.DarkOrange
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Read the build version off a NodeVersionResponse,
+        ''' preferring the new "build" field but falling back to
+        ''' the legacy "version" alias for pre-5f-1 nodes that
+        ''' only populate the latter. Returns "unknown" only when
+        ''' both fields are empty.
+        ''' </summary>
+        Private Shared Function SafeBuild(response As NodeVersionResponse) As String
+            If response Is Nothing Then Return "unknown"
+            If Not String.IsNullOrEmpty(response.Build) Then Return response.Build
+            If Not String.IsNullOrEmpty(response.Version) Then Return response.Version
+            Return "unknown"
+        End Function
 
         ''' <summary>
         ''' Compact version string for the at-a-glance Version column.

@@ -43,6 +43,27 @@ Namespace GSM.Manager.Data
         ''' </summary>
         Public Property MaxConcurrentRestarts As Integer = 0
 
+        ''' <summary>
+        ''' Phase 5f-2 — last protocol version observed from this
+        ''' node's /api/version response. Cached in the DB so the
+        ''' Manager can render the protocol-compatibility indicator
+        ''' on a node-detail panel without waiting for a fresh
+        ''' round trip every time the panel opens.
+        '''
+        ''' Nullable: Nothing until the Manager has successfully
+        ''' contacted the node since this column was added (or
+        ''' since the node entity was created). Compared against
+        ''' GSM.Node.Api.NodeApiContract.ProtocolVersion to decide
+        ''' the indicator state. Same = silent, Manager newer =
+        ''' yellow, Node newer = yellow, contact failure = red.
+        '''
+        ''' Refreshed on every successful /api/version call (cheap
+        ''' — the endpoint is unauthenticated and returns a small
+        ''' JSON body), so a node upgraded out from under the
+        ''' Manager is detected at most one panel-open later.
+        ''' </summary>
+        Public Property LastSeenProtocolVersion As Integer?
+
         Public Overridable Property Installations As ICollection(Of InstallationEntity)
     End Class
 

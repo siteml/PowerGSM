@@ -1,6 +1,7 @@
 Imports System
 Imports System.Collections.Concurrent
 Imports System.Collections.Generic
+Imports System.Reflection
 Imports System.Threading
 Imports System.Windows.Forms
 Imports Microsoft.EntityFrameworkCore
@@ -8,6 +9,7 @@ Imports Microsoft.Extensions.DependencyInjection
 Imports Microsoft.Extensions.Logging
 Imports GSM.Manager.Data
 Imports GSM.Manager.Core
+Imports GSM.Node.Api
 Imports GSM.Plugin
 
 ' ============================================================
@@ -107,6 +109,32 @@ Namespace GSM.Manager
 
             ' Build provider
             Services = serviceCollection.BuildServiceProvider()
+
+            ' Self-identifying startup line. Reads this assembly's
+            ' InformationalVersion (set indirectly via
+            ' Directory.Build.props' Version property) and emits a
+            ' Manager-version line at Information level so log files
+            ' name what produced them. Useful when diagnosing issues
+            ' across mixed Manager/Node versions — the file says
+            ' "GSM.Manager 0.1.0 starting" before any other activity.
+            ' Logging extension methods require Imports
+            ' Microsoft.Extensions.Logging which is already present.
+            Try
+                Dim bootstrapLogger = Services.
+                    GetRequiredService(Of ILoggerFactory)().
+                    CreateLogger("GSM.Manager")
+                Dim asm = GetType(ManagerRingBufferStore).Assembly
+                Dim infoAttr = asm.GetCustomAttribute(Of AssemblyInformationalVersionAttribute)()
+                Dim build As String = If(infoAttr?.InformationalVersion,
+                                          asm.GetName().Version?.ToString(3))
+                If String.IsNullOrEmpty(build) Then build = "0.0.0"
+                bootstrapLogger.LogInformation(
+                    "GSM.Manager {Build} starting (Protocol v{Protocol}, Contracts v{Contracts})",
+                    build, NodeApiContract.ProtocolVersion,
+                    NodeApiContract.ContractsVersion)
+            Catch
+                ' Logging failure must never block startup.
+            End Try
 
             ' Ensure database is up-to-date with current schema.
             ' Migrate() applies any pending EF migrations — creates

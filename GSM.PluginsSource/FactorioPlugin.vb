@@ -1,3 +1,4 @@
+' <RequiresContracts: 1>
 Imports System
 Imports System.Collections.Generic
 Imports System.IO

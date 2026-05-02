@@ -34,6 +34,18 @@ Namespace GSM.Manager.Core
         Private ReadOnly _baseUrl As String
         Private ReadOnly _logger As ILogger(Of NodeHttpClient)
 
+        ' Phase 5f-2 — in-memory cache of the last successful
+        ' /api/version response. Hits are silent (no log spam),
+        ' misses re-query. The cache is per-client-instance and
+        ' lives as long as the factory keeps the client alive
+        ' (see NodeHttpClientFactory: clients are evicted only on
+        ' RemoveClient calls). Lock guards the read-modify-write
+        ' against concurrent callers — the panel may issue an
+        ' on-load fetch while a background poller is also
+        ' refreshing.
+        Private _cachedVersion As NodeVersionResponse
+        Private ReadOnly _versionLock As New Object()
+
         Public Sub New(hostAddress As String, port As Integer,
                        authToken As String,
                        logger As ILogger(Of NodeHttpClient))
@@ -69,6 +81,57 @@ Namespace GSM.Manager.Core
             Catch ex As Exception
                 Throw WrapException("Authenticate", ex)
             End Try
+        End Function
+
+        ''' <summary>
+        ''' Hit the unauthenticated /api/version endpoint and
+        ''' return the node's identity + version axes. Caches the
+        ''' result in-memory so a typical UI flow (panel opens,
+        ''' fetches version, renders compat indicator) doesn't
+        ''' re-hit the wire on every navigation. Pass force=True
+        ''' to bypass the cache — e.g. when the user has reason
+        ''' to believe the node was upgraded out from under us.
+        '''
+        ''' Failure modes are reported as NodeConnectionException
+        ''' (network/host issue) or NodeApiException (HTTP-level
+        ''' problem) via WrapException, so callers can disambiguate
+        ''' "node is offline" from "node returned 500". The cache
+        ''' is populated only on success, so a transient failure
+        ''' doesn't poison subsequent calls.
+        ''' </summary>
+        Public Async Function GetApiVersionAsync(force As Boolean,
+                                                  cancellation As CancellationToken) As Task(Of NodeVersionResponse) Implements INodeClient.GetApiVersionAsync
+            If Not force Then
+                SyncLock _versionLock
+                    If _cachedVersion IsNot Nothing Then Return _cachedVersion
+                End SyncLock
+            End If
+            Try
+                Dim fresh = Await _httpClient.GetFromJsonAsync(Of NodeVersionResponse)(
+                    "/api/version", cancellation)
+                If fresh IsNot Nothing Then
+                    SyncLock _versionLock
+                        _cachedVersion = fresh
+                    End SyncLock
+                End If
+                Return fresh
+            Catch ex As Exception
+                Throw WrapException("GetApiVersion", ex)
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Synchronous accessor for the in-memory version cache.
+        ''' Returns Nothing until GetApiVersionAsync has succeeded
+        ''' at least once on this client. Used by feature-gating
+        ''' logic that needs to make decisions without an awaited
+        ''' round trip — e.g. a button's Enabled state computed at
+        ''' menu-render time.
+        ''' </summary>
+        Public Function TryGetCachedVersion() As NodeVersionResponse
+            SyncLock _versionLock
+                Return _cachedVersion
+            End SyncLock
         End Function
 
         ' ---- Instance lifecycle ----

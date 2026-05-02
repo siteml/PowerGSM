@@ -1,0 +1,60 @@
+<!--
+  ============================================================
+   Directory.Build.props — solution-wide build properties
+
+   MSBuild auto-imports this file into every project under the
+   solution root, so each project (Contracts, Node, Manager,
+   CtrlCSender, NodeSetup) inherits the same version stamps.
+   Bumping the build version is a one-edit-one-file operation.
+
+   See VERSIONING.md for the policy that drives the values
+   below and the procedure for bumping them across releases.
+  ============================================================ -->
+<Project>
+
+  <PropertyGroup>
+
+    <!--
+      Version (and via SDK fallback PackageVersion +
+      InformationalVersion) carries the public 0.MINOR.PATCH
+      string. This is what humans cite. Bumps every release.
+
+      InformationalVersion is intentionally NOT set explicitly
+      here. The .NET SDK derives it from <Version> and, when
+      the build runs inside a git repo with SourceRevisionId
+      populated, appends "+<git-short-sha>". That gives us a
+      diagnostic build identifier without us having to manage
+      it by hand. The Manager's About dialog and the Node's
+      /api/version response strip the "+sha" suffix for clean
+      display while keeping the raw string available in logs.
+    -->
+    <Version>0.1.0</Version>
+
+    <!--
+      AssemblyVersion is what Assembly.GetName().Version
+      returns at runtime. .NET convention is MAJOR.MINOR.0.0:
+      it bumps only on MINOR (and eventually MAJOR), not on
+      every PATCH. Keeping it stable across PATCH releases
+      means a binding-redirect-aware host (we have none today,
+      but plugins compiled against Contracts via Roslyn arguably
+      qualify) doesn't see a "different" assembly on a bug-fix
+      release. Strong-naming would care about this; we don't
+      sign, but the convention is free.
+
+      At 0.1.x this stays 0.1.0.0. At 0.2.0 it becomes 0.2.0.0
+      and remains there for 0.2.1, 0.2.2, ...
+    -->
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+
+    <!--
+      FileVersion is the Win32 FILEVERSION resource. Bumps with
+      every release including PATCH so users can tell builds
+      apart by right-clicking the EXE → Details. Four parts
+      because Windows requires four; the trailing .0 is just
+      padding for the public 3-part version.
+    -->
+    <FileVersion>0.1.0.0</FileVersion>
+
+  </PropertyGroup>
+
+</Project>

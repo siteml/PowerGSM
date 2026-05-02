@@ -3,6 +3,30 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
+
+    <!--
+      RuntimeIdentifiers must list every RID this project may be
+      published as, so NuGet restore generates a TFM/RID slot for
+      each in obj/project.assets.json. Without this, GSM.Node's
+      PublishCtrlCSender target (which calls MSBuild on this
+      project with RuntimeIdentifier=win-x64) fails with:
+
+        Assets file ...project.assets.json doesn't have a target
+        for 'net8.0/win-x64'.
+
+      The CLI form `dotnet publish -r win-x64` happens to work
+      anyway because that command does a transitive restore with
+      the RID applied across all references; VS's UI Publish and
+      other paths that skip the upfront restore-with-RID don't
+      compensate, so the slot has to be there ahead of time.
+
+      The helper is Windows-only at runtime (P/Invokes kernel32
+      console APIs that have no Linux analogue) so win-x64 is
+      the only RID that matters today. If we ever need a Linux
+      variant of the helper, add the RID here.
+    -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+
     <RootNamespace></RootNamespace>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>

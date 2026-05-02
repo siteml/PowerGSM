@@ -2,6 +2,7 @@ Imports System
 Imports System.Diagnostics
 Imports System.Drawing
 Imports System.Linq
+Imports System.Reflection
 Imports System.Text.Json
 Imports System.Threading.Tasks
 Imports System.Windows.Forms
@@ -44,6 +45,7 @@ Namespace GSM.Manager.UI
         Private _menuStrip As MenuStrip
         Private _statusStrip As StatusStrip
         Private _statusLabel As ToolStripStatusLabel
+        Private _versionStatusLabel As ToolStripStatusLabel
 
         ' ---- Tree root nodes ----
         Private _nodesRoot As TreeNode
@@ -150,14 +152,44 @@ Namespace GSM.Manager.UI
             toolsMenu.DropDownItems.Add(settingsItem)
 
             _menuStrip.Items.AddRange(New ToolStripItem() {fileMenu, nodesMenu, toolsMenu})
+
+            ' Help menu added in 5f-1 alongside the About dialog.
+            ' Help is conventionally the rightmost top-level menu so
+            ' it goes last. About... is the only item for now;
+            ' future entries (online docs, check for updates, report
+            ' a bug) can join it without restructuring.
+            Dim helpMenu As New ToolStripMenuItem("&Help")
+            Dim aboutItem As New ToolStripMenuItem("&About PowerGSM...", Nothing,
+                Sub(s, e) OnAbout())
+            helpMenu.DropDownItems.Add(aboutItem)
+            _menuStrip.Items.Add(helpMenu)
+
             Me.MainMenuStrip = _menuStrip
 
             ' ---- Status bar ----
+            ' Two labels: a left-aligned spring label that fills
+            ' available width and carries the rolling status
+            ' message, and a right-aligned fixed label showing the
+            ' app version for passive visibility ("what version am
+            ' I running?" without opening Help → About). Order
+            ' matters: the spring label must be added FIRST so the
+            ' version label sits to its right.
             _statusStrip = New StatusStrip()
             _statusLabel = New ToolStripStatusLabel("Ready")
             _statusLabel.Spring = True
             _statusLabel.TextAlign = ContentAlignment.MiddleLeft
             _statusStrip.Items.Add(_statusLabel)
+
+            _versionStatusLabel = New ToolStripStatusLabel(GetVersionStatusText())
+            _versionStatusLabel.Spring = False
+            _versionStatusLabel.TextAlign = ContentAlignment.MiddleRight
+            _versionStatusLabel.ForeColor = SystemColors.GrayText
+            ' Single-click on the version label opens the About
+            ' dialog — a conventional shortcut for users who notice
+            ' the version and want a fuller view (protocol/contracts
+            ' axes, git SHA, blurb).
+            AddHandler _versionStatusLabel.Click, Sub(s, e) OnAbout()
+            _statusStrip.Items.Add(_versionStatusLabel)
 
             ' ---- Split container ----
             ' Setting MinSize/SplitterDistance values at construction
@@ -537,6 +569,45 @@ Namespace GSM.Manager.UI
 
         Public Sub SetStatus(text As String)
             _statusLabel.Text = text
+        End Sub
+
+        ''' <summary>
+        ''' Compose the right-aligned version label for the status
+        ''' bar. Reads the build version off this assembly via
+        ''' AssemblyInformationalVersion (set indirectly by
+        ''' Directory.Build.props' Version property), strips any
+        ''' "+sha" suffix the SDK appends in source-linked builds,
+        ''' and prefixes "v" so the label reads e.g. "v0.1.0".
+        ''' Falls back through AssemblyVersion to a literal
+        ''' "v0.0.0" so the label is always present.
+        ''' </summary>
+        Private Function GetVersionStatusText() As String
+            Try
+                Dim asm = Assembly.GetExecutingAssembly()
+                Dim infoAttr = asm.GetCustomAttribute(Of AssemblyInformationalVersionAttribute)()
+                Dim raw As String = Nothing
+                If infoAttr IsNot Nothing Then raw = infoAttr.InformationalVersion
+                If String.IsNullOrEmpty(raw) Then
+                    raw = asm.GetName().Version?.ToString(3)
+                End If
+                If String.IsNullOrEmpty(raw) Then Return "v0.0.0"
+                Dim plus = raw.IndexOf("+"c)
+                If plus >= 0 Then raw = raw.Substring(0, plus)
+                Return "v" & raw
+            Catch
+                Return "v0.0.0"
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Open the modal Help → About dialog. Reachable from the
+        ''' Help menu and from clicking the version label in the
+        ''' status bar.
+        ''' </summary>
+        Private Sub OnAbout()
+            Using dlg As New AboutForm()
+                dlg.ShowDialog(Me)
+            End Using
         End Sub
 
         ' ============================================================

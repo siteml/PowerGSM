@@ -1,0 +1,266 @@
+# PowerGSM release workflow.
+#
+# Triggered by pushing a v*.*.* tag. Builds Manager + Node + NodeSetup
+# (Windows) and Node + NodeSetup (Linux), zips them, and creates a
+# GitHub Release with the matching CHANGELOG section as release notes.
+#
+# Versioning lives in Directory.Build.props at the solution root —
+# bump there BEFORE tagging. The tag is the trigger, not the source
+# of version metadata: assemblies stamp from Directory.Build.props,
+# and this workflow only uses the tag to derive zip filenames and
+# the CHANGELOG section to extract.
+#
+# See VERSIONING.md for the full release procedure.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  # Needed by softprops/action-gh-release to create the Release entry
+  # and upload assets. Read access to the repo content is the implicit
+  # default; we add write here for the release surface only.
+  contents: write
+
+jobs:
+  # ============================================================
+  #  Windows artifacts: Manager + Node (win-x64)
+  #
+  #  Manager requires Windows because of WinForms. Node is built
+  #  here too (rather than only on Linux) because Node's publish
+  #  pulls in the win-x64 self-contained CtrlCSender helper, and
+  #  the CtrlCSender source is Windows-only (P/Invokes kernel32).
+  # ============================================================
+  build-windows:
+    name: Build Windows artifacts
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Determine version from tag
+        id: version
+        # Bash on Windows runner — git-bash is preinstalled and
+        # understood by GitHub Actions when shell: bash is set.
+        # Strips the leading "v" so the tag "v0.1.0" yields "0.1.0",
+        # which is what the assembly version and zip filenames expect.
+        shell: bash
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # Restore the whole solution once. Each subsequent publish uses
+      # --no-restore to skip redundant restores. Restore-on-publish
+      # would also work, but doing it once at the top makes failures
+      # easier to attribute to a single step.
+      - name: Restore solution
+        run: dotnet restore PowerGSM.sln
+
+      # Order matters here: Node publishes FIRST so its publish folder
+      # exists. NodeSetup's Win64.pubxml then copies itself into Node's
+      # publish folder via the DeployToNodeFolder MSBuild target. Doing
+      # NodeSetup first would either silently no-op the copy (folder
+      # missing) or fail outright depending on MSBuild's mood that day.
+      # PublishProfileFullPath rather than PublishProfile because
+      # the SDK's PublishProfile search path is hardcoded to
+      # Properties\PublishProfiles\, but VB.NET projects keep their
+      # pubxml files under My Project\PublishProfiles\. Visual
+      # Studio passes the full path explicitly when publishing from
+      # the IDE, so VS works fine. CLI publish needs the explicit
+      # path or it silently falls back to framework defaults
+      # (NETSDK1198 warning, but build still "succeeds" with the
+      # wrong shape — no SelfContained, no PublishSingleFile, etc.).
+      - name: Publish Node (win-x64)
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/winx64.pubxml" --no-restore
+
+      # NodeSetup is multi-targeted (net8.0;net8.0-windows). The SDK's
+      # CrossTargeting check fires BEFORE the pubxml's TargetFramework
+      # is read, so even though Win64.pubxml says net8.0-windows, the
+      # CLI errors with NETSDK1129 unless we pass -f explicitly.
+      - name: Publish NodeSetup into Node folder (win-x64)
+        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0-windows -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Win64.pubxml" --no-restore
+
+      - name: Publish Manager (win-x64)
+        run: dotnet publish GSM.Manager/GSM.Manager.vbproj -p:PublishProfileFullPath="GSM.Manager/My Project/PublishProfiles/FolderProfile.pubxml" --no-restore
+
+      # PowerShell's Compress-Archive zips the directory's CONTENTS when
+      # the path ends with \*. The zip therefore unpacks flat (no
+      # PowerGSM-Node-0.1.0-win-x64\ wrapper folder), which is what
+      # users expect for a "drop next to your install dir" deploy.
+      - name: Zip Node artifact
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          Compress-Archive `
+            -Path "GSM.Node\bin\Release\net8.0\publish\*" `
+            -DestinationPath "PowerGSM-Node-$version-win-x64.zip" `
+            -CompressionLevel Optimal
+
+      - name: Zip Manager artifact
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          Compress-Archive `
+            -Path "GSM.Manager\bin\Release\net8.0-windows\publish\win-x64\*" `
+            -DestinationPath "PowerGSM-Manager-$version-win-x64.zip" `
+            -CompressionLevel Optimal
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            PowerGSM-Node-*-win-x64.zip
+            PowerGSM-Manager-*-win-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ============================================================
+  #  Linux artifacts: Node (linux-x64) only
+  #
+  #  No Manager on Linux — WinForms is Windows-only and the Manager
+  #  is the WinForms half of the system. Linux users run the Node
+  #  service alone, managed remotely by a Windows Manager.
+  # ============================================================
+  build-linux:
+    name: Build Linux artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Determine version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # Restore only the projects this job will touch. A solution-wide
+      # restore on Linux pulls in WinForms reference assemblies just
+      # to satisfy GSM.Manager's restore graph, which works but adds
+      # noise. Per-project restore keeps logs clean.
+      - name: Restore Node + NodeSetup
+        run: |
+          dotnet restore GSM.Node/GSM.Node.vbproj
+          dotnet restore GSM.NodeSetup/GSM.NodeSetup.vbproj
+
+      # See build-windows for the rationale on PublishProfileFullPath.
+      - name: Publish Node (linux-x64)
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" --no-restore
+
+      # See build-windows for why -f is explicit. Linux build uses
+      # the net8.0 (non-Windows) TFM — the .vbproj's <Compile Remove>
+      # rule excludes the WinForms files when net8.0 is targeted.
+      - name: Publish NodeSetup into Node folder (linux-x64)
+        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0 -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Linux64.pubxml" --no-restore
+
+      # zip is preinstalled on ubuntu-latest. Using zip rather than
+      # tar.gz keeps the artifact format consistent with the Windows
+      # zips, so users on either OS unpack with the same tool.
+      - name: Zip Node artifact
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          cd GSM.Node/bin/Release/net8.0/publish/linux64
+          zip -r -9 "${GITHUB_WORKSPACE}/PowerGSM-Node-${version}-linux-x64.zip" .
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: PowerGSM-Node-*-linux-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ============================================================
+  #  Release: download both artifact sets, extract changelog
+  #  section, create the GitHub Release.
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        # Needed for CHANGELOG.md — the artifacts don't include it.
+        uses: actions/checkout@v4
+
+      - name: Determine version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # Extract the section under "## [VERSION]" up to (but not
+      # including) the next "## [". Output goes into a multi-line
+      # output variable using GitHub Actions' heredoc syntax.
+      #
+      # awk logic:
+      #   On any "## [" heading line:
+      #     - If we already found our section, exit (we hit the
+      #       NEXT section, so we're done).
+      #     - Else if this heading is our target version, set the
+      #       flag and skip printing the heading itself (release
+      #       page shows the version in its title; duplicating it
+      #       in the body would look silly).
+      #     - Else skip — we haven't reached our section yet.
+      #   For all other lines: print iff the flag is set.
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          notes=$(awk -v v="$version" '
+            /^## \[/ {
+              if (found) exit
+              if ($2 == "[" v "]") { found = 1; next }
+              next
+            }
+            found
+          ' CHANGELOG.md)
+          if [ -z "$notes" ]; then
+            echo "ERROR: No '## [$version]' section found in CHANGELOG.md" >&2
+            echo "Add a section for $version before tagging the release." >&2
+            exit 1
+          fi
+          {
+            echo "notes<<CHANGELOG_EOF"
+            echo "$notes"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        # Sanity log so a failed upload step has a paper trail
+        # showing what was actually present in artifacts/ before
+        # the release call.
+        run: ls -la artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: PowerGSM ${{ steps.version.outputs.version }}
+          body: ${{ steps.changelog.outputs.notes }}
+          files: |
+            artifacts/PowerGSM-Manager-*.zip
+            artifacts/PowerGSM-Node-*.zip
+          draft: false
+          # Tags containing a hyphen (0.1.0-rc1, 0.2.0-beta) are
+          # marked pre-release. GitHub's UI surfaces these
+          # differently from full releases; users browsing
+          # /releases see the latest stable highlighted.
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          fail_on_unmatched_files: true

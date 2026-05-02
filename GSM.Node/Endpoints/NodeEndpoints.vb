@@ -1,5 +1,6 @@
 Imports System
 Imports System.IO
+Imports System.Reflection
 Imports Microsoft.AspNetCore.Builder
 Imports Microsoft.AspNetCore.Http
 Imports Microsoft.Extensions.Logging
@@ -22,13 +23,30 @@ Namespace GSM.Node.Endpoints
 
         Public Sub Map(app As WebApplication)
 
-            ' Version — unauthenticated, used as health check
+            ' Version — unauthenticated, used as health check.
+            '
+            ' Returns three version axes:
+            '   - build:            human-cited 0.MINOR.PATCH from
+            '                       Directory.Build.props
+            '   - protocolVersion:  Manager↔Node REST contract integer
+            '   - contractsVersion: plugin-facing types integer
+            '
+            ' The legacy 'version' field carries the same string as
+            ' 'build' so any pre-5f-1 Manager that only knew about
+            ' 'version' still gets a usable answer. The build string
+            ' strips any '+sha' suffix that the SDK appends to
+            ' InformationalVersion when SourceRevisionId is set, so
+            ' the wire format stays clean for matching across builds.
             app.MapGet("/api/version",
                 Function() As IResult
+                    Dim asm = GetType(ProcessManager).Assembly
+                    Dim build As String = ReadBuildVersion(asm)
                     Return Results.Ok(New With {
                         .application = "PowerGSM.Node",
-                        .version = GetType(ProcessManager).Assembly.
-                            GetName().Version?.ToString(),
+                        .version = build,
+                        .build = build,
+                        .protocolVersion = NodeApiContract.ProtocolVersion,
+                        .contractsVersion = NodeApiContract.ContractsVersion,
                         .runtime = System.Runtime.InteropServices.
                             RuntimeInformation.FrameworkDescription
                     })
@@ -61,6 +79,49 @@ Namespace GSM.Node.Endpoints
                 End Function)
 
         End Sub
+
+        ''' <summary>
+        ''' Read the build version off an assembly for /api/version.
+        ''' Prefers AssemblyInformationalVersion (clean SemVer string
+        ''' set by Directory.Build.props' Version property) over
+        ''' AssemblyVersion (which is MAJOR.MINOR.0.0 by .NET
+        ''' convention so it's stable across PATCH releases and
+        ''' therefore a less informative wire identity). Strips the
+        ''' "+gitsha" suffix the SDK appends when SourceRevisionId
+        ''' is populated — the SHA is useful in logs but noisy on
+        ''' the wire and confuses simple version-string equality
+        ''' checks. Falls back to AssemblyVersion if the
+        ''' Informational attribute is missing for any reason, then
+        ''' to "0.0.0" as a last resort so callers always get a
+        ''' string back.
+        ''' </summary>
+        Private Function ReadBuildVersion(asm As Assembly) As String
+            Try
+                Dim infoAttr = asm.GetCustomAttribute(Of AssemblyInformationalVersionAttribute)()
+                If infoAttr IsNot Nothing AndAlso
+                   Not String.IsNullOrEmpty(infoAttr.InformationalVersion) Then
+                    Dim v = infoAttr.InformationalVersion
+                    Dim plus = v.IndexOf("+"c)
+                    If plus >= 0 Then v = v.Substring(0, plus)
+                    Return v
+                End If
+            Catch
+                ' Reflection failed; fall through to the next source.
+            End Try
+
+            Try
+                Dim ver = asm.GetName().Version
+                If ver IsNot Nothing Then
+                    ' ToString(3) gives MAJOR.MINOR.BUILD without the
+                    ' trailing .REVISION zero — looks more like the
+                    ' 0.MINOR.PATCH the user expects.
+                    Return ver.ToString(3)
+                End If
+            Catch
+            End Try
+
+            Return "0.0.0"
+        End Function
 
     End Module
 

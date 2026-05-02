@@ -1,5 +1,6 @@
 Imports System
 Imports System.IO
+Imports System.Reflection
 Imports System.Threading.Tasks
 Imports Microsoft.AspNetCore.Builder
 Imports Microsoft.AspNetCore.Hosting
@@ -9,6 +10,7 @@ Imports Microsoft.Extensions.DependencyInjection
 Imports Microsoft.Extensions.Hosting
 Imports Microsoft.Extensions.Logging
 Imports Microsoft.Data.Sqlite
+Imports GSM.Node.Api
 Imports GSM.Node.Security
 
 ' ============================================================
@@ -219,6 +221,32 @@ Namespace GSM.Node
                 lifetime.ApplicationStarted.Register(
                     Sub() SetConsoleCtrlHandler(_consoleCtrlHandler, True))
             End If
+
+            ' Self-identifying startup line so log files name what
+            ' produced them. Logged at Information so it survives
+            ' the Microsoft/System -> Warning category clamp above.
+            ' The build string is read off this assembly's
+            ' InformationalVersion attribute (set indirectly via
+            ' Directory.Build.props' Version property), with the
+            ' "+gitsha" suffix the SDK appends in source-linked
+            ' builds preserved here — in logs the SHA is useful for
+            ' diagnosis even though /api/version strips it.
+            Try
+                Dim startupLogger = app.Services.
+                    GetRequiredService(Of ILoggerFactory)().
+                    CreateLogger("GSM.Node")
+                Dim asm = GetType(NodeConfiguration).Assembly
+                Dim infoAttr = asm.GetCustomAttribute(Of AssemblyInformationalVersionAttribute)()
+                Dim build As String = If(infoAttr?.InformationalVersion,
+                                          asm.GetName().Version?.ToString(3))
+                If String.IsNullOrEmpty(build) Then build = "0.0.0"
+                startupLogger.LogInformation(
+                    "GSM.Node {Build} starting (Protocol v{Protocol}, Contracts v{Contracts}) on port {Port}",
+                    build, NodeApiContract.ProtocolVersion,
+                    NodeApiContract.ContractsVersion, nodeConfig.ListenPort)
+            Catch
+                ' Logging failure must never block startup.
+            End Try
 
             app.Run()
 

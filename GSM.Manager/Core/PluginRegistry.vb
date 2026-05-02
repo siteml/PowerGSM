@@ -5,11 +5,13 @@ Imports System.IO
 Imports System.Linq
 Imports System.Reflection
 Imports System.Runtime.Loader
+Imports System.Text.RegularExpressions
 Imports System.Threading
 Imports Microsoft.CodeAnalysis
 Imports Microsoft.CodeAnalysis.VisualBasic
 Imports Microsoft.Extensions.Logging
 Imports Basic.Reference.Assemblies
+Imports GSM.Node.Api
 Imports GSM.Plugin
 
 ' ============================================================
@@ -60,10 +62,31 @@ Namespace GSM.Manager.Core
 
         Private ReadOnly _plugins As New ConcurrentDictionary(Of String, IGamePlugin)
         Private ReadOnly _pluginStatuses As New ConcurrentDictionary(Of String, PluginLoadStatus)
+
+        ' Phase 5f-3 — declared contracts version per loaded
+        ' plugin, keyed by GameId. Populated when a plugin loads
+        ' successfully (its `' <RequiresContracts: N>' magic
+        ' comment was parsed and either matched the running
+        ' version exactly or was older). Cleared on every reload
+        ' alongside _plugins. Used by the Plugin Status form to
+        ' show the declared version next to each loaded plugin
+        ' so users can spot "Loaded but old" cases at a glance.
+        Private ReadOnly _declaredContractsByGameId As New ConcurrentDictionary(Of String, Integer)
+
         Private ReadOnly _logger As ILogger(Of PluginRegistry)
         Private ReadOnly _pluginsDirectory As String
         Private _loadContext As AssemblyLoadContext
         Private ReadOnly _lockObj As New Object()
+
+        ' Phase 5f-3 — magic-comment regex. Matches at any line
+        ' position, captures the version integer. Whitespace
+        ' tolerant (`'  <RequiresContracts:  42>` is fine), but
+        ' case-sensitive on the keyword to keep things
+        ' predictable. Compiled once because ReloadAll runs once
+        ' per plugin source on every reload.
+        Private Shared ReadOnly s_RequiresContractsRegex As _
+            New Regex("'\s*<RequiresContracts\s*:\s*(\d+)\s*>",
+                      RegexOptions.Compiled)
 
         Public Sub New(logger As ILogger(Of PluginRegistry),
                        Optional pluginsDirectory As String = Nothing)
@@ -104,6 +127,44 @@ Namespace GSM.Manager.Core
             Return _plugins.Keys.ToList()
         End Function
 
+        ''' <summary>
+        ''' Phase 5f-3 — returns the contracts version a loaded
+        ''' plugin declared via its `' &lt;RequiresContracts: N&gt;'
+        ''' magic comment, or Nothing if the plugin isn't loaded
+        ''' or didn't declare a version. Used by the Plugin Status
+        ''' form to render the per-plugin Contracts column.
+        ''' </summary>
+        Public Function GetDeclaredContractsVersion(gameId As String) As Integer?
+            If String.IsNullOrEmpty(gameId) Then Return Nothing
+            Dim result As Integer
+            If _declaredContractsByGameId.TryGetValue(gameId, result) Then Return result
+            Return Nothing
+        End Function
+
+        ''' <summary>
+        ''' Parse the `' &lt;RequiresContracts: N&gt;' magic comment
+        ''' from a plugin source file's text. Returns the captured
+        ''' integer when found, Nothing when absent. Multiple
+        ''' matches return the FIRST occurrence — plugins should
+        ''' put the comment near the top, but we don't enforce
+        ''' position so an unusually-structured plugin still works.
+        '''
+        ''' Cheap enough to call before invoking Roslyn so we can
+        ''' fail fast on a too-new declaration without paying the
+        ''' compile cost. Pulled out as a private helper rather
+        ''' than inlined so the parsing convention has one place
+        ''' to live, in case the format ever evolves (e.g. adding
+        ''' a min/max range).
+        ''' </summary>
+        Private Shared Function ParseRequiresContractsVersion(sourceText As String) As Integer?
+            If String.IsNullOrEmpty(sourceText) Then Return Nothing
+            Dim match = s_RequiresContractsRegex.Match(sourceText)
+            If Not match.Success Then Return Nothing
+            Dim parsed As Integer
+            If Integer.TryParse(match.Groups(1).Value, parsed) Then Return parsed
+            Return Nothing
+        End Function
+
         ' ============================================================
         '  Load / Reload
         ' ============================================================
@@ -139,6 +200,7 @@ Namespace GSM.Manager.Core
             End If
             _plugins.Clear()
             _pluginStatuses.Clear()
+            _declaredContractsByGameId.Clear()
 
             ' Ensure plugins directory exists
             If Not Directory.Exists(_pluginsDirectory) Then
@@ -176,14 +238,84 @@ Namespace GSM.Manager.Core
                 Dim fileName = Path.GetFileName(filePath)
                 Dim asmName = "GSM.Plugins." & Path.GetFileNameWithoutExtension(filePath)
 
-                Dim tree As SyntaxTree
+                ' Read the source first — needed both for the magic
+                ' comment parse and for Roslyn. One read, used twice.
+                Dim sourceText As String
                 Try
-                    Dim sourceText = File.ReadAllText(filePath)
-                    tree = VisualBasicSyntaxTree.ParseText(sourceText, path:=filePath)
+                    sourceText = File.ReadAllText(filePath)
                 Catch ex As Exception
                     summary.CompilationErrors.Add(New PluginCompilationError With {
                         .FileName = fileName,
                         .Message = $"Failed to read file: {ex.Message}"
+                    })
+                    Continue For
+                End Try
+
+                ' Phase 5f-3 — contracts version negotiation.
+                ' Three outcomes from comparing the plugin's
+                ' declared version against the manager's running
+                ' NodeApiContract.ContractsVersion:
+                '
+                '   plugin == manager : load silently, stamp the
+                '                       version on the per-GameId
+                '                       map after a successful
+                '                       instantiate.
+                '   plugin <  manager : load, log a debug note.
+                '                       Older contracts are by
+                '                       definition still understood
+                '                       by the current manager
+                '                       (contracts only break on a
+                '                       contracts-version bump).
+                '   plugin >  manager : skip BEFORE Roslyn so the
+                '                       user sees a clear single-
+                '                       line error rather than a
+                '                       cascade of "type X not
+                '                       defined" diagnostics from
+                '                       a method we don't have yet.
+                '   missing            : log a warning and treat
+                '                       as 1 (the only contracts
+                '                       version that's ever
+                '                       existed, so this is
+                '                       harmless until 2 ships).
+                Dim runningContractsVersion = NodeApiContract.ContractsVersion
+                Dim declaredContractsVersion As Integer? = ParseRequiresContractsVersion(sourceText)
+                Dim effectiveDeclaredVersion As Integer
+                If declaredContractsVersion.HasValue Then
+                    effectiveDeclaredVersion = declaredContractsVersion.Value
+                Else
+                    effectiveDeclaredVersion = 1
+                    _logger.LogWarning(
+                        "Plugin {File} has no '<RequiresContracts: N>' magic comment; assuming v1. " &
+                        "Add the comment near the top of the file to make this explicit.",
+                        fileName)
+                End If
+
+                If effectiveDeclaredVersion > runningContractsVersion Then
+                    summary.CompilationErrors.Add(New PluginCompilationError With {
+                        .FileName = fileName,
+                        .Message = $"Plugin requires contracts v{effectiveDeclaredVersion}, " &
+                                   $"but this manager runs contracts v{runningContractsVersion}. " &
+                                   "Update the manager or use a plugin compiled for v" &
+                                   $"{runningContractsVersion}."
+                    })
+                    _pluginStatuses(fileName) = PluginLoadStatus.ContractsVersionTooNew
+                    _logger.LogError(
+                        "Plugin {File} requires contracts v{Declared}, manager runs v{Running} — skipped.",
+                        fileName, effectiveDeclaredVersion, runningContractsVersion)
+                    Continue For
+                ElseIf effectiveDeclaredVersion < runningContractsVersion Then
+                    _logger.LogDebug(
+                        "Plugin {File} targets contracts v{Declared}, manager runs v{Running} — should be compatible.",
+                        fileName, effectiveDeclaredVersion, runningContractsVersion)
+                End If
+
+                Dim tree As SyntaxTree
+                Try
+                    tree = VisualBasicSyntaxTree.ParseText(sourceText, path:=filePath)
+                Catch ex As Exception
+                    summary.CompilationErrors.Add(New PluginCompilationError With {
+                        .FileName = fileName,
+                        .Message = $"Failed to parse: {ex.Message}"
                     })
                     Continue For
                 End Try
@@ -250,6 +382,18 @@ Namespace GSM.Manager.Core
                             _plugins(gid) = instance
                             _pluginStatuses(pluginType.Name) = PluginLoadStatus.Loaded
                             summary.LoadedPlugins.Add(gid)
+
+                            ' Phase 5f-3 — stamp the declared
+                            ' contracts version on the per-GameId
+                            ' map. Done here (after a successful
+                            ' instantiate) rather than at parse
+                            ' time so the entry only exists for
+                            ' plugins that actually loaded —
+                            ' avoids leaking entries for files
+                            ' that compiled but failed to
+                            ' instantiate, or were rejected as
+                            ' DuplicateGameId.
+                            _declaredContractsByGameId(gid) = effectiveDeclaredVersion
 
                             If previousGameIds.Contains(gid) Then
                                 summary.UpdatedGameIds.Add(gid)

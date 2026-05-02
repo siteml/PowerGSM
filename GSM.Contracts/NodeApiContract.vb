@@ -20,6 +20,53 @@ Imports GSM.Plugin
 Namespace GSM.Node.Api
 
     ' ============================================================
+    '  Version constants
+    '
+    '  These are the canonical integers driving phase 5f's three-
+    '  axis versioning scheme. See VERSIONING.md at the solution
+    '  root for the full policy. Both bump only on BREAKING changes:
+    '  additive changes (new endpoints, new optional DTO fields,
+    '  new interface members) do NOT bump them.
+    '
+    '  ProtocolVersion governs the Manager↔Node REST contract.
+    '  Node returns it from /api/version; Manager compares against
+    '  its own compiled-in copy on connect (mismatch surfacing
+    '  ships in phase 5f-2).
+    '
+    '  ContractsVersion governs plugin-facing types in GSM.Contracts.
+    '  Plugins declare what version they target via a magic comment;
+    '  Manager validates on load (validation ships in phase 5f-3).
+    '
+    '  These live in NodeApiContract.vb because both Manager and Node
+    '  need them and Contracts is referenced by everything. Bumping
+    '  is one edit per integer.
+    ' ============================================================
+
+    ''' <summary>
+    ''' Canonical version integers shared by Manager and Node. See
+    ''' the comment block above and VERSIONING.md for the full policy.
+    ''' </summary>
+    Public Module NodeApiContract
+
+        ''' <summary>
+        ''' Manager↔Node REST contract version. Bumps only when the
+        ''' wire shape changes in a breaking way (endpoint removed,
+        ''' DTO field removed/renamed/semantically changed). New
+        ''' endpoints and new optional fields do NOT bump it.
+        ''' </summary>
+        Public Const ProtocolVersion As Integer = 1
+
+        ''' <summary>
+        ''' Plugin-facing contracts version. Bumps only when types
+        ''' in GSM.Contracts change in a breaking way (member removed,
+        ''' signature changed, enum member removed). New members and
+        ''' new types do NOT bump it.
+        ''' </summary>
+        Public Const ContractsVersion As Integer = 1
+
+    End Module
+
+    ' ============================================================
     '  Enums
     ' ============================================================
 
@@ -82,6 +129,50 @@ Namespace GSM.Node.Api
     ' ============================================================
     '  Node identity and status
     ' ============================================================
+
+    ''' <summary>
+    ''' Response shape from GET /api/version. Unauthenticated and
+    ''' lightweight — used both as a connectivity probe and to
+    ''' negotiate the three version axes (build, protocol,
+    ''' contracts) at connect time. See VERSIONING.md.
+    '''
+    ''' The wire format also carries an "application" string and
+    ''' a "runtime" string for diagnostics. The legacy "version"
+    ''' field is preserved as an alias for "build" so any pre-
+    ''' 5f-1 manager calling against a current node still gets a
+    ''' usable answer. Older nodes that don't know about Protocol/
+    ''' ContractsVersion will leave those fields at zero.
+    ''' </summary>
+    Public Class NodeVersionResponse
+        Public Property Application As String
+
+        ''' <summary>
+        ''' Legacy alias for Build. Pre-5f-1 nodes only populated
+        ''' this field; current nodes populate both with the same
+        ''' value. Prefer Build for new code.
+        ''' </summary>
+        Public Property Version As String
+
+        Public Property Build As String
+
+        ''' <summary>
+        ''' Manager↔Node REST contract version. Compare against
+        ''' NodeApiContract.ProtocolVersion to decide compatibility.
+        ''' Zero indicates a pre-5f-1 node that didn't carry this
+        ''' field — treat as "older than this manager".
+        ''' </summary>
+        Public Property ProtocolVersion As Integer
+
+        ''' <summary>
+        ''' Plugin contracts version on the node side. Mostly
+        ''' informational on the Manager since plugins run
+        ''' Manager-side; surfaced for diagnostics. Zero indicates
+        ''' a pre-5f-1 node.
+        ''' </summary>
+        Public Property ContractsVersion As Integer
+
+        Public Property Runtime As String
+    End Class
 
     Public Class NodeStatusResponse
         Public Property NodeId As String
@@ -425,6 +516,17 @@ Namespace GSM.Node.Api
         ' ---- Node ----
         Function GetStatusAsync(cancellation As CancellationToken) As Task(Of NodeStatusResponse)
         Function AuthenticateAsync(request As NodeAuthRequest, cancellation As CancellationToken) As Task(Of NodeAuthResponse)
+
+        ''' <summary>
+        ''' Hits the unauthenticated /api/version endpoint and
+        ''' returns the node's identity + version axes. Used by
+        ''' the Manager for connectivity probing and
+        ''' protocol-compatibility negotiation. Implementations
+        ''' may cache successful results in-memory; pass force=True
+        ''' to bypass the cache.
+        ''' </summary>
+        Function GetApiVersionAsync(force As Boolean,
+                                     cancellation As CancellationToken) As Task(Of NodeVersionResponse)
 
         ' ---- Instance lifecycle ----
         Function StartInstanceAsync(request As StartInstanceRequest, cancellation As CancellationToken) As Task(Of InstanceStatusResponse)

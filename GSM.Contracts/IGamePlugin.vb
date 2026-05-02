@@ -695,6 +695,17 @@ Namespace GSM.Plugin
         CompilationFailed
         InterfaceMismatch
         DuplicateGameId
+        ''' <summary>
+        ''' Phase 5f-3 — plugin's `' &lt;RequiresContracts: N&gt;'
+        ''' magic comment declared a contracts version newer
+        ''' than the running manager's NodeApiContract.ContractsVersion.
+        ''' The plugin was rejected before Roslyn compile to
+        ''' avoid a compile-error spew that would obscure the
+        ''' real cause. User-visible fix: update the manager,
+        ''' or use a plugin compiled for the running contracts
+        ''' version.
+        ''' </summary>
+        ContractsVersionTooNew
         Unloaded
     End Enum
 
