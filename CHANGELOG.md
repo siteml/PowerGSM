@@ -9,6 +9,13 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
+## [0.1.0-rc1] - 2026-05-02
+
+Release pipeline dry run for 0.1.0. See `[0.1.0]` below for the
+actual changeset captured in this release — this rc1 section exists
+only to exercise the GitHub Actions release workflow end-to-end on
+a throwaway pre-release tag before cutting the real `v0.1.0`.
+
 ## [0.1.0] - 2026-05-02
 
 First named version. Establishes the versioning baseline; everything
