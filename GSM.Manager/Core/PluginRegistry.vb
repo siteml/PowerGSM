@@ -9,6 +9,7 @@ Imports System.Threading
 Imports Microsoft.CodeAnalysis
 Imports Microsoft.CodeAnalysis.VisualBasic
 Imports Microsoft.Extensions.Logging
+Imports Basic.Reference.Assemblies
 Imports GSM.Plugin
 
 ' ============================================================
@@ -156,111 +157,118 @@ Namespace GSM.Manager.Core
                 Return summary
             End If
 
-            ' Create new load context
+            ' Create new load context shared by all plugin assemblies —
+            ' that way they all get unloaded together on the next reload.
             _loadContext = New AssemblyLoadContext("PluginContext", isCollectible:=True)
 
-            ' Read all source files
-            Dim sourceTrees As New List(Of SyntaxTree)
-            For Each filePath In sourceFiles
-                Try
-                    Dim sourceText = File.ReadAllText(filePath)
-                    Dim tree = VisualBasicSyntaxTree.ParseText(sourceText,
-                        path:=filePath)
-                    sourceTrees.Add(tree)
-                Catch ex As Exception
-                    summary.CompilationErrors.Add(New PluginCompilationError With {
-                        .FileName = Path.GetFileName(filePath),
-                        .Message = $"Failed to read file: {ex.Message}"
-                    })
-                End Try
-            Next
-
-            If sourceTrees.Count = 0 Then
-                DetectOrphans(previousGameIds, orphanDetector, summary)
-                Return summary
-            End If
-
-            ' Gather references
+            ' Gather references once (shared across per-file compilations)
             Dim references = GetMetadataReferences()
 
-            ' Compile
             Dim compilationOptions As New VisualBasicCompilationOptions(
                 OutputKind.DynamicallyLinkedLibrary,
                 optionStrict:=OptionStrict.Off,
                 optionExplicit:=True,
                 optionInfer:=True)
 
-            Dim compilation = VisualBasicCompilation.Create(
-                "GSM.Plugins.Dynamic",
-                sourceTrees,
-                references,
-                compilationOptions)
+            ' Compile each plugin file independently so one failure doesn't
+            ' prevent others from loading. Each file gets its own assembly.
+            For Each filePath In sourceFiles
+                Dim fileName = Path.GetFileName(filePath)
+                Dim asmName = "GSM.Plugins." & Path.GetFileNameWithoutExtension(filePath)
 
-            Using ms As New MemoryStream()
-                Dim emitResult = compilation.Emit(ms)
+                Dim tree As SyntaxTree
+                Try
+                    Dim sourceText = File.ReadAllText(filePath)
+                    tree = VisualBasicSyntaxTree.ParseText(sourceText, path:=filePath)
+                Catch ex As Exception
+                    summary.CompilationErrors.Add(New PluginCompilationError With {
+                        .FileName = fileName,
+                        .Message = $"Failed to read file: {ex.Message}"
+                    })
+                    Continue For
+                End Try
 
-                If Not emitResult.Success Then
-                    For Each diag In emitResult.Diagnostics.
-                            Where(Function(d) d.Severity = DiagnosticSeverity.Error)
-                        Dim loc = diag.Location
-                        Dim lineSpan = loc.GetLineSpan()
-                        summary.CompilationErrors.Add(New PluginCompilationError With {
-                            .FileName = If(lineSpan.Path, "unknown"),
-                            .Line = lineSpan.StartLinePosition.Line + 1,
-                            .Column = lineSpan.StartLinePosition.Character + 1,
-                            .ErrorCode = diag.Id,
-                            .Message = diag.GetMessage()
-                        })
-                    Next
-                    _logger.LogError("Plugin compilation failed with {Count} errors",
-                                     summary.CompilationErrors.Count)
-                    DetectOrphans(previousGameIds, orphanDetector, summary)
-                    Return summary
-                End If
+                Dim compilation = VisualBasicCompilation.Create(
+                    asmName,
+                    {tree},
+                    references,
+                    compilationOptions)
 
-                ' Load assembly
-                ms.Seek(0, SeekOrigin.Begin)
-                Dim pluginAssembly = _loadContext.LoadFromStream(ms)
+                Using ms As New MemoryStream()
+                    Dim emitResult = compilation.Emit(ms)
 
-                ' Find and instantiate IGamePlugin implementations
-                For Each pluginType In pluginAssembly.GetTypes().
-                        Where(Function(t) Not t.IsAbstract AndAlso
-                                          Not t.IsInterface AndAlso
-                                          GetType(IGamePlugin).IsAssignableFrom(t))
-                    Try
-                        Dim instance = DirectCast(Activator.CreateInstance(pluginType), IGamePlugin)
-                        Dim gid = instance.GameId
-
-                        If _plugins.ContainsKey(gid) Then
+                    If Not emitResult.Success Then
+                        For Each diag In emitResult.Diagnostics.
+                                Where(Function(d) d.Severity = DiagnosticSeverity.Error)
+                            Dim loc = diag.Location
+                            Dim lineSpan = loc.GetLineSpan()
                             summary.CompilationErrors.Add(New PluginCompilationError With {
-                                .FileName = pluginType.Name,
-                                .Message = $"Duplicate GameId '{gid}' — skipping"
+                                .FileName = If(lineSpan.Path, fileName),
+                                .Line = lineSpan.StartLinePosition.Line + 1,
+                                .Column = lineSpan.StartLinePosition.Character + 1,
+                                .ErrorCode = diag.Id,
+                                .Message = diag.GetMessage()
                             })
-                            _pluginStatuses(pluginType.Name) = PluginLoadStatus.DuplicateGameId
-                            Continue For
-                        End If
+                        Next
+                        _logger.LogError("Plugin {File} failed to compile with {Count} error(s)",
+                                         fileName,
+                                         emitResult.Diagnostics.Count(Function(d) d.Severity = DiagnosticSeverity.Error))
+                        Continue For
+                    End If
 
-                        _plugins(gid) = instance
-                        _pluginStatuses(pluginType.Name) = PluginLoadStatus.Loaded
-                        summary.LoadedPlugins.Add(gid)
-
-                        If previousGameIds.Contains(gid) Then
-                            summary.UpdatedGameIds.Add(gid)
-                        Else
-                            summary.AddedGameIds.Add(gid)
-                        End If
-
-                        _logger.LogInformation("Loaded plugin: {GameId} ({Type})",
-                                               gid, pluginType.Name)
+                    ' Load this plugin's assembly
+                    ms.Seek(0, SeekOrigin.Begin)
+                    Dim pluginAssembly As Assembly
+                    Try
+                        pluginAssembly = _loadContext.LoadFromStream(ms)
                     Catch ex As Exception
                         summary.CompilationErrors.Add(New PluginCompilationError With {
-                            .FileName = pluginType.Name,
-                            .Message = $"Failed to instantiate: {ex.Message}"
+                            .FileName = fileName,
+                            .Message = $"Failed to load assembly: {ex.Message}"
                         })
-                        _pluginStatuses(pluginType.Name) = PluginLoadStatus.InterfaceMismatch
+                        Continue For
                     End Try
-                Next
-            End Using
+
+                    ' Find and instantiate IGamePlugin implementations
+                    For Each pluginType In pluginAssembly.GetTypes().
+                            Where(Function(t) Not t.IsAbstract AndAlso
+                                              Not t.IsInterface AndAlso
+                                              GetType(IGamePlugin).IsAssignableFrom(t))
+                        Try
+                            Dim instance = DirectCast(Activator.CreateInstance(pluginType), IGamePlugin)
+                            Dim gid = instance.GameId
+
+                            If _plugins.ContainsKey(gid) Then
+                                summary.CompilationErrors.Add(New PluginCompilationError With {
+                                    .FileName = pluginType.Name,
+                                    .Message = $"Duplicate GameId '{gid}' — skipping"
+                                })
+                                _pluginStatuses(pluginType.Name) = PluginLoadStatus.DuplicateGameId
+                                Continue For
+                            End If
+
+                            _plugins(gid) = instance
+                            _pluginStatuses(pluginType.Name) = PluginLoadStatus.Loaded
+                            summary.LoadedPlugins.Add(gid)
+
+                            If previousGameIds.Contains(gid) Then
+                                summary.UpdatedGameIds.Add(gid)
+                            Else
+                                summary.AddedGameIds.Add(gid)
+                            End If
+
+                            _logger.LogInformation("Loaded plugin: {GameId} ({Type})",
+                                                   gid, pluginType.Name)
+                        Catch ex As Exception
+                            summary.CompilationErrors.Add(New PluginCompilationError With {
+                                .FileName = pluginType.Name,
+                                .Message = $"Failed to instantiate: {ex.Message}"
+                            })
+                            _pluginStatuses(pluginType.Name) = PluginLoadStatus.InterfaceMismatch
+                        End Try
+                    Next
+                End Using
+            Next
 
             ' Detect removed plugins
             Dim currentGameIds = _plugins.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase)
@@ -307,32 +315,85 @@ Namespace GSM.Manager.Core
         End Sub
 
         ''' <summary>
-        ''' Gathers metadata references for the Roslyn compiler.
-        ''' Includes the runtime assemblies and GSM.Contracts.
+        ''' Returns a MetadataReference for GSM.Contracts so the Roslyn
+        ''' compiler can resolve IGamePlugin / ILogParser / etc. when
+        ''' compiling plugins.
+        '''
+        ''' Relies on GSM.Contracts.dll being a loose file next to
+        ''' GSM.Manager.exe. This is enforced by
+        ''' &lt;ExcludeFromSingleFile&gt;true&lt;/ExcludeFromSingleFile&gt; on the
+        ''' Contracts ProjectReference in GSM.Manager.vbproj. Without
+        ''' that, Assembly.Location returns an empty string in single-file
+        ''' publish and there's no clean way to feed the bundled assembly
+        ''' to Roslyn.
         ''' </summary>
+        Private Shared _contractsReference As MetadataReference
+        Private Shared ReadOnly _contractsRefLock As New Object()
+
+        Private Shared Function GetContractsReference() As MetadataReference
+            If _contractsReference IsNot Nothing Then Return _contractsReference
+            SyncLock _contractsRefLock
+                If _contractsReference IsNot Nothing Then Return _contractsReference
+
+                Dim contractsAsm = GetType(IGamePlugin).Assembly
+                Dim asmPath = contractsAsm.Location
+
+                If Not String.IsNullOrEmpty(asmPath) AndAlso File.Exists(asmPath) Then
+                    _contractsReference = MetadataReference.CreateFromFile(asmPath)
+                    Return _contractsReference
+                End If
+
+                ' Defensive fallback: the loose DLL next to the executable.
+                ' Cheap to check and covers any edge case where
+                ' Assembly.Location is empty.
+                Dim sideBySide = Path.Combine(AppContext.BaseDirectory, "GSM.Contracts.dll")
+                If File.Exists(sideBySide) Then
+                    _contractsReference = MetadataReference.CreateFromFile(sideBySide)
+                    Return _contractsReference
+                End If
+
+                Throw New InvalidOperationException(
+                    "Could not locate GSM.Contracts.dll for Roslyn compilation. " &
+                    "GSM.Manager.vbproj must mark the GSM.Contracts ProjectReference " &
+                    "with <ExcludeFromSingleFile>true</ExcludeFromSingleFile> so the " &
+                    "DLL is published as a loose file next to GSM.Manager.exe.")
+            End SyncLock
+        End Function
+
         Private Shared Function GetMetadataReferences() As List(Of MetadataReference)
             Dim refs As New List(Of MetadataReference)
 
-            ' Core runtime assemblies
-            Dim trustedAssemblies = CStr(AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES"))
-            If trustedAssemblies IsNot Nothing Then
-                For Each assemblyPath In trustedAssemblies.Split(Path.PathSeparator)
-                    Try
-                        refs.Add(MetadataReference.CreateFromFile(assemblyPath))
-                    Catch
-                        ' Skip assemblies that can't be loaded as references
-                    End Try
-                Next
-            End If
+            ' .NET 8 framework references — sourced from the
+            ' Basic.Reference.Assemblies NuGet package, which embeds the
+            ' reference assemblies as resources. This is deployment-shape
+            ' independent: it works in dev builds, framework-dependent
+            ' publish, self-contained publish, single-file, and trimmed
+            ' publishes alike.
+            '
+            ' We deliberately do NOT use TRUSTED_PLATFORM_ASSEMBLIES here.
+            ' That works in dev and in non-single-file publishes, but in
+            ' .NET 6+ self-contained single-file publishes (which is what
+            ' GSM.Manager uses), TPA entries point to virtual paths inside
+            ' the bundle that don't exist on disk. CreateFromFile throws
+            ' FileNotFoundException for every entry, refs ends up empty,
+            ' and every plugin compiles against zero BCL types — which
+            ' surfaces as a flood of "System.String / System.Void / etc.
+            ' is not defined" errors in the published build only.
+            refs.AddRange(ReferenceAssemblies.Net80)
 
-            ' GSM.Contracts assembly
-            Dim contractsAssembly = GetType(IGamePlugin).Assembly.Location
-            If Not String.IsNullOrEmpty(contractsAssembly) Then
-                Try
-                    refs.Add(MetadataReference.CreateFromFile(contractsAssembly))
-                Catch
-                End Try
-            End If
+            ' GSM.Contracts — handled separately because it isn't a
+            ' framework assembly and isn't covered by
+            ' Basic.Reference.Assemblies.
+            Try
+                refs.Add(GetContractsReference())
+            Catch ex As Exception
+                ' Re-throw with context; without Contracts every plugin will
+                ' fail with cascading "type not defined" errors and the user
+                ' won't know why.
+                Throw New InvalidOperationException(
+                    "Failed to add GSM.Contracts to plugin compilation references. " & ex.Message,
+                    ex)
+            End Try
 
             Return refs
         End Function

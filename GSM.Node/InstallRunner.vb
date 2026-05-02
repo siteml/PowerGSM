@@ -5,6 +5,9 @@ Imports System.IO
 Imports System.IO.Compression
 Imports System.Net.Http
 Imports System.Text
+Imports System.Text.RegularExpressions
+Imports SharpCompress.Archives
+Imports SharpCompress.Common
 Imports System.Threading
 Imports System.Threading.Tasks
 Imports GSM.Plugin
@@ -72,6 +75,7 @@ Namespace GSM.Node
             op.InstallPath = request.InstallPath
             op.Steps = If(request.Steps, New List(Of InstallStep))
             op.SteamCredentials = request.SteamCredentials
+            op.RunCommonRedist = request.RunCommonRedist
             op.State = InstallationOperationState.Queued
             op.StartedAt = DateTime.UtcNow
             op.TotalSteps = op.Steps.Count
@@ -281,12 +285,24 @@ Namespace GSM.Node
                 _logger.LogInformation("SteamCMD exited with code {Code} (attempt {Attempt})",
                                        exitCode, attempt)
 
-                If exitCode = 0 Then Return
+                If exitCode = 0 Then
+                    If op.RunCommonRedist Then
+                        Await RunCommonRedistAsync(op, cancellation)
+                    Else
+                        _logger.LogInformation("Skipping _CommonRedist (disabled in installation settings)")
+                    End If
+                    Return
+                End If
 
                 ' Code 7 = SteamCMD self-updated after install.
                 ' If the app install succeeded, treat as success.
                 If exitCode = 7 AndAlso _steamCmdSawSuccess Then
                     _logger.LogInformation("SteamCMD exited code 7 but app install succeeded")
+                    If op.RunCommonRedist Then
+                        Await RunCommonRedistAsync(op, cancellation)
+                    Else
+                        _logger.LogInformation("Skipping _CommonRedist (disabled in installation settings)")
+                    End If
                     Return
                 End If
 
@@ -525,6 +541,104 @@ Namespace GSM.Node
             Next
         End Sub
 
+        ''' <summary>
+        ''' After a SteamCMD install, many Steam games ship VC++ redistributables,
+        ''' DirectX, and .NET runtimes under _CommonRedist. Steam doesn't run
+        ''' these for dedicated server installs, so we run them ourselves.
+        ''' All common redists accept /quiet /norestart or /silent.
+        ''' Idempotent — safe to run repeatedly.
+        ''' </summary>
+        Private Async Function RunCommonRedistAsync(op As ActiveOperation,
+                                                     cancellation As CancellationToken) As Task
+            If Not OperatingSystem.IsWindows() Then Return
+
+            Dim installPath = Path.GetFullPath(op.InstallPath).TrimEnd("\"c, "/"c)
+            Dim redistRoot = Path.Combine(installPath, "_CommonRedist")
+            If Not Directory.Exists(redistRoot) Then
+                _logger.LogInformation("No _CommonRedist folder at {Path}, skipping redist install", redistRoot)
+                Return
+            End If
+
+            op.State = InstallationOperationState.Configuring
+            op.Message = "Installing redistributables..."
+            _logger.LogInformation("Running redistributables from {Path}", redistRoot)
+
+            Dim installedCount = 0
+            For Each exePath In Directory.EnumerateFiles(redistRoot, "*.exe", SearchOption.AllDirectories)
+                cancellation.ThrowIfCancellationRequested()
+
+                Dim name = Path.GetFileName(exePath)
+                Dim nameLower = name.ToLowerInvariant()
+
+                ' DirectX setup uses /silent; most others accept /install /quiet /norestart
+                Dim silentArgs As String
+                If nameLower.Contains("dxsetup") Then
+                    silentArgs = "/silent"
+                ElseIf nameLower.Contains("vcredist") OrElse nameLower.StartsWith("vc_redist") Then
+                    silentArgs = "/install /quiet /norestart"
+                Else
+                    silentArgs = "/quiet /norestart"
+                End If
+
+                op.Message = $"Installing {name}..."
+                _logger.LogInformation("Running redist: {Exe} {Args}", exePath, silentArgs)
+
+                Try
+                    Dim psi As New ProcessStartInfo(exePath, silentArgs)
+                    psi.UseShellExecute = False
+                    psi.CreateNoWindow = True
+                    psi.WorkingDirectory = Path.GetDirectoryName(exePath)
+
+                    Using p = Process.Start(psi)
+                        ' 5-minute timeout per redist. Linked with the
+                        ' outer install cancellation so if the user
+                        ' cancels the whole install mid-redist we bail
+                        ' promptly instead of sitting on WaitForExit.
+                        Dim timedOut = False
+                        Try
+                            Using timeoutCts As New CancellationTokenSource(300000)
+                                Using linked = CancellationTokenSource.
+                                        CreateLinkedTokenSource(cancellation, timeoutCts.Token)
+                                    Await p.WaitForExitAsync(linked.Token)
+                                End Using
+                            End Using
+                        Catch ex As OperationCanceledException
+                            Try : p.Kill(entireProcessTree:=True) : Catch : End Try
+                            ' Outer cancel? Propagate. Timeout? Log and move on.
+                            If cancellation.IsCancellationRequested Then
+                                Throw
+                            End If
+                            timedOut = True
+                        End Try
+
+                        If timedOut Then
+                            _logger.LogWarning("Redist {Exe} timed out after 5 minutes", name)
+                            Continue For
+                        End If
+
+                        ' Exit codes meaning "success" or "already installed":
+                        '   0    = success
+                        '   1638 = newer version already installed
+                        '   3010 = success, reboot required
+                        '   5100 = system requirements not met (skip, not fatal)
+                        Select Case p.ExitCode
+                            Case 0, 1638, 3010
+                                installedCount += 1
+                                _logger.LogInformation("Redist {Exe} installed (code {Code})", name, p.ExitCode)
+                            Case 5100
+                                _logger.LogInformation("Redist {Exe} skipped: system requirements not met", name)
+                            Case Else
+                                _logger.LogWarning("Redist {Exe} returned code {Code}", name, p.ExitCode)
+                        End Select
+                    End Using
+                Catch ex As Exception
+                    _logger.LogWarning(ex, "Failed to run redist {Exe}", name)
+                End Try
+            Next
+
+            _logger.LogInformation("Redistributable install complete ({Count} processed)", installedCount)
+        End Function
+
         Private Async Function ExecuteDownloadStepAsync(op As ActiveOperation,
                                                          dlStep As DownloadFileStep,
                                                          cancellation As CancellationToken) As Task
@@ -552,41 +666,33 @@ Namespace GSM.Node
                 Dim fileInfo As New FileInfo(destPath)
                 _logger.LogInformation("Downloaded {File} ({Size} bytes)", destPath, fileInfo.Length)
                 If fileInfo.Length < 1024 Then
-                    ' Likely an error page, not an archive
                     Dim content = File.ReadAllText(destPath)
                     File.Delete(destPath)
                     Throw New Exception($"Download appears to be an error page ({fileInfo.Length} bytes): {content.Substring(0, Math.Min(200, content.Length))}")
                 End If
 
-                If destPath.EndsWith(".tar.xz", StringComparison.OrdinalIgnoreCase) OrElse
-                   destPath.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase) OrElse
-                   destPath.EndsWith(".tgz", StringComparison.OrdinalIgnoreCase) Then
-                    ' Use tar — auto-detect compression with -xf (works on
-                    ' both Linux tar and Windows bsdtar)
-                    _logger.LogInformation("Extracting archive with tar: {File}", destPath)
-                    Dim tarPsi As New ProcessStartInfo("tar")
-                    tarPsi.Arguments = $"-xf ""{destPath}"" -C ""{op.InstallPath}"""
-                    tarPsi.UseShellExecute = False
-                    tarPsi.CreateNoWindow = True
-                    tarPsi.RedirectStandardError = True
-                    Dim tarProc = Process.Start(tarPsi)
-                    Dim tarErr = tarProc.StandardError.ReadToEnd()
-                    tarProc.WaitForExit(300000)
-                    If tarProc.ExitCode <> 0 Then
-                        If tarErr.Contains("xz") OrElse tarErr.Contains("initialize filter") Then
-                            Throw New Exception(
-                                "Cannot extract .tar.xz on this system — the 'xz' tool is not installed. " &
-                                "This archive format is supported on Linux only. " &
-                                "On Windows, use SteamCMD install method instead.")
-                        End If
-                        Throw New Exception($"tar extraction failed with code {tarProc.ExitCode}: {tarErr}")
-                    End If
-                Else
-                    ' Assume zip
-                    _logger.LogInformation("Extracting zip: {File}", destPath)
+                _logger.LogInformation("Extracting archive: {File}", destPath)
+
+                If destPath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) Then
+                    ' Use built-in ZipFile for .zip
                     IO.Compression.ZipFile.ExtractToDirectory(destPath, op.InstallPath, True)
+                Else
+                    ' Use SharpCompress for everything else
+                    ' (tar.xz, tar.gz, tgz, 7z, rar, etc.)
+                    Using archive = ArchiveFactory.Open(destPath)
+                        Dim opts As New ExtractionOptions() With {
+                            .ExtractFullPath = True,
+                            .Overwrite = True
+                        }
+                        For Each entry In archive.Entries
+                            If Not entry.IsDirectory Then
+                                entry.WriteToDirectory(op.InstallPath, opts)
+                            End If
+                        Next
+                    End Using
                 End If
 
+                _logger.LogInformation("Extraction complete")
                 File.Delete(destPath)
             End If
         End Function
@@ -650,6 +756,157 @@ Namespace GSM.Node
         ' ============================================================
         '  Helpers
         ' ============================================================
+
+        ''' <summary>
+        ''' Fast version check. Reads the local appmanifest ACF for
+        ''' the installed buildid and runs SteamCMD app_info_print
+        ''' to get the latest published buildid. No files are
+        ''' downloaded or modified. Roughly 10-20s including SteamCMD
+        ''' startup overhead.
+        ''' </summary>
+        Public Async Function CheckAppVersionAsync(request As AppVersionCheckRequest,
+                                                     cancellation As CancellationToken) As Task(Of AppVersionCheckResponse)
+            Dim response As New AppVersionCheckResponse()
+            Dim branch = If(String.IsNullOrWhiteSpace(request.BetaBranch), "public", request.BetaBranch)
+
+            ' ---- Installed buildid from ACF ----
+            Try
+                Dim acfPath = Path.Combine(request.InstallPath,
+                                            "steamapps",
+                                            $"appmanifest_{request.AppId}.acf")
+                If File.Exists(acfPath) Then
+                    Dim acfText = Await File.ReadAllTextAsync(acfPath, cancellation)
+                    response.InstalledBuildId = ExtractAcfBuildId(acfText)
+                End If
+            Catch ex As Exception
+                _logger.LogWarning(ex, "Failed to read appmanifest for {AppId}", request.AppId)
+            End Try
+
+            ' ---- Latest buildid from SteamCMD ----
+            Try
+                Dim steamCmdPath = Await FindOrDownloadSteamCmdAsync(cancellation)
+                If String.IsNullOrEmpty(steamCmdPath) Then
+                    response.ErrorMessage = "SteamCMD not available on node"
+                    Return response
+                End If
+
+                Dim args As New StringBuilder()
+                If request.SteamCredentials IsNot Nothing AndAlso
+                   Not request.SteamCredentials.IsAnonymous AndAlso
+                   Not String.IsNullOrEmpty(request.SteamCredentials.Username) Then
+                    args.Append("+login ")
+                    args.Append(QuoteForSteamCmd(request.SteamCredentials.Username))
+                    args.Append(" "c)
+                    args.Append(QuoteForSteamCmd(request.SteamCredentials.Password))
+                Else
+                    args.Append("+login anonymous")
+                End If
+                args.Append($" +app_info_update 1 +app_info_print {request.AppId} +quit")
+
+                Dim psi As New ProcessStartInfo()
+                psi.FileName = steamCmdPath
+                psi.Arguments = args.ToString()
+                psi.UseShellExecute = False
+                psi.RedirectStandardOutput = True
+                psi.RedirectStandardError = True
+                psi.CreateNoWindow = True
+                psi.WorkingDirectory = Path.GetDirectoryName(steamCmdPath)
+
+                Dim stdout As New StringBuilder()
+                Dim stderr As New StringBuilder()
+                Using proc As New Process()
+                    proc.StartInfo = psi
+                    AddHandler proc.OutputDataReceived, Sub(s, e)
+                                                            If e.Data IsNot Nothing Then stdout.AppendLine(e.Data)
+                                                        End Sub
+                    AddHandler proc.ErrorDataReceived, Sub(s, e)
+                                                           If e.Data IsNot Nothing Then stderr.AppendLine(e.Data)
+                                                       End Sub
+                    proc.Start()
+                    proc.BeginOutputReadLine()
+                    proc.BeginErrorReadLine()
+
+                    ' Poll with timeout — no WaitForExitAsync (deadlocks
+                    ' with redirected streams in .NET 8).
+                    Dim deadline = DateTime.UtcNow.AddSeconds(90)
+                    While Not proc.HasExited
+                        If cancellation.IsCancellationRequested Then
+                            Try : proc.Kill(True) : Catch : End Try
+                            response.ErrorMessage = "Version check cancelled"
+                            Return response
+                        End If
+                        If DateTime.UtcNow > deadline Then
+                            Try : proc.Kill(True) : Catch : End Try
+                            response.ErrorMessage = "Version check timed out after 90s"
+                            Return response
+                        End If
+                        Await Task.Delay(250, cancellation)
+                    End While
+                End Using
+
+                response.LatestBuildId = ExtractAppInfoBuildId(stdout.ToString(), branch)
+                If String.IsNullOrEmpty(response.LatestBuildId) Then
+                    response.ErrorMessage = $"Could not find buildid for branch '{branch}' in app_info output"
+                End If
+            Catch ex As Exception
+                _logger.LogError(ex, "Version check failed for {AppId}", request.AppId)
+                response.ErrorMessage = ex.Message
+            End Try
+
+            ' ---- Compare ----
+            response.UpdateAvailable = Not String.IsNullOrEmpty(response.InstalledBuildId) AndAlso
+                                        Not String.IsNullOrEmpty(response.LatestBuildId) AndAlso
+                                        response.InstalledBuildId <> response.LatestBuildId
+
+            Return response
+        End Function
+
+        ''' <summary>
+        ''' Parses the installed buildid from Steam's appmanifest ACF.
+        ''' Format is a simple key-value VDF; we only care about one
+        ''' line so a regex beats pulling in a VDF parser library.
+        ''' </summary>
+        Private Shared Function ExtractAcfBuildId(acfText As String) As String
+            If String.IsNullOrEmpty(acfText) Then Return Nothing
+            Dim m = Regex.Match(acfText, "^\s*""buildid""\s+""(\d+)""",
+                                 RegexOptions.Multiline Or RegexOptions.IgnoreCase)
+            If m.Success Then Return m.Groups(1).Value
+            Return Nothing
+        End Function
+
+        ''' <summary>
+        ''' Parses the latest buildid for a branch out of SteamCMD's
+        ''' app_info_print output. Output is nested VDF; we look for
+        ''' the branches section and the requested branch's buildid.
+        ''' </summary>
+        Private Shared Function ExtractAppInfoBuildId(output As String, branch As String) As String
+            If String.IsNullOrEmpty(output) Then Return Nothing
+            ' Try to find the "branches" section, then look for the
+            ' specific branch name followed by its buildid. The output
+            ' structure is approximately:
+            '   "branches"
+            '   {
+            '       "public"
+            '       {
+            '           "buildid"        "17234567"
+            '           ...
+            '       }
+            '       "beta"
+            '       {
+            '           "buildid"        "17234599"
+            '           ...
+            '       }
+            '   }
+            Dim pattern = """" & Regex.Escape(branch) & """[^{]*\{[^}]*?""buildid""\s+""(\d+)"""
+            Dim m = Regex.Match(output, pattern, RegexOptions.Singleline)
+            If m.Success Then Return m.Groups(1).Value
+
+            ' Fallback: first buildid in output (works if only one branch)
+            m = Regex.Match(output, """buildid""\s+""(\d+)""", RegexOptions.Singleline)
+            If m.Success Then Return m.Groups(1).Value
+
+            Return Nothing
+        End Function
 
         Private Async Function FindOrDownloadSteamCmdAsync(cancellation As CancellationToken) As Task(Of String)
             ' Check common locations first
@@ -797,6 +1054,7 @@ Namespace GSM.Node
         Public Property InstallPath As String
         Public Property Steps As List(Of InstallStep)
         Public Property SteamCredentials As SteamCredential
+        Public Property RunCommonRedist As Boolean
         Public Property State As InstallationOperationState
         Public Property StartedAt As DateTime
         Public Property CompletedAt As DateTime?

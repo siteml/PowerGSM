@@ -34,6 +34,7 @@ Namespace GSM.Manager.Core
         Private ReadOnly _pluginRegistry As PluginRegistry
         Private ReadOnly _credentialService As CredentialService
         Private ReadOnly _instanceManager As InstanceManager
+        Private ReadOnly _emitter As NotificationEmitter
         Private ReadOnly _logger As ILogger(Of InstallationManager)
         Private ReadOnly _installLocks As New ConcurrentDictionary(Of String, SemaphoreSlim)
 
@@ -41,11 +42,13 @@ Namespace GSM.Manager.Core
                        pluginRegistry As PluginRegistry,
                        credentialService As CredentialService,
                        instanceManager As InstanceManager,
+                       emitter As NotificationEmitter,
                        logger As ILogger(Of InstallationManager))
             _clientFactory = clientFactory
             _pluginRegistry = pluginRegistry
             _credentialService = credentialService
             _instanceManager = instanceManager
+            _emitter = emitter
             _logger = logger
         End Sub
 
@@ -104,15 +107,34 @@ Namespace GSM.Manager.Core
             End If
 
             Dim instanceIds As IReadOnlyList(Of String) = Nothing
+            Dim runningBeforeUpdate As New List(Of String)
 
             Try
-                ' Stop all instances using this installation
+                ' Take inventory of what's using this installation.
                 instanceIds = _instanceManager.GetInstanceIdsForInstallation(installationId)
+
+                ' Capture pre-update state. We only want to touch
+                ' instances that were actually Running (or Starting —
+                ' those count as "user wanted this on") so we don't
+                ' fire spurious Stopped notifications for instances
+                ' that were already off, and we don't auto-launch
+                ' instances the user had deliberately left stopped.
                 For Each instId In instanceIds
+                    Dim state = _instanceManager.GetLiveState(instId)
+                    If state IsNot Nothing AndAlso
+                       (state.CurrentState = GSM.Plugin.InstanceState.Running OrElse
+                        state.CurrentState = GSM.Plugin.InstanceState.Starting) Then
+                        runningBeforeUpdate.Add(instId)
+                    End If
+                Next
+
+                ' Stop only the running ones.
+                For Each instId In runningBeforeUpdate
                     Await _instanceManager.StopInstanceAsync(instId)
                 Next
-                _logger.LogInformation("Stopped {Count} instances for update of {Id}",
-                                       instanceIds.Count, installationId)
+                _logger.LogInformation(
+                    "Stopped {Running}/{Total} instances for update of {Id}",
+                    runningBeforeUpdate.Count, instanceIds.Count, installationId)
 
                 ' Wait a moment for processes to fully exit
                 Await Task.Delay(2000, cancellation)
@@ -123,13 +145,14 @@ Namespace GSM.Manager.Core
                                                       promptHandler:=promptHandler,
                                                       cancellation:=cancellation)
 
-                ' Restart instances if requested and update succeeded
+                ' Restart only the instances that were running before.
+                ' Instances the user had intentionally stopped stay stopped.
                 If ok AndAlso restartAfter Then
-                    For Each instId In instanceIds
+                    For Each instId In runningBeforeUpdate
                         Await _instanceManager.StartInstanceAsync(instId)
                     Next
                     _logger.LogInformation("Restarted {Count} instances after update",
-                                           instanceIds.Count)
+                                           runningBeforeUpdate.Count)
                 End If
 
                 Return ok
@@ -201,18 +224,31 @@ Namespace GSM.Manager.Core
                 End If
 
                 ' Build request
+                ' Whether to run _CommonRedist after install. Default OFF —
+                ' on non-elevated nodes this spawns UAC prompts for each
+                ' bundled redist. The user opts in explicitly in the
+                ' installation settings when the node runs elevated.
+                Dim runRedist = installEntity.RunCommonRedist
+
                 Dim request As New InstallRequest With {
                     .InstallationId = installationId,
                     .GameId = installEntity.GameId,
                     .InstallPath = installEntity.InstallPath,
                     .Steps = steps.ToList(),
-                    .SteamCredentials = steamCred
+                    .SteamCredentials = steamCred,
+                    .RunCommonRedist = runRedist
                 }
 
                 ' Send to node
                 Dim client = _clientFactory.GetClient(
                     nodeEntity.NodeId, nodeEntity.HostAddress,
                     nodeEntity.Port, nodeEntity.AuthToken)
+
+                ' Emit UpdateStarted event — we fire this even for the
+                ' fresh-install path; consumers that only care about
+                ' updates can filter on isUpdate themselves (not exposed
+                ' today). The "Started" signal is useful either way.
+                If _emitter IsNot Nothing Then _emitter.UpdateStarted(installationId)
 
                 Try
                     Dim progress = Await client.StartInstallAsync(request,
@@ -262,23 +298,60 @@ Namespace GSM.Manager.Core
                     End While
 
                     If progress.OperationState = InstallationOperationState.Completed Then
-                        ' Update database with new version info
+                        ' Stamp a version string on the install. True
+                        ' version tracking (e.g. Steam buildid from the
+                        ' ACF manifest on the node) is a TODO — for now
+                        ' we record a provenance string that tells us
+                        ' the install method, the AppId (if SteamCMD),
+                        ' and when this install completed. That's enough
+                        ' to know whether a "Check for Updates" run is
+                        ' called for based on install age, and it won't
+                        ' falsely match against a future real buildid.
+                        ' Stamp a provenance placeholder now — the real
+                        ' Steam buildid will overwrite it on the first
+                        ' Check for Updates (or we attempt it below if
+                        ' the install included a SteamCmdStep).
+                        installEntity.InstalledVersion = BuildVersionStamp(steps)
                         installEntity.UpdatedUtc = DateTime.UtcNow
                         db.SaveChanges()
 
                         _logger.LogInformation("{Op} completed for {Id}",
                                                If(isUpdate, "Update", "Install"), installationId)
+
+                        ' Fire UpdateCompleted — consumers don't care
+                        ' whether it was a fresh install or an update,
+                        ' both boil down to "installation is now ready".
+                        If _emitter IsNot Nothing Then _emitter.UpdateCompleted(installationId, Nothing)
+
+                        ' Fire-and-forget a version check so the stored
+                        ' InstalledVersion gets upgraded to the real
+                        ' buildid without requiring the user to click
+                        ' Check for Updates. We don't block the install
+                        ' return on this — if the version check fails
+                        ' for any reason, the synthetic stamp stays put.
+                        Try
+                            Dim _unused = Task.Run(Async Function()
+                                                       Try
+                                                           Await CheckForUpdatesAsync(installationId, CancellationToken.None)
+                                                       Catch
+                                                       End Try
+                                                   End Function)
+                        Catch
+                        End Try
+
                         Return True
                     Else
                         _logger.LogError("{Op} failed for {Id}: {Err}",
                                          If(isUpdate, "Update", "Install"), installationId,
                                          progress.ErrorMessage)
+                        If _emitter IsNot Nothing Then _emitter.UpdateFailed(installationId, progress.ErrorMessage)
                         Return False
                     End If
 
                 Catch ex As Exception
                     _logger.LogError(ex, "{Op} exception for {Id}",
                                      If(isUpdate, "Update", "Install"), installationId)
+                    If _emitter IsNot Nothing Then _emitter.UpdateFailed(installationId, ex.Message)
                     Return False
                 End Try
             End Using
@@ -323,6 +396,152 @@ Namespace GSM.Manager.Core
             Return InstallMethod.Manual
         End Function
 
+        ''' <summary>
+        ''' Builds a provenance version stamp after a successful
+        ''' install/update. Prefers the Steam AppId + install timestamp
+        ''' when SteamCMD was used; falls back to just a timestamp for
+        ''' other install methods. True version tracking (Steam
+        ''' buildid from the ACF manifest on the node) is a TODO that
+        ''' will replace this once the node exposes an endpoint for it.
+        ''' </summary>
+        Private Shared Function BuildVersionStamp(steps As IReadOnlyList(Of InstallStep)) As String
+            Dim timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+            If steps IsNot Nothing Then
+                For Each s In steps
+                    Dim steamStep = TryCast(s, SteamCmdStep)
+                    If steamStep IsNot Nothing Then
+                        If Not String.IsNullOrEmpty(steamStep.BetaBranch) Then
+                            Return $"steam:{steamStep.AppId}@{steamStep.BetaBranch} ({timestamp})"
+                        End If
+                        Return $"steam:{steamStep.AppId} ({timestamp})"
+                    End If
+                Next
+
+                For Each s In steps
+                    Dim dlStep = TryCast(s, DownloadFileStep)
+                    If dlStep IsNot Nothing Then
+                        Return $"download ({timestamp})"
+                    End If
+                Next
+            End If
+
+            Return $"installed ({timestamp})"
+        End Function
+
+        ''' <summary>
+        ''' Reads the "RunCommonRedist" flag from the installation's
+        ''' ConfigJson. Stored there rather than on the entity itself
+        ''' so existing installations don't need an EF migration.
+        ''' <summary>
+        ''' Asks the node for a fast version check — compares installed
+        ''' buildid against the latest available on Steam. Requires a
+        ''' plugin that emits a SteamCmdStep in its update steps; other
+        ''' install methods return a "not supported" result.
+        ''' </summary>
+        Public Async Function CheckForUpdatesAsync(installationId As String,
+                                                     cancellation As CancellationToken) As Task(Of UpdateCheckResult)
+            Dim result As New UpdateCheckResult()
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim installEntity = db.Installations.Find(installationId)
+                If installEntity Is Nothing Then
+                    result.ErrorMessage = "Installation not found"
+                    Return result
+                End If
+                Dim nodeEntity = db.Nodes.Find(installEntity.NodeId)
+                If nodeEntity Is Nothing Then
+                    result.ErrorMessage = "Node not found"
+                    Return result
+                End If
+
+                Dim plugin = _pluginRegistry.GetPlugin(installEntity.GameId)
+                If plugin Is Nothing Then
+                    result.ErrorMessage = $"Plugin '{installEntity.GameId}' is not loaded"
+                    Return result
+                End If
+
+                ' Build minimal InstallationConfig for plugin
+                Dim installConfig As New InstallationConfig With {
+                    .InstallationId = installationId,
+                    .GameId = installEntity.GameId,
+                    .DisplayName = installEntity.DisplayName,
+                    .InstallPath = installEntity.InstallPath,
+                    .NodeId = installEntity.NodeId,
+                    .CustomFields = DeserializeConfig(installEntity.ConfigJson)
+                }
+                installConfig.InstallMethod = ParseInstallMethod(installEntity.InstallMethod)
+
+                ' Pull first SteamCmdStep from update steps to get AppId + branch
+                Dim updateSteps = plugin.GetUpdateSteps(installConfig)
+                Dim steamStep As SteamCmdStep = Nothing
+                If updateSteps IsNot Nothing Then
+                    For Each s In updateSteps
+                        steamStep = TryCast(s, SteamCmdStep)
+                        If steamStep IsNot Nothing Then Exit For
+                    Next
+                End If
+                If steamStep Is Nothing Then
+                    result.ErrorMessage = "Update check is only supported for Steam-installed games"
+                    Return result
+                End If
+
+                ' Resolve Steam credentials
+                Dim steamCred As SteamCredential = Nothing
+                If Not String.IsNullOrEmpty(installEntity.SteamCredentialId) Then
+                    steamCred = _credentialService.GetSteamCredentialForTransmit(
+                        db, installEntity.SteamCredentialId)
+                End If
+
+                Dim req As New AppVersionCheckRequest With {
+                    .InstallationId = installationId,
+                    .InstallPath = installEntity.InstallPath,
+                    .AppId = steamStep.AppId,
+                    .BetaBranch = steamStep.BetaBranch,
+                    .SteamCredentials = steamCred
+                }
+
+                Try
+                    Dim client = _clientFactory.GetClient(
+                        nodeEntity.NodeId, nodeEntity.HostAddress,
+                        nodeEntity.Port, nodeEntity.AuthToken)
+                    Dim resp = Await client.CheckAppVersionAsync(req, cancellation)
+                    result.InstalledBuildId = resp.InstalledBuildId
+                    result.LatestBuildId = resp.LatestBuildId
+                    result.UpdateAvailable = resp.UpdateAvailable
+                    result.ErrorMessage = resp.ErrorMessage
+
+                    ' Opportunistically update the stored InstalledVersion
+                    ' with the real buildid read from the ACF manifest —
+                    ' fixes up legacy rows that still have the synthetic
+                    ' "steam:<appid> (timestamp)" placeholder, and keeps
+                    ' it current without requiring a full reinstall.
+                    If Not String.IsNullOrEmpty(resp.InstalledBuildId) Then
+                        Dim newStamp = $"steam:{steamStep.AppId}@{If(steamStep.BetaBranch, "public")} build {resp.InstalledBuildId}"
+                        If installEntity.InstalledVersion <> newStamp Then
+                            installEntity.InstalledVersion = newStamp
+                            installEntity.UpdatedUtc = DateTime.UtcNow
+                            db.SaveChanges()
+                        End If
+                    End If
+                Catch ex As Exception
+                    result.ErrorMessage = ex.Message
+                End Try
+            End Using
+            Return result
+        End Function
+
+    End Class
+
+    ''' <summary>
+    ''' Result of an update check — either a populated comparison or
+    ''' an error message explaining why the check couldn't run.
+    ''' </summary>
+    Public Class UpdateCheckResult
+        Public Property InstalledBuildId As String
+        Public Property LatestBuildId As String
+        Public Property UpdateAvailable As Boolean
+        Public Property ErrorMessage As String
     End Class
 
 End Namespace

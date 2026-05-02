@@ -1,0 +1,69 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net8.0;net8.0-windows</TargetFrameworks>
+    <RootNamespace></RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OptionStrict>Off</OptionStrict>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionInfer>On</OptionInfer>
+    <AssemblyName>GSM.NodeSetup</AssemblyName>
+    <ApplicationIcon>..\GSM.Node\PowerGSM.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <!-- Windows-only: enable WinForms and define the WINDOWS_GUI compile constant. -->
+  <!-- VB.Net DefineConstants for boolean conditionals uses NAME=True syntax,    -->
+  <!-- comma-separated, so #If WINDOWS_GUI Then works in source.                  -->
+  <PropertyGroup Condition="'$(TargetFramework)'=='net8.0-windows'">
+    <UseWindowsForms>true</UseWindowsForms>
+    <DefineConstants>$(DefineConstants),WINDOWS_GUI=True</DefineConstants>
+  </PropertyGroup>
+
+  <!-- Exclude the Windows\ folder from non-Windows builds.                       -->
+  <!-- The cross-platform (net8.0) Linux build is console-only and must not see   -->
+  <!-- any WinForms-dependent source files.                                       -->
+  <ItemGroup Condition="'$(TargetFramework)'!='net8.0-windows'">
+    <Compile Remove="Windows\**\*.vb" />
+    <None Include="Windows\**\*.vb" />
+  </ItemGroup>
+
+  <!--
+    Post-publish deployment.
+
+    Each pubxml sets <NodeDeploymentDir> to the node's publish folder
+    (winx64 → ..\GSM.Node\bin\Release\net8.0\publish\,
+     linux64 → ..\GSM.Node\bin\Release\net8.0\publish\linux64\).
+    NodeSetup itself publishes to its own bin\publish\<rid>\ folder so
+    the publish task never races with the node's publish task on shared
+    runtime DLLs. After the publish is fully written, this target copies
+    the result into NodeDeploymentDir sequentially.
+
+    Both pubxml profiles use <DeleteExistingFiles>false</DeleteExistingFiles>
+    so neither publish destroys the other's files when this folder is
+    re-deployed.
+
+    The Retries / RetryDelayMilliseconds attributes guard against the
+    rare case where the destination is briefly locked (e.g. by a still-
+    running node service or by Windows Defender's real-time scan after
+    the file lands).
+  -->
+  <Target Name="DeployToNodeFolder"
+          AfterTargets="Publish"
+          Condition="'$(NodeDeploymentDir)' != ''">
+    <Message Importance="high"
+             Text="Deploying GSM.NodeSetup output to $(NodeDeploymentDir)" />
+    <ItemGroup>
+      <_NodeSetupPublishedFiles Include="$(PublishDir)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_NodeSetupPublishedFiles)"
+          DestinationFiles="@(_NodeSetupPublishedFiles->'$(NodeDeploymentDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Retries="3"
+          RetryDelayMilliseconds="500" />
+    <Message Importance="high"
+             Text="Deployed $(_NodeSetupPublishedFiles->Count()) file(s) to $(NodeDeploymentDir)" />
+  </Target>
+
+</Project>

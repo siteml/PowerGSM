@@ -128,6 +128,64 @@ Namespace GSM.Notification
     End Interface
 
     ' ============================================================
+    '  IDestinationTargetingPlugin — opt-in extension for plugins
+    '  that can dispatch a custom message directly to ONE specific
+    '  destination (bypassing event-type / scope filtering).
+    '
+    '  Phase 4b-1.5: lets the automation engine's NotifyAction send
+    '  a literal message to a user-picked destination from a rule,
+    '  distinct from the event-driven broadcast path which fans
+    '  out to every destination matching an event's scope.
+    '
+    '  Plugins that don't implement this interface are still valid
+    '  notification plugins — they just don't support custom
+    '  message dispatch from automation actions. Currently only
+    '  DiscordWebhookPlugin implements it; future transports
+    '  (Slack, Telegram) will add their own implementations.
+    '
+    '  The plugin owns the lookup: NotificationService asks each
+    '  registered plugin in turn whether it can target the given
+    '  destinationId. The first one to return True/successfully
+    '  dispatch wins. This avoids NotificationService needing to
+    '  know which transports own which destinations.
+    ' ============================================================
+
+    ''' <summary>
+    ''' Optional capability interface for notification plugins
+    ''' that support direct destination targeting.
+    ''' </summary>
+    Public Interface IDestinationTargetingPlugin
+
+        ''' <summary>
+        ''' True if this plugin owns the given destination ID
+        ''' (i.e. its TransportKind matches and the destination
+        ''' is in this plugin's cache). Cheap synchronous check
+        ''' so NotificationService can skip plugins that don't
+        ''' own the destination without an async round trip.
+        ''' </summary>
+        Function OwnsDestination(destinationId As String) As Boolean
+
+        ''' <summary>
+        ''' Send a custom message to one specific destination.
+        ''' Returns True on enqueue success, False on lookup
+        ''' failure or transport error. Does NOT apply event-
+        ''' type or scope filtering — the caller has explicitly
+        ''' chosen this destination.
+        '''
+        ''' Token substitution should already be done by the
+        ''' caller; the plugin treats the message string as
+        ''' literal final text.
+        ''' </summary>
+        Function SendCustomToDestinationAsync(
+            destinationId As String,
+            message As String,
+            severity As NotificationSeverity,
+            tokens As NotificationTokens,
+            cancellation As CancellationToken) As Task(Of Boolean)
+
+    End Interface
+
+    ' ============================================================
     '  IRemoteCommandHandler — manager implements this
     ' ============================================================
 
@@ -189,6 +247,30 @@ Namespace GSM.Notification
         Public Property MaxPlayers As Integer?
         Public Property RuleName As String
         Public Property ErrorMessage As String
+
+        ''' <summary>
+        ''' The Steam buildid of the installation, when known —
+        ''' extracted from InstallationEntity.InstalledVersion's
+        ''' " build <id>" suffix (written by InstallationManager
+        ''' after a version check). Empty string if the stamp
+        ''' doesn't carry one yet.
+        ''' </summary>
+        Public Property BuildId As String
+
+        ''' <summary>
+        ''' Current tile ID for the instance at the time the event
+        ''' fired (game-specific — Last Oasis uses this for tiles;
+        ''' other games leave it empty). Token: {TileId}.
+        ''' </summary>
+        Public Property TileId As String
+
+        ''' <summary>
+        ''' Human-readable tile name at the time the event fired.
+        ''' For Last Oasis this is the tile's display name from
+        ''' the MapPath. Token: {TileName}.
+        ''' </summary>
+        Public Property TileName As String
+
         Public Property CustomTokens As Dictionary(Of String, String)
     End Class
 

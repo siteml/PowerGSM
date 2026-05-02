@@ -8,30 +8,135 @@
     <OptionStrict>Off</OptionStrict>
     <OptionExplicit>On</OptionExplicit>
     <OptionInfer>On</OptionInfer>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
-    <PlatformTarget>x64</PlatformTarget>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
-    <PlatformTarget>x64</PlatformTarget>
+    <ApplicationIcon>PowerGSM.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="PowerGSM.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\GSM.Contracts\GSM.Contracts.vbproj" />
+
+    <!--
+      GSM.CtrlCSender is a runtime helper, not a referenced
+      assembly. Build-order dependency only: ReferenceOutputAssembly=false
+      keeps Roslyn from trying to link an Exe as a managed reference,
+      Private=false keeps it out of our publish closure as a referenced
+      DLL (we copy it explicitly via the targets below), and
+      SkipGetTargetFrameworkProperties=true silences the TFM-mismatch
+      warning that would otherwise fire for an OutputType=Exe project.
+    -->
+    <ProjectReference Include="..\GSM.CtrlCSender\GSM.CtrlCSender.vbproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+    </ProjectReference>
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="8.0.0" />
+    <PackageReference Include="SharpCompress" Version="0.36.0" />
   </ItemGroup>
 
   <ItemGroup>
     <None Update="nodesettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Update="install-service.bat">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="uninstall-service.bat">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
+
+  <!-- ============================================================
+       GSM.CtrlCSender deployment
+
+       The helper is a tiny console app that GSM.Node spawns to
+       deliver CTRL_C_EVENT to UE4 game-server children. It must
+       sit next to GSM.Node.exe at runtime in both dev and prod.
+
+       Dev (Build) and prod (Publish) need different layouts:
+
+         1. BUILD (dev): Helper is framework-dependent. The dev
+            machine has .NET 8 installed, so the regular
+            (.exe + .dll + .runtimeconfig.json + .deps.json) layout
+            works. Output is tiny (around 200KB), incremental builds
+            stay fast.
+
+         2. PUBLISH (prod): Helper is self-contained single-file.
+            GSM.Node is typically published self-contained, which
+            packs the .NET runtime into Node's own publish output
+            but does NOT lay out a sharable framework next to it
+            (no shared\Microsoft.NETCore.App\version\ directory).
+            A framework-dependent helper dropped into that publish
+            folder fails to launch with "No frameworks were found"
+            because its apphost can't see a usable framework.
+            So at publish time we explicitly publish the helper as
+            self-contained / single-file, producing one standalone
+            .exe (~15MB) that has zero external dependencies.
+
+       The helper is hardcoded to win-x64 because:
+         * It's Windows-only (P/Invokes kernel32 console APIs).
+         * We always want it present in the publish output, even
+           if the user is producing a non-Windows publish, since
+           there's no harm in shipping an unused Windows binary.
+         * The runtime caller (ProcessManager.TrySendConsoleCtrlC)
+           is gated behind OperatingSystem.IsWindows() so it only
+           runs on Windows hosts anyway.
+       ============================================================ -->
+
+  <!--
+    BUILD path: copy the framework-dependent helper next to
+    GSM.Node.exe. Works at dev time because the dev machine has
+    .NET 8 installed. Condition="Exists('%(Identity)')" tolerates
+    files that don't exist in every config (e.g. .pdb is normally
+    only present in Debug).
+  -->
+  <Target Name="CopyCtrlCSenderToOutput" AfterTargets="Build">
+    <ItemGroup>
+      <_CtrlCSenderOutput Include="..\GSM.CtrlCSender\bin\$(Configuration)\net8.0\GSM.CtrlCSender.exe" />
+      <_CtrlCSenderOutput Include="..\GSM.CtrlCSender\bin\$(Configuration)\net8.0\GSM.CtrlCSender.dll" />
+      <_CtrlCSenderOutput Include="..\GSM.CtrlCSender\bin\$(Configuration)\net8.0\GSM.CtrlCSender.runtimeconfig.json" />
+      <_CtrlCSenderOutput Include="..\GSM.CtrlCSender\bin\$(Configuration)\net8.0\GSM.CtrlCSender.deps.json" />
+      <_CtrlCSenderOutput Include="..\GSM.CtrlCSender\bin\$(Configuration)\net8.0\GSM.CtrlCSender.pdb" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_CtrlCSenderOutput)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('%(Identity)')" />
+  </Target>
+
+  <!--
+    PUBLISH path: invoke a self-contained single-file Publish of
+    the helper into a dedicated subfolder of its own bin, then
+    copy the resulting one-file .exe next to GSM.Node.exe in
+    Node's publish folder.
+
+    BeforeTargets="Publish" runs after Node's Build but before
+    its Publish copy logic, so the helper's .exe is ready when
+    CopyCtrlCSenderToPublish (AfterTargets="Publish") fires.
+
+    PublishDir is set explicitly to keep these self-contained
+    outputs separate from the framework-dependent bin output that
+    the Build path uses; otherwise a Build after a Publish would
+    see ~200 runtime DLLs sitting where the framework-dependent
+    output is supposed to be.
+  -->
+  <Target Name="PublishCtrlCSender" BeforeTargets="Publish">
+    <MSBuild Projects="..\GSM.CtrlCSender\GSM.CtrlCSender.vbproj"
+             Targets="Publish"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=true;PublishSingleFile=true;PublishDir=$(MSBuildThisFileDirectory)..\GSM.CtrlCSender\bin\$(Configuration)\win-x64\selfcontained\" />
+  </Target>
+
+  <Target Name="CopyCtrlCSenderToPublish" AfterTargets="Publish">
+    <Copy SourceFiles="..\GSM.CtrlCSender\bin\$(Configuration)\win-x64\selfcontained\GSM.CtrlCSender.exe"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>

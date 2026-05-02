@@ -33,6 +33,16 @@ Namespace GSM.Manager.Data
         Public Property LastSeenUtc As DateTime
         Public Property OsDescription As String
 
+        ''' <summary>
+        ''' Node-wide ceiling on concurrent coordinated restarts
+        ''' across all installations hosted on this node. Zero
+        ''' means "no node-wide limit; installation-scoped limits
+        ''' apply". Positive values cap total simultaneous
+        ''' restarts (e.g. 1 forces absolute serialisation across
+        ''' a shared box running LO + Factorio).
+        ''' </summary>
+        Public Property MaxConcurrentRestarts As Integer = 0
+
         Public Overridable Property Installations As ICollection(Of InstallationEntity)
     End Class
 
@@ -53,6 +63,55 @@ Namespace GSM.Manager.Data
         Public Property CreatedUtc As DateTime
         Public Property UpdatedUtc As DateTime
 
+        ''' <summary>
+        ''' Phase 5 — last value the VersionCheckService observed
+        ''' from upstream. May differ from InstalledVersion (which
+        ''' tracks what's actually installed) and is what triggers
+        ''' version-mismatch rules. The poll service compares each
+        ''' newly-fetched value against this; if changed, it both
+        ''' updates this column and raises a mismatch event.
+        '''
+        ''' Null/empty until the first successful poll — a freshly
+        ''' installed installation has InstalledVersion populated
+        ''' but no LatestKnownVersion until VersionCheckService runs
+        ''' for the first time.
+        ''' </summary>
+        Public Property LatestKnownVersion As String
+
+        ''' <summary>
+        ''' Phase 5 — timestamp of the last successful version check.
+        ''' Used by the InstallationPanel for "Checked X minutes ago"
+        ''' display, and by the polling service to throttle (skip
+        ''' installations checked within the last poll interval to
+        ''' tolerate rapid Manager restarts without re-polling
+        ''' every installation immediately on each restart).
+        '''
+        ''' Nullable: Nothing until the first successful poll. Failed
+        ''' polls do NOT update this — only successful ones — so an
+        ''' installation that's been failing checks for a while shows
+        ''' an obviously-stale timestamp in the UI.
+        ''' </summary>
+        Public Property LastVersionCheckUtc As DateTime?
+
+        ''' <summary>
+        ''' When true, the node runs every .exe under _CommonRedist
+        ''' after a SteamCMD install completes (VC++, DirectX, etc.).
+        ''' Off by default because most target machines already have
+        ''' these installed, and without an elevated node service each
+        ''' redistributable triggers a UAC prompt.
+        ''' </summary>
+        Public Property RunCommonRedist As Boolean
+
+        ''' <summary>
+        ''' Max instances from this installation that can be in
+        ''' the "restarting" phase at once. Defaults to 1 so the
+        ''' typical shared-install use case (LO's four realms
+        ''' behind one install) gets safe sequential behaviour
+        ''' automatically. A node-wide override on NodeEntity
+        ''' takes precedence when set.
+        ''' </summary>
+        Public Property MaxConcurrentRestarts As Integer = 1
+
         Public Overridable Property Node As NodeEntity
         Public Overridable Property Instances As ICollection(Of InstanceEntity)
     End Class
@@ -72,12 +131,86 @@ Namespace GSM.Manager.Data
         Public Property CreatedUtc As DateTime
         Public Property UpdatedUtc As DateTime
 
+        ''' <summary>
+        ''' Position of this instance within its installation's
+        ''' sibling list. Lower values come first. Used by the
+        ''' Restart Schedule stagger feature to compute per-instance
+        ''' offsets, and by the installation panel to display
+        ''' instances in user-controlled order.
+        '''
+        ''' Default 0 is assigned to brand-new entities that haven't
+        ''' been placed yet; the migration that introduced this
+        ''' column backfilled existing rows with a stable ordering
+        ''' based on CreatedUtc. New inserts should use
+        ''' GsmDataExtensions.NextSortOrder for the target
+        ''' installation to avoid collisions.
+        ''' </summary>
+        Public Property SortOrder As Integer = 0
+
+        ' ---- Restart scheduling (hybrid quick-config) ----
+        '
+        ' These fields drive the "Restart Schedule" section on
+        ' the EditInstance form. When RestartEnabled is true, a
+        ' corresponding AutomationRule is materialised (created
+        ' or updated) with RuleId == RestartRuleId. The rule is
+        ' fully visible + editable in the Automation Rules
+        ' window; edits that stay within what the simple UI can
+        ' express round-trip, edits beyond that cause the simple
+        ' UI to gray out and direct the user to the rule editor.
+
+        ''' <summary>
+        ''' Master on/off for scheduled restarts on this instance.
+        ''' When toggled off, the generated rule is deleted
+        ''' (not merely disabled) to keep the rules list clean.
+        ''' </summary>
+        Public Property RestartEnabled As Boolean = False
+
+        ''' <summary>
+        ''' Cron expression for when this instance wants to
+        ''' restart. The coordinator serialises concurrent
+        ''' firings via installation/node semaphores, so two
+        ''' instances with identical crons won't both run at
+        ''' once — they queue in acquisition order.
+        ''' </summary>
+        Public Property RestartCron As String
+
+        ''' <summary>
+        ''' FK to the auto-generated AutomationRule. Null when
+        ''' RestartEnabled is false. When non-null, the rule
+        ''' with this RuleId is the materialisation of the
+        ''' quick-config fields above. Stored so the Manager
+        ''' can round-trip edits without guessing which rule
+        ''' belongs to which instance.
+        ''' </summary>
+        Public Property RestartRuleId As String
+
+        ''' <summary>
+        ''' User-defined logical grouping label. Lets users tag
+        ''' instances as part of a "realm", "cluster", "production
+        ''' tier", etc. without the engine knowing what the tag
+        ''' means. Used by RuleScope.InstanceSet to resolve
+        ''' "all instances in this set" — sets can span
+        ''' installations and nodes.
+        '''
+        ''' Game-agnostic and entirely user-driven: no plugin
+        ''' opt-in needed, no schema for what tags exist. Auto-
+        ''' complete in EditInstanceForm offers existing distinct
+        ''' values from the DB so users can stay consistent.
+        ''' Comparison is case-sensitive at query time.
+        ''' </summary>
+        Public Property InstanceSetTag As String
+
         Public Overridable Property Installation As InstallationEntity
     End Class
 
     ''' <summary>
     ''' A persisted automation rule.
     ''' Trigger, conditions, and action are stored as JSON.
+    '''
+    ''' GameFilter is a top-level filter (not embedded in the
+    ''' rule's JSON) so the engine can index/query on it later
+    ''' without parsing every rule. Applies to multi-instance
+    ''' scopes; ignored for Instance scope.
     ''' </summary>
     Public Class AutomationRuleEntity
         Public Property RuleId As String
@@ -85,11 +218,29 @@ Namespace GSM.Manager.Data
         Public Property IsEnabled As Boolean = True
         Public Property ScopeKind As String
         Public Property TargetId As String
+        Public Property GameFilter As String
         Public Property TriggerJson As String
         Public Property ConditionsJson As String
         Public Property ActionJson As String
         Public Property CreatedUtc As DateTime
         Public Property UpdatedUtc As DateTime
+
+        ''' <summary>
+        ''' Display position in the Automation Rules window's list.
+        ''' Lower values come first. Like InstanceEntity.SortOrder,
+        ''' default 0 is what brand-new rows get; the migration that
+        ''' introduced this column should backfill existing rows with
+        ''' a stable ordering based on CreatedUtc. New inserts should
+        ''' use GsmDataExtensions.NextRuleSortOrder to land at the end
+        ''' of the existing list.
+        '''
+        ''' Has no effect on rule firing semantics — it's purely a
+        ''' display preference. Two rules whose triggers fire at the
+        ''' same instant still queue based on the engine's internal
+        ''' ordering (cron tick order, condition-result order, etc.),
+        ''' not on this column.
+        ''' </summary>
+        Public Property SortOrder As Integer = 0
     End Class
 
     ''' <summary>
@@ -103,18 +254,6 @@ Namespace GSM.Manager.Data
         Public Property Username As String
         Public Property EncryptedPassword As Byte()
         Public Property IsAnonymous As Boolean
-    End Class
-
-    ''' <summary>
-    ''' Realm credentials for games that require them (e.g. Last Oasis).
-    ''' Keys are DPAPI-encrypted.
-    ''' </summary>
-    Public Class RealmCredentialEntity
-        Public Property CredentialId As String
-        Public Property DisplayName As String
-        Public Property GameId As String
-        Public Property EncryptedCustomerKey As Byte()
-        Public Property EncryptedProviderKey As Byte()
     End Class
 
     ''' <summary>
@@ -155,6 +294,206 @@ Namespace GSM.Manager.Data
         Public Property SkipReason As String
     End Class
 
+    ''' <summary>
+    ''' A named set of fields that notifications are ALLOWED to expose.
+    ''' Destinations reference a profile to decide how much detail their
+    ''' messages contain — e.g. a Public profile strips IPs, paths, keys;
+    ''' an Admin profile shows everything. Seeded on first run with
+    ''' Public / Admin defaults.
+    ''' </summary>
+    Public Class VisibilityProfileEntity
+        Public Property ProfileId As String
+        Public Property DisplayName As String
+        ''' <summary>JSON array of field names from NotificationField enum.</summary>
+        Public Property AllowedFieldsJson As String
+        Public Property IsBuiltIn As Boolean
+        Public Property CreatedUtc As DateTime
+        Public Property UpdatedUtc As DateTime
+    End Class
+
+    ''' <summary>
+    ''' A single notification destination. Currently supports Discord
+    ''' webhooks; future transports (Slack, Telegram, email) will add
+    ''' more TransportKind values and parse payloads accordingly.
+    ''' </summary>
+    Public Class NotificationDestinationEntity
+        Public Property DestinationId As String
+        Public Property DisplayName As String
+        Public Property Enabled As Boolean
+
+        ''' <summary>e.g. "DiscordWebhook" — selects the transport impl.</summary>
+        Public Property TransportKind As String
+
+        ''' <summary>Transport-specific config as JSON (webhook URL etc).</summary>
+        Public Property TransportConfigJson As String
+
+        ''' <summary>JSON array of NotificationEventType values to send.</summary>
+        Public Property EnabledEventTypesJson As String
+
+        ''' <summary>
+        ''' JSON array of installation IDs this destination cares about.
+        ''' Empty/null = all installations. Destinations filter at both
+        ''' installation and instance level — the two filters AND.
+        ''' </summary>
+        Public Property InstallationFilterJson As String
+
+        ''' <summary>
+        ''' JSON array of instance IDs this destination cares about.
+        ''' Empty/null = all instances. Applied on top of the installation
+        ''' filter — an event must pass both to be sent.
+        ''' </summary>
+        Public Property InstanceFilterJson As String
+
+        Public Property VisibilityProfileId As String
+
+        ''' <summary>
+        ''' Optional per-event-type template overrides as JSON:
+        ''' { "InstanceStarted": "🟢 {InstanceName} is up on {NodeName}", ... }
+        ''' Keys not present fall back to built-in defaults.
+        ''' </summary>
+        Public Property TemplateOverridesJson As String
+
+        Public Property CreatedUtc As DateTime
+        Public Property UpdatedUtc As DateTime
+    End Class
+
+    ' ============================================================
+    '  Session history — Round B of cross-instance entity tracking
+    '
+    '  Three tables work together to answer questions like
+    '  "what did Alice type last Tuesday while she was playing
+    '  on tile T3" even if that tile has since migrated between
+    '  instances or to a different node.
+    '
+    '  The primary key for cross-instance correlation is
+    '  SessionIdentity, produced by the game plugin's log parser.
+    '  For games with no migration concept, session identity
+    '  collapses to "{gameId}:{instanceId}" and everything still
+    '  works — there's just one session per instance and no
+    '  transitions to record.
+    ' ============================================================
+
+    ''' <summary>
+    ''' A single chat message captured from a game server. Keyed
+    ''' by SessionIdentity + TimestampUtc so queries like
+    ''' "all chat on this tile ever" and "all chat today" are
+    ''' both cheap. Retention is time-based (configurable via
+    ''' AppSetting "ChatRetentionDays") so the table doesn't
+    ''' grow without bound.
+    ''' </summary>
+    Public Class ChatMessageEntity
+        Public Property MessageId As String
+        Public Property SessionIdentity As String
+        ''' <summary>Node that captured this message. Useful for
+        ''' filtering "all chat across any tile on node X".</summary>
+        Public Property NodeId As String
+        ''' <summary>Instance that hosted the session when this
+        ''' message was captured. May differ across messages of
+        ''' the same SessionIdentity if the tile migrated.</summary>
+        Public Property InstanceId As String
+        Public Property TimestampUtc As DateTime
+        Public Property PlayerName As String
+        Public Property Text As String
+    End Class
+
+    ''' <summary>
+    ''' Aggregated per-player activity on a session. UPSERTed
+    ''' on every join/leave observation: first join creates a
+    ''' row, subsequent observations update LastSeenUtc. This is
+    ''' the "who played on this tile ever" index and answers the
+    ''' "last seen" query in O(1) lookup. Never pruned by
+    ''' retention — the user wants this to survive until a realm
+    ''' is actually nuked (realm_id changes → new SessionIdentity
+    ''' → new row set).
+    ''' </summary>
+    Public Class PlayerSessionEntity
+        Public Property PlayerSessionId As String
+        Public Property SessionIdentity As String
+        Public Property PlayerName As String
+        Public Property FirstSeenUtc As DateTime
+        Public Property LastSeenUtc As DateTime
+        ''' <summary>Most recently observed instance that hosted
+        ''' this player's session. For forensics / "who was
+        ''' hosting when Alice logged off".</summary>
+        Public Property LastHostInstanceId As String
+    End Class
+
+    ''' <summary>
+    ''' Audit trail of which instance hosted which session-identity
+    ''' and when. One row per (SessionIdentity, InstanceId) hosting
+    ''' window. HostedUntilUtc is Nothing while the instance is
+    ''' actively hosting; the row is closed out when the parser
+    ''' observes a TileUnloaded event or the SessionIdentity
+    ''' changes.
+    '''
+    ''' Not strictly required for the user-facing features, but
+    ''' makes forensic questions answerable without trawling logs:
+    ''' "which instance was hosting tile T at 03:17 last Tuesday".
+    ''' </summary>
+    Public Class SessionHostEntity
+        Public Property HostId As String
+        Public Property SessionIdentity As String
+        Public Property InstanceId As String
+        Public Property HostedFromUtc As DateTime
+        ''' <summary>Nothing means still hosting.</summary>
+        Public Property HostedUntilUtc As DateTime?
+        ''' <summary>
+        ''' Human-readable tile/session name at the time this row
+        ''' was opened. Tile names can change across game updates
+        ''' for the same underlying tile_id, so each hosting window
+        ''' stamps the name as-seen and UI queries use the most
+        ''' recent row's name when resolving SessionIdentity to a
+        ''' display label. Nothing when the plugin doesn't supply
+        ''' one (e.g. games without migration semantics).
+        ''' </summary>
+        Public Property TileName As String
+    End Class
+
+    ''' <summary>
+    ''' Append-only log of every individual player join and leave
+    ''' observation. Added in Round D1 to support the History
+    ''' window's timeline view and snapshot mode ("who was online
+    ''' at this moment") — both need the individual transitions,
+    ''' not the aggregated first-seen/last-seen in PlayerSessions.
+    '''
+    ''' Written alongside PlayerSessions on every observation:
+    ''' PlayerSessions = per-player summary, PlayerActivity =
+    ''' full event stream.
+    '''
+    ''' Retention: NEVER pruned by time. This is identity-scoped
+    ''' data (keyed by SessionIdentity) — the same class as
+    ''' PlayerSessions and SessionHosts. Pruning by time would
+    ''' break "last seen" lookups months or years after a player
+    ''' was on, which defeats the reason the table exists. Rows
+    ''' naturally become orphans when a realm's identity changes
+    ''' (realm nuked → new realm_id → new SessionIdentity); that's
+    ''' the only cleanup mechanism, and it's implicit.
+    ''' </summary>
+    Public Class PlayerActivityEntity
+        Public Property ActivityId As String
+        Public Property SessionIdentity As String
+        Public Property NodeId As String
+        Public Property InstanceId As String
+        Public Property TimestampUtc As DateTime
+        Public Property PlayerName As String
+        ''' <summary>"join" or "leave" — stored as lowercase string
+        ''' for future extensibility (kick, ban, etc.). Kept short
+        ''' so index covering is cheap.</summary>
+        Public Property EventKind As String
+    End Class
+
+    ''' <summary>
+    ''' Generic key-value store for manager-level preferences.
+    ''' Introduced in Round B for ChatRetentionDays; reusable for
+    ''' future global settings without schema churn. Not intended
+    ''' for per-entity configuration — use ConfigJson fields on
+    ''' the relevant entity for those.
+    ''' </summary>
+    Public Class AppSettingEntity
+        Public Property SettingKey As String
+        Public Property Value As String
+    End Class
+
     ' ============================================================
     '  DbContext
     ' ============================================================
@@ -171,10 +510,16 @@ Namespace GSM.Manager.Data
         Public Property Instances As DbSet(Of InstanceEntity)
         Public Property AutomationRules As DbSet(Of AutomationRuleEntity)
         Public Property SteamCredentials As DbSet(Of SteamCredentialEntity)
-        Public Property RealmCredentials As DbSet(Of RealmCredentialEntity)
         Public Property NotificationPlugins As DbSet(Of NotificationPluginEntity)
         Public Property NotificationSubscriptions As DbSet(Of NotificationSubscriptionEntity)
         Public Property RuleExecutions As DbSet(Of RuleExecutionEntity)
+        Public Property VisibilityProfiles As DbSet(Of VisibilityProfileEntity)
+        Public Property NotificationDestinations As DbSet(Of NotificationDestinationEntity)
+        Public Property ChatMessages As DbSet(Of ChatMessageEntity)
+        Public Property PlayerSessions As DbSet(Of PlayerSessionEntity)
+        Public Property SessionHosts As DbSet(Of SessionHostEntity)
+        Public Property PlayerActivity As DbSet(Of PlayerActivityEntity)
+        Public Property AppSettings As DbSet(Of AppSettingEntity)
 
         Protected Overrides Sub OnModelCreating(modelBuilder As ModelBuilder)
             modelBuilder.ApplyConfiguration(New NodeEntityConfig())
@@ -182,10 +527,16 @@ Namespace GSM.Manager.Data
             modelBuilder.ApplyConfiguration(New InstanceEntityConfig())
             modelBuilder.ApplyConfiguration(New AutomationRuleEntityConfig())
             modelBuilder.ApplyConfiguration(New SteamCredentialEntityConfig())
-            modelBuilder.ApplyConfiguration(New RealmCredentialEntityConfig())
             modelBuilder.ApplyConfiguration(New NotificationPluginEntityConfig())
             modelBuilder.ApplyConfiguration(New NotificationSubscriptionEntityConfig())
             modelBuilder.ApplyConfiguration(New RuleExecutionEntityConfig())
+            modelBuilder.ApplyConfiguration(New VisibilityProfileEntityConfig())
+            modelBuilder.ApplyConfiguration(New NotificationDestinationEntityConfig())
+            modelBuilder.ApplyConfiguration(New ChatMessageEntityConfig())
+            modelBuilder.ApplyConfiguration(New PlayerSessionEntityConfig())
+            modelBuilder.ApplyConfiguration(New SessionHostEntityConfig())
+            modelBuilder.ApplyConfiguration(New PlayerActivityEntityConfig())
+            modelBuilder.ApplyConfiguration(New AppSettingEntityConfig())
         End Sub
 
     End Class
@@ -223,6 +574,31 @@ Namespace GSM.Manager.Data
         Public Sub Configure(builder As EntityTypeBuilder(Of InstanceEntity)) Implements IEntityTypeConfiguration(Of InstanceEntity).Configure
             builder.HasKey(Function(i) i.InstanceId)
             builder.Property(Function(i) i.GameId).IsRequired().HasMaxLength(100)
+            ' Phase 1 restart-scheduling fields — cap string widths
+            ' so the generated SQLite columns don't end up as
+            ' unbounded TEXT. RestartCron holds a cron expression
+            ' (5–6 fields, whitespace-separated; 100 chars is plenty),
+            ' RestartRuleId holds a GUID-"N" style identifier (32
+            ' chars, but keep 100 for consistency with other FK
+            ' columns in the schema).
+            builder.Property(Function(i) i.RestartCron).HasMaxLength(100)
+            builder.Property(Function(i) i.RestartRuleId).HasMaxLength(100)
+            ' InstanceSetTag is a free-form user label, max 100
+            ' chars to match the other identifier-shaped columns
+            ' in the schema. Indexed because the dominant access
+            ' pattern at rule-firing time is
+            '   WHERE InstanceSetTag = X [AND GameId = Y]
+            ' across the whole Instances table — unindexed it'd
+            ' be a full scan on every InstanceSet-scoped rule
+            ' evaluation.
+            builder.Property(Function(i) i.InstanceSetTag).HasMaxLength(100)
+            builder.HasIndex(Function(i) i.InstanceSetTag)
+            ' SortOrder gets an index so the "list instances in
+            ' order within an installation" query doesn't scan
+            ' the full table. Composite with InstallationId so
+            ' the index is directly usable for the common
+            ' WHERE InstallationId = X ORDER BY SortOrder query.
+            builder.HasIndex(Function(i) New With {i.InstallationId, i.SortOrder})
             builder.HasOne(Function(i) i.Installation).
                 WithMany(Function(inst) inst.Instances).
                 HasForeignKey(Function(i) i.InstallationId)
@@ -235,6 +611,16 @@ Namespace GSM.Manager.Data
         Public Sub Configure(builder As EntityTypeBuilder(Of AutomationRuleEntity)) Implements IEntityTypeConfiguration(Of AutomationRuleEntity).Configure
             builder.HasKey(Function(r) r.RuleId)
             builder.Property(Function(r) r.RuleName).IsRequired().HasMaxLength(200)
+            ' GameFilter holds a GameId ("lastoasis", "factorio")
+            ' which matches InstallationEntity.GameId's 100-char
+            ' cap. Not indexed — the engine reads all enabled
+            ' rules at startup/reload, so per-rule filter is in
+            ' memory.
+            builder.Property(Function(r) r.GameFilter).HasMaxLength(100)
+            ' SortOrder index for the Automation Rules window's
+            ' "ORDER BY SortOrder" query. Cheap to maintain since
+            ' rules are mutated rarely compared to e.g. instances.
+            builder.HasIndex(Function(r) r.SortOrder)
         End Sub
     End Class
 
@@ -244,15 +630,6 @@ Namespace GSM.Manager.Data
         Public Sub Configure(builder As EntityTypeBuilder(Of SteamCredentialEntity)) Implements IEntityTypeConfiguration(Of SteamCredentialEntity).Configure
             builder.HasKey(Function(c) c.CredentialId)
             builder.Property(Function(c) c.Username).IsRequired().HasMaxLength(200)
-        End Sub
-    End Class
-
-    Public Class RealmCredentialEntityConfig
-        Implements IEntityTypeConfiguration(Of RealmCredentialEntity)
-
-        Public Sub Configure(builder As EntityTypeBuilder(Of RealmCredentialEntity)) Implements IEntityTypeConfiguration(Of RealmCredentialEntity).Configure
-            builder.HasKey(Function(c) c.CredentialId)
-            builder.Property(Function(c) c.GameId).IsRequired().HasMaxLength(100)
         End Sub
     End Class
 
@@ -282,6 +659,113 @@ Namespace GSM.Manager.Data
             builder.Property(Function(e) e.RuleId).IsRequired().HasMaxLength(100)
             builder.HasIndex(Function(e) e.RuleId)
             builder.HasIndex(Function(e) e.StartedAtUtc)
+        End Sub
+    End Class
+
+    Public Class VisibilityProfileEntityConfig
+        Implements IEntityTypeConfiguration(Of VisibilityProfileEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of VisibilityProfileEntity)) Implements IEntityTypeConfiguration(Of VisibilityProfileEntity).Configure
+            builder.HasKey(Function(e) e.ProfileId)
+            builder.Property(Function(e) e.DisplayName).IsRequired().HasMaxLength(100)
+        End Sub
+    End Class
+
+    Public Class NotificationDestinationEntityConfig
+        Implements IEntityTypeConfiguration(Of NotificationDestinationEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of NotificationDestinationEntity)) Implements IEntityTypeConfiguration(Of NotificationDestinationEntity).Configure
+            builder.HasKey(Function(e) e.DestinationId)
+            builder.Property(Function(e) e.DisplayName).IsRequired().HasMaxLength(100)
+            builder.Property(Function(e) e.TransportKind).IsRequired().HasMaxLength(40)
+            builder.HasIndex(Function(e) e.Enabled)
+        End Sub
+    End Class
+
+    Public Class ChatMessageEntityConfig
+        Implements IEntityTypeConfiguration(Of ChatMessageEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of ChatMessageEntity)) Implements IEntityTypeConfiguration(Of ChatMessageEntity).Configure
+            builder.HasKey(Function(m) m.MessageId)
+            builder.Property(Function(m) m.SessionIdentity).IsRequired().HasMaxLength(200)
+            builder.Property(Function(m) m.NodeId).HasMaxLength(100)
+            builder.Property(Function(m) m.InstanceId).HasMaxLength(100)
+            builder.Property(Function(m) m.PlayerName).HasMaxLength(100)
+            builder.Property(Function(m) m.Text).HasMaxLength(4000)
+            ' Composite index for the dominant query: "give me chat
+            ' for this session, newest first". Covers both the live
+            ' chat panel and the retention pruner (which scans by
+            ' timestamp range).
+            builder.HasIndex(Function(m) New With {m.SessionIdentity, m.TimestampUtc})
+            ' Secondary index for retention pruning — the pruner
+            ' queries WHERE TimestampUtc < cutoff regardless of
+            ' session, so give it a dedicated index.
+            builder.HasIndex(Function(m) m.TimestampUtc)
+        End Sub
+    End Class
+
+    Public Class PlayerSessionEntityConfig
+        Implements IEntityTypeConfiguration(Of PlayerSessionEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of PlayerSessionEntity)) Implements IEntityTypeConfiguration(Of PlayerSessionEntity).Configure
+            builder.HasKey(Function(p) p.PlayerSessionId)
+            builder.Property(Function(p) p.SessionIdentity).IsRequired().HasMaxLength(200)
+            builder.Property(Function(p) p.PlayerName).IsRequired().HasMaxLength(100)
+            builder.Property(Function(p) p.LastHostInstanceId).HasMaxLength(100)
+            ' Unique composite key for UPSERT: at most one row per
+            ' (session, player). Round C's persistence logic
+            ' looks up by this and updates in place.
+            builder.HasIndex(Function(p) New With {p.SessionIdentity, p.PlayerName}).IsUnique()
+            ' "Who's been here lately" queries sort by LastSeenUtc
+            ' — cover that without scanning.
+            builder.HasIndex(Function(p) New With {p.SessionIdentity, p.LastSeenUtc})
+        End Sub
+    End Class
+
+    Public Class SessionHostEntityConfig
+        Implements IEntityTypeConfiguration(Of SessionHostEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of SessionHostEntity)) Implements IEntityTypeConfiguration(Of SessionHostEntity).Configure
+            builder.HasKey(Function(h) h.HostId)
+            builder.Property(Function(h) h.SessionIdentity).IsRequired().HasMaxLength(200)
+            builder.Property(Function(h) h.InstanceId).IsRequired().HasMaxLength(100)
+            builder.Property(Function(h) h.TileName).HasMaxLength(200)
+            builder.HasIndex(Function(h) New With {h.SessionIdentity, h.HostedFromUtc})
+            ' Needed by the "close the currently-open row" UPSERT
+            ' in Round C — there should be at most one open row
+            ' per SessionIdentity at a time, but the query still
+            ' needs to find it quickly.
+            builder.HasIndex(Function(h) New With {h.InstanceId, h.HostedUntilUtc})
+        End Sub
+    End Class
+
+    Public Class PlayerActivityEntityConfig
+        Implements IEntityTypeConfiguration(Of PlayerActivityEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of PlayerActivityEntity)) Implements IEntityTypeConfiguration(Of PlayerActivityEntity).Configure
+            builder.HasKey(Function(a) a.ActivityId)
+            builder.Property(Function(a) a.SessionIdentity).IsRequired().HasMaxLength(200)
+            builder.Property(Function(a) a.NodeId).HasMaxLength(100)
+            builder.Property(Function(a) a.InstanceId).HasMaxLength(100)
+            builder.Property(Function(a) a.PlayerName).IsRequired().HasMaxLength(100)
+            builder.Property(Function(a) a.EventKind).IsRequired().HasMaxLength(20)
+            ' The dominant query is the History-window timeline:
+            ' "give me all activity for session X in time range Y".
+            ' Composite index covers it.
+            builder.HasIndex(Function(a) New With {a.SessionIdentity, a.TimestampUtc})
+            ' For the "filter by player name" query path, where the
+            ' caller may not know which session(s) to look in.
+            builder.HasIndex(Function(a) New With {a.PlayerName, a.TimestampUtc})
+        End Sub
+    End Class
+
+    Public Class AppSettingEntityConfig
+        Implements IEntityTypeConfiguration(Of AppSettingEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of AppSettingEntity)) Implements IEntityTypeConfiguration(Of AppSettingEntity).Configure
+            builder.HasKey(Function(s) s.SettingKey)
+            builder.Property(Function(s) s.SettingKey).HasMaxLength(100)
+            builder.Property(Function(s) s.Value).HasMaxLength(4000)
         End Sub
     End Class
 
@@ -328,6 +812,145 @@ Namespace GSM.Manager.Data
             Dim options = New DbContextOptionsBuilder(Of GsmDbContext)().
                 UseSqlite($"Data Source={dbPath}").Options
             Return New GsmDbContext(options)
+        End Function
+
+        ' ============================================================
+        '  AppSettings helpers — typed read/write on the KV table
+        '
+        '  Centralized here so Round C (retention pruner), Round D
+        '  (settings UI) and any future caller all use the same
+        '  parsing rules. All misses return the supplied default;
+        '  malformed values are treated as misses (not errors) so
+        '  a typo in the DB can't crash the app.
+        ' ============================================================
+
+        ''' <summary>
+        ''' Read a string setting. Returns defaultValue if the key
+        ''' is absent.
+        ''' </summary>
+        <Runtime.CompilerServices.Extension>
+        Public Function GetSetting(db As GsmDbContext,
+                                    key As String,
+                                    defaultValue As String) As String
+            Dim row = db.AppSettings.Find(key)
+            If row Is Nothing OrElse row.Value Is Nothing Then Return defaultValue
+            Return row.Value
+        End Function
+
+        ''' <summary>
+        ''' Read an integer setting. Returns defaultValue if the key
+        ''' is absent or the stored text doesn't parse as Int32.
+        ''' </summary>
+        <Runtime.CompilerServices.Extension>
+        Public Function GetSettingInt(db As GsmDbContext,
+                                       key As String,
+                                       defaultValue As Integer) As Integer
+            Dim row = db.AppSettings.Find(key)
+            If row Is Nothing OrElse String.IsNullOrEmpty(row.Value) Then Return defaultValue
+            Dim parsed As Integer
+            If Integer.TryParse(row.Value, parsed) Then Return parsed
+            Return defaultValue
+        End Function
+
+        ''' <summary>
+        ''' Write a string setting, creating the row if absent.
+        ''' Caller is responsible for SaveChanges.
+        ''' </summary>
+        <Runtime.CompilerServices.Extension>
+        Public Sub SetSetting(db As GsmDbContext, key As String, value As String)
+            Dim row = db.AppSettings.Find(key)
+            If row Is Nothing Then
+                db.AppSettings.Add(New AppSettingEntity With {.SettingKey = key, .Value = value})
+            Else
+                row.Value = value
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Well-known setting keys. Use these instead of string
+        ''' literals so typos are compile errors.
+        ''' </summary>
+        Public Class SettingKeys
+            Public Const ChatRetentionDays As String = "ChatRetentionDays"
+            ''' <summary>
+            ''' JSON array of TreeNode.Tag values that were expanded
+            ''' when the Manager last closed. Restored on next start so
+            ''' the user doesn't have to re-expand the same nodes every
+            ''' time. Stored as JSON for safe round-tripping of any
+            ''' future tag formats.
+            ''' </summary>
+            Public Const TreeExpandedTags As String = "TreeExpandedTags"
+        End Class
+
+        ''' <summary>
+        ''' Default retention in days. Used by the pruner when the
+        ''' AppSetting row is absent (first run). Can be overridden
+        ''' per-install via the settings UI in Round D.
+        ''' </summary>
+        Public Const DefaultChatRetentionDays As Integer = 90
+
+        ' ============================================================
+        '  SortOrder helpers
+        '
+        '  Instance rows within an installation are ordered by
+        '  SortOrder ASC. New inserts must pick a SortOrder that
+        '  places them at the end of the sibling list; colliding
+        '  values are tolerated (ties break on CreatedUtc) but
+        '  produce non-deterministic ordering which is a poor UX.
+        ' ============================================================
+
+        ''' <summary>
+        ''' Returns the next SortOrder value to use when inserting
+        ''' a new instance into the given installation. Computes
+        ''' max(SortOrder)+1 across existing siblings; returns 1
+        ''' for the first instance in an installation. Caller is
+        ''' responsible for using this value on the new entity
+        ''' BEFORE SaveChanges.
+        ''' </summary>
+        <Runtime.CompilerServices.Extension>
+        Public Function NextSortOrder(db As GsmDbContext,
+                                       installationId As String) As Integer
+            If String.IsNullOrEmpty(installationId) Then Return 1
+            Dim currentMax As Integer = 0
+            Try
+                ' DefaultIfEmpty(0).Max() avoids the
+                ' "Sequence contains no elements" exception when
+                ' the installation has zero instances yet — which
+                ' happens on the first insert after creating a new
+                ' installation.
+                currentMax = db.Instances.
+                    Where(Function(i) i.InstallationId = installationId).
+                    Select(Function(i) i.SortOrder).
+                    DefaultIfEmpty(0).
+                    Max()
+            Catch
+                ' On any DB-side failure, fall through to 1. Worst
+                ' case the new row gets SortOrder=1 which collides
+                ' with an existing one; ties break on CreatedUtc
+                ' at display time.
+                currentMax = 0
+            End Try
+            Return currentMax + 1
+        End Function
+
+        ''' <summary>
+        ''' Like NextSortOrder but for AutomationRules. Computes
+        ''' max(SortOrder)+1 across all rules so a freshly created
+        ''' rule lands at the end of the existing list. Same
+        ''' DefaultIfEmpty(0) safety as the instance variant.
+        ''' </summary>
+        <Runtime.CompilerServices.Extension>
+        Public Function NextRuleSortOrder(db As GsmDbContext) As Integer
+            Dim currentMax As Integer = 0
+            Try
+                currentMax = db.AutomationRules.
+                    Select(Function(r) r.SortOrder).
+                    DefaultIfEmpty(0).
+                    Max()
+            Catch
+                currentMax = 0
+            End Try
+            Return currentMax + 1
         End Function
 
     End Module

@@ -10,6 +10,7 @@ Imports Microsoft.Extensions.Logging
 Imports NCrontab
 Imports GSM.Plugin
 Imports GSM.Automation
+Imports GSM.Notification
 Imports GSM.Manager
 Imports GSM.Manager.Data
 
@@ -83,8 +84,20 @@ Namespace GSM.Manager.Core
 
         ''' <summary>
         ''' Reloads rules from the database.
+        '''
+        ''' Self-starting: if the engine hasn't been Start()ed yet,
+        ''' or was previously Stop()ped, ReloadRules now synthesises
+        ''' a fresh CTS so cron timers can arm against it. This
+        ''' makes ReloadRules safe to call from UI paths (e.g.
+        ''' EditInstanceForm after save) without requiring the
+        ''' caller to know about engine lifecycle state. Saved one
+        ''' prior crash where the engine was never started at all.
         ''' </summary>
         Public Sub ReloadRules()
+            If _engineCts Is Nothing OrElse _engineCts.IsCancellationRequested Then
+                _engineCts = New CancellationTokenSource()
+            End If
+
             ' Stop existing timers
             For Each kvp In _cronTimers
                 kvp.Value.Stop()
@@ -135,8 +148,14 @@ Namespace GSM.Manager.Core
                     timer.Start(_engineCts.Token)
                 End If
             End If
-            ' StateChange and VersionMismatch triggers are event-driven
-            ' and will be wired up when those events are implemented
+            ' StateChange triggers are event-driven and will be
+            ' wired up when state-change events are implemented.
+            ' VersionMismatch triggers are event-driven via
+            ' RaiseVersionMismatchAsync — callers (plugins,
+            ' future version-check polling service) invoke that
+            ' method when they detect a mismatch, and the engine
+            ' fires matching rules. No per-rule setup needed here
+            ' since the matching happens at raise time.
         End Sub
 
         ' ============================================================
@@ -154,6 +173,167 @@ Namespace GSM.Manager.Core
             End If
             Await FireRuleAsync(rule, "Manual")
             Return True
+        End Function
+
+        ''' <summary>
+        ''' Raise a version-mismatch event for an installation.
+        ''' Fires every enabled rule with a VersionMismatchTrigger
+        ''' whose scope and target are affected by the change.
+        '''
+        ''' Phase 5 skeleton: this method is the integration point
+        ''' for future version-check polling. The actual polling
+        ''' service (SteamCMD app_info_print, Factorio API, etc.)
+        ''' is not yet implemented — this method exists so that
+        ''' when polling is added, version-mismatch rules already
+        ''' authored via the rule editor will fire automatically
+        ''' without further engine changes. Plugins that detect
+        ''' updates out-of-band can also call this directly.
+        '''
+        ''' Scope-matching logic mirrors the rest of the engine:
+        '''   Instance     - rule fires if the instance's
+        '''                  installation matches the parameter
+        '''                  (one rule fire per matching instance)
+        '''   Installation - rule fires if TargetId matches
+        '''   Node         - rule fires if the installation lives
+        '''                  on that node (with optional GameFilter)
+        '''   InstanceSet  - rule fires if any tagged instance
+        '''                  belongs to the installation
+        '''   AllInstances - always fires, optionally narrowed by
+        '''                  GameFilter
+        '''
+        ''' Idempotency / throttling is the caller's concern: this
+        ''' method has no "don't refire if user hasn't updated"
+        ''' logic. Callers that poll on a timer should track which
+        ''' installations they've already raised for and only call
+        ''' again when the upstream version changes again.
+        ''' </summary>
+        Public Async Function RaiseVersionMismatchAsync(installationId As String) As Task
+            If String.IsNullOrEmpty(installationId) Then Return
+
+            ' Resolve installation context once — we need the
+            ' GameId for filter matching, and the NodeId for
+            ' Node-scope rules.
+            Dim installGameId As String = Nothing
+            Dim installNodeId As String = Nothing
+            Dim setTagsForInstall As New HashSet(Of String)(StringComparer.Ordinal)
+            Dim instanceIdsForInstall As New List(Of String)
+
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim install = db.Installations.
+                        FirstOrDefault(Function(i) i.InstallationId = installationId)
+                    If install Is Nothing Then
+                        _logger.LogWarning(
+                            "RaiseVersionMismatchAsync: installation {Id} not found",
+                            installationId)
+                        Return
+                    End If
+                    installGameId = install.GameId
+                    installNodeId = install.NodeId
+
+                    ' Pre-compute the instances under this install
+                    ' and their set tags so we can match Instance
+                    ' and InstanceSet scopes without re-querying.
+                    For Each inst In db.Instances.
+                        Where(Function(i) i.InstallationId = installationId)
+                        instanceIdsForInstall.Add(inst.InstanceId)
+                        If Not String.IsNullOrEmpty(inst.InstanceSetTag) Then
+                            setTagsForInstall.Add(inst.InstanceSetTag)
+                        End If
+                    Next
+                End Using
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "Failed to resolve installation {Id} for version-mismatch raise",
+                    installationId)
+                Return
+            End Try
+
+            ' Iterate rules, match scope, fire matches. Snapshot
+            ' the rule list to a local List first so the dictionary
+            ' iteration doesn't fight a concurrent ReloadRules call.
+            Dim rulesSnapshot = _rules.Values.ToList()
+            Dim firedCount = 0
+
+            For Each rule In rulesSnapshot
+                If Not rule.IsEnabled Then Continue For
+                If Not (TypeOf rule.Trigger Is VersionMismatchTrigger) Then Continue For
+                If Not VersionMismatchRuleMatches(
+                    rule, installationId, installGameId, installNodeId,
+                    instanceIdsForInstall, setTagsForInstall) Then Continue For
+
+                ' Instance-scope rules fire once per matching
+                ' instance (since the rule's TargetId is one
+                ' specific instance). All other scopes fire once
+                ' for the rule itself — the rule's action will
+                ' do the multi-instance fan-out via
+                ' GetInstanceIdsForScope.
+                firedCount += 1
+                Try
+                    Await FireRuleAsync(rule, $"VersionMismatch:{installationId}")
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Failed to fire version-mismatch rule {Id}", rule.RuleId)
+                End Try
+            Next
+
+            _logger.LogInformation(
+                "Version mismatch raised for installation {Id}: {Count} rule(s) fired",
+                installationId, firedCount)
+        End Function
+
+        ''' <summary>
+        ''' Scope-aware match check for a version-mismatch rule
+        ''' against an affected installation. Returns true if the
+        ''' rule should fire for this installation.
+        '''
+        ''' GameFilter handling: applied only to multi-instance
+        ''' scopes (Installation, Node, InstanceSet, AllInstances).
+        ''' Instance scope already pins the game via the target
+        ''' instance, so GameFilter is ignored there.
+        ''' </summary>
+        Private Function VersionMismatchRuleMatches(
+                rule As AutomationRule,
+                installationId As String,
+                installGameId As String,
+                installNodeId As String,
+                instanceIdsForInstall As List(Of String),
+                setTagsForInstall As HashSet(Of String)) As Boolean
+
+            ' GameFilter pre-check (skipped for Instance scope).
+            If rule.Scope <> RuleScope.Instance AndAlso
+               Not String.IsNullOrEmpty(rule.GameFilter) AndAlso
+               Not String.Equals(rule.GameFilter, installGameId, StringComparison.Ordinal) Then
+                Return False
+            End If
+
+            Select Case rule.Scope
+                Case RuleScope.Instance
+                    ' Rule's TargetId is a specific instance; fires
+                    ' if that instance is under this installation.
+                    Return instanceIdsForInstall.Contains(rule.TargetId)
+
+                Case RuleScope.Installation
+                    Return String.Equals(
+                        rule.TargetId, installationId, StringComparison.Ordinal)
+
+                Case RuleScope.Node
+                    Return String.Equals(
+                        rule.TargetId, installNodeId, StringComparison.Ordinal)
+
+                Case RuleScope.InstanceSet
+                    ' Set is a string tag; rule fires if any
+                    ' instance under this installation carries
+                    ' the rule's TargetId tag.
+                    Return setTagsForInstall.Contains(If(rule.TargetId, ""))
+
+                Case RuleScope.AllInstances
+                    Return True
+
+                Case Else
+                    Return False
+            End Select
         End Function
 
         ''' <summary>
@@ -294,49 +474,58 @@ Namespace GSM.Manager.Core
         End Sub
 
         ' ============================================================
-        '  Rule deserialization
+        '  Rule deserialization / serialization
         ' ============================================================
 
+        ''' <summary>
+        ''' Hydrate an AutomationRule from a persisted entity.
+        ''' Phase 2: uses AutomationRuleSerializer for polymorphic
+        ''' trigger / conditions / action JSON. Falls back to the
+        ''' legacy dictionary shape for triggers written before
+        ''' Phase 2; on next save the rule rewrites in the new
+        ''' format automatically.
+        ''' </summary>
         Private Function DeserializeRule(entity As AutomationRuleEntity) As AutomationRule
-            ' For now, create a minimal rule structure.
-            ' Full JSON deserialization of polymorphic triggers/conditions/actions
-            ' would require a custom JsonConverter — left as a TODO.
             Dim rule As New AutomationRule With {
                 .RuleId = entity.RuleId,
                 .DisplayName = entity.RuleName,
                 .IsEnabled = entity.IsEnabled,
-                .TargetId = entity.TargetId
+                .TargetId = entity.TargetId,
+                .GameFilter = entity.GameFilter
             }
 
-            ' Parse scope
             Dim scopeVal As RuleScope
             If [Enum].TryParse(entity.ScopeKind, True, scopeVal) Then
                 rule.Scope = scopeVal
             End If
 
-            ' Trigger, conditions, and action deserialization
-            ' requires polymorphic JSON handling — placeholder for now
-            If Not String.IsNullOrEmpty(entity.TriggerJson) Then
-                Try
-                    ' Simple: check if it's a schedule trigger
-                    Dim triggerDoc = JsonSerializer.Deserialize(Of Dictionary(Of String, String))(entity.TriggerJson)
-                    If triggerDoc IsNot Nothing AndAlso triggerDoc.ContainsKey("cronExpression") Then
-                        rule.Trigger = New ScheduleTrigger With {
-                            .CronExpression = triggerDoc("cronExpression")
-                        }
-                    ElseIf triggerDoc IsNot Nothing AndAlso triggerDoc.ContainsKey("triggerId") Then
-                        Select Case triggerDoc("triggerId")
-                            Case "manual"
-                                rule.Trigger = New ManualTrigger()
-                            Case "version_mismatch"
-                                rule.Trigger = New VersionMismatchTrigger()
-                        End Select
-                    End If
-                Catch
-                End Try
-            End If
+            rule.Trigger = AutomationRuleSerializer.DeserializeTrigger(entity.TriggerJson)
+            rule.Conditions = AutomationRuleSerializer.DeserializeConditions(entity.ConditionsJson)
+            rule.Action = AutomationRuleSerializer.DeserializeAction(entity.ActionJson)
 
             Return rule
+        End Function
+
+        ''' <summary>
+        ''' Serialise an AutomationRule into its persistence form.
+        ''' Returns a fresh entity with JSON columns populated; the
+        ''' caller is responsible for adding/updating and saving it.
+        ''' Primary key fields (RuleId, timestamps) are NOT set by
+        ''' this method — the caller owns identity and audit fields.
+        ''' </summary>
+        Public Shared Function SerializeRuleToEntity(rule As AutomationRule,
+                                                      Optional existing As AutomationRuleEntity = Nothing) As AutomationRuleEntity
+            If rule Is Nothing Then Throw New ArgumentNullException(NameOf(rule))
+            Dim entity = If(existing, New AutomationRuleEntity())
+            entity.RuleName = rule.DisplayName
+            entity.IsEnabled = rule.IsEnabled
+            entity.ScopeKind = rule.Scope.ToString()
+            entity.TargetId = rule.TargetId
+            entity.GameFilter = rule.GameFilter
+            entity.TriggerJson = AutomationRuleSerializer.SerializeTrigger(rule.Trigger)
+            entity.ConditionsJson = AutomationRuleSerializer.SerializeConditions(rule.Conditions)
+            entity.ActionJson = AutomationRuleSerializer.SerializeAction(rule.Action)
+            Return entity
         End Function
 
     End Class
@@ -426,19 +615,330 @@ Namespace GSM.Manager.Core
             Return Await _instanceManager.SendRconCommandAsync(instanceId, command)
         End Function
 
+        ''' <summary>
+        ''' Delegates to the RestartCoordinator singleton for
+        ''' ready-signal waits. Resolved from the DI container
+        ''' lazily so this class doesn't need a ctor dep on the
+        ''' coordinator (which would add another node to the
+        ''' dependency graph around construction time).
+        ''' </summary>
+        Public Overrides Async Function WaitForReadySignal(instanceId As String,
+                                                            timeoutSeconds As Integer) As Task(Of Boolean)
+            Dim coordinator = ManagerProgram.Services?.GetService(Of RestartCoordinator)()
+            If coordinator Is Nothing Then
+                ' No coordinator wired — surface as a non-error
+                ' failure so the enclosing sequence still
+                ' progresses via the caller's fallback path.
+                _logger.LogWarning(
+                    "WaitForReadySignal called but RestartCoordinator is not registered")
+                Return False
+            End If
+            Return Await coordinator.WaitForReadySignalAsync(instanceId, timeoutSeconds)
+        End Function
+
+        ''' <summary>
+        ''' Delegates to RestartCoordinator.AcquireForInstanceAsync.
+        ''' Same lazy-resolve pattern as WaitForReadySignal — no
+        ''' ctor dep on the coordinator.
+        ''' </summary>
+        Public Overrides Async Function AcquireRestartSlot(instanceId As String) As Task(Of Boolean)
+            Dim coordinator = ManagerProgram.Services?.GetService(Of RestartCoordinator)()
+            If coordinator Is Nothing Then
+                _logger.LogWarning(
+                    "AcquireRestartSlot called but RestartCoordinator is not registered")
+                Return False
+            End If
+            Return Await coordinator.AcquireForInstanceAsync(instanceId)
+        End Function
+
+        ''' <summary>
+        ''' Delegates to RestartCoordinator.ReleaseForInstance.
+        ''' Synchronous (sub, not function) because
+        ''' CoordinatedRestartAction calls this from a Finally
+        ''' block and VB doesn't permit Await in Finally. The
+        ''' underlying release is synchronous anyway — just
+        ''' semaphore.Release() calls.
+        ''' </summary>
+        Public Overrides Sub ReleaseRestartSlot(instanceId As String)
+            Try
+                Dim coordinator = ManagerProgram.Services?.GetService(Of RestartCoordinator)()
+                If coordinator IsNot Nothing Then
+                    coordinator.ReleaseForInstance(instanceId)
+                End If
+            Catch ex As Exception
+                ' Release must never throw — it runs in Finally
+                ' paths and an exception here would mask the
+                ' original failure that caused the sequence to
+                ' bail. Swallow + log.
+                _logger.LogWarning(ex,
+                    "ReleaseRestartSlot threw for {Id}", instanceId)
+            End Try
+        End Sub
+
         Public Overrides Function GetInstanceIdsForInstallation(installationId As String) As Task(Of IReadOnlyList(Of String))
             Dim ids = _instanceManager.GetInstanceIdsForInstallation(installationId)
             Return Task.FromResult(ids)
+        End Function
+
+        ''' <summary>
+        ''' Resolve instance IDs for any rule scope. Implemented
+        ''' as a direct DB query rather than going through
+        ''' InstanceManager because the manager doesn't expose
+        ''' Node/InstanceSet/AllInstances lookups (and adding
+        ''' four near-identical helpers there for one caller
+        ''' would be churn).
+        '''
+        ''' For Installation scope we still delegate to
+        ''' InstanceManager so the existing call path keeps
+        ''' running through the same code (any future caching
+        ''' there benefits both). For other scopes we hit the
+        ''' DB directly.
+        '''
+        ''' Returns Task(Of) for interface symmetry even though
+        ''' we run synchronously — EF Core's sync APIs are fine
+        ''' here (no await chain to preserve), and wrapping the
+        ''' result in Task.FromResult avoids polluting the
+        ''' interface with a sync variant.
+        ''' </summary>
+        Public Overrides Function GetInstanceIdsForScope(scope As RuleScope,
+                                                          targetId As String,
+                                                          gameFilter As String) As Task(Of IReadOnlyList(Of String))
+            ' Instance scope is trivial — a single ID, no DB hit.
+            ' GameFilter is ignored here per contract.
+            If scope = RuleScope.Instance Then
+                Dim singleton As IReadOnlyList(Of String) =
+                    If(String.IsNullOrEmpty(targetId),
+                       CType(New List(Of String)(), IReadOnlyList(Of String)),
+                       CType(New List(Of String) From {targetId}, IReadOnlyList(Of String)))
+                Return Task.FromResult(singleton)
+            End If
+
+            ' Installation scope keeps going through the
+            ' manager so existing wiring is unchanged.
+            If scope = RuleScope.Installation Then
+                Dim ids = _instanceManager.GetInstanceIdsForInstallation(targetId)
+                If Not String.IsNullOrEmpty(gameFilter) Then
+                    ' GameFilter on Installation scope is normally
+                    ' redundant (an installation has one game),
+                    ' but apply it defensively in case the rule's
+                    ' filter was set when the scope changed.
+                    ids = ApplyGameFilter(ids, gameFilter)
+                End If
+                Return Task.FromResult(ids)
+            End If
+
+            ' Node, InstanceSet, AllInstances — direct DB query.
+            Dim result As New List(Of String)
+            Try
+                Using dbScope = ManagerProgram.Services.CreateScope()
+                    Dim db = dbScope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+
+                    Dim query = db.Instances.AsQueryable()
+
+                    Select Case scope
+                        Case RuleScope.Node
+                            ' Node scope filters via the parent
+                            ' Installation's NodeId. EF generates
+                            ' the JOIN automatically.
+                            If Not String.IsNullOrEmpty(targetId) Then
+                                query = query.Where(Function(i) i.Installation.NodeId = targetId)
+                            Else
+                                ' Empty TargetId on Node scope is
+                                ' a misconfigured rule — return
+                                ' empty rather than every instance.
+                                Return Task.FromResult(
+                                    CType(result, IReadOnlyList(Of String)))
+                            End If
+
+                        Case RuleScope.InstanceSet
+                            If Not String.IsNullOrEmpty(targetId) Then
+                                query = query.Where(Function(i) i.InstanceSetTag = targetId)
+                            Else
+                                Return Task.FromResult(
+                                    CType(result, IReadOnlyList(Of String)))
+                            End If
+
+                        Case RuleScope.AllInstances
+                            ' No scope-level filter; gameFilter
+                            ' applied below if set.
+
+                        Case Else
+                            ' Unknown scope — return empty rather
+                            ' than guessing.
+                            Return Task.FromResult(
+                                CType(result, IReadOnlyList(Of String)))
+                    End Select
+
+                    If Not String.IsNullOrEmpty(gameFilter) Then
+                        query = query.Where(Function(i) i.GameId = gameFilter)
+                    End If
+
+                    result = query.Select(Function(i) i.InstanceId).ToList()
+                End Using
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "GetInstanceIdsForScope failed for scope={Scope} target={Target}",
+                    scope, targetId)
+            End Try
+
+            Return Task.FromResult(CType(result, IReadOnlyList(Of String)))
+        End Function
+
+        ''' <summary>
+        ''' Filter an existing list of instance IDs by GameId via
+        ''' a DB lookup. Used by the Installation-scope path which
+        ''' gets its IDs from the InstanceManager (without GameId)
+        ''' but needs to honour the rule's GameFilter.
+        ''' </summary>
+        Private Function ApplyGameFilter(ids As IReadOnlyList(Of String),
+                                          gameFilter As String) As IReadOnlyList(Of String)
+            If ids Is Nothing OrElse ids.Count = 0 Then Return ids
+            Try
+                Using dbScope = ManagerProgram.Services.CreateScope()
+                    Dim db = dbScope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim filtered = db.Instances.
+                        Where(Function(i) ids.Contains(i.InstanceId) AndAlso
+                                          i.GameId = gameFilter).
+                        Select(Function(i) i.InstanceId).
+                        ToList()
+                    Return CType(filtered, IReadOnlyList(Of String))
+                End Using
+            Catch
+                ' On failure, return the unfiltered list — rule
+                ' execution proceeds rather than silently no-oping.
+                Return ids
+            End Try
         End Function
 
         Public Overrides Async Function UpdateInstallation(installationId As String) As Task(Of Boolean)
             Return Await _installationManager.UpdateAsync(installationId)
         End Function
 
-        Public Overrides Async Function SendNotification(pluginId As String,
+        Public Overrides Async Function SendNotification(destinationId As String,
                                                           message As String,
                                                           severity As NotificationSeverity) As Task
-            Await _notificationService.SendSimpleAsync(pluginId, message, severity)
+            ' Phase 4b-1.5: build a NotificationTokens bundle from
+            ' the firing rule's context so {Token} substitutions in
+            ' the user-authored message can resolve to actual
+            ' values (rule name, target instance/installation/node
+            ' display names, etc.). The bundle is built per-call
+            ' rather than cached on the context because rule
+            ' contexts are short-lived (one per firing) so caching
+            ' wouldn't help, and we'd rather pay the DB hit only
+            ' for rules that actually invoke a NotifyAction.
+            Dim tokens = BuildTokensFromContext()
+            Await _notificationService.SendToDestinationAsync(
+                destinationId, message, severity, tokens)
+        End Function
+
+        ''' <summary>
+        ''' Constructs a NotificationTokens bundle reflecting the
+        ''' firing rule's scope and target. Resolves IDs to display
+        ''' names by looking up the relevant entity. Tolerates
+        ''' missing entities (e.g. instance was deleted between
+        ''' rule arming and firing) by leaving the corresponding
+        ''' name token empty.
+        '''
+        ''' For multi-instance scopes (Installation, Node,
+        ''' InstanceSet, AllInstances) we don't populate per-
+        ''' instance tokens — the rule's action targets the whole
+        ''' set, so {InstanceName} would be ambiguous. Tokens
+        ''' that don't apply substitute to empty string in
+        ''' SubstituteTokens.
+        ''' </summary>
+        Private Function BuildTokensFromContext() As NotificationTokens
+            Dim t As New NotificationTokens With {
+                .RuleName = _rule.DisplayName
+            }
+
+            Try
+                Using dbScope = ManagerProgram.Services.CreateScope()
+                    Dim db = dbScope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+
+                    Select Case _rule.Scope
+                        Case RuleScope.Instance
+                            Dim inst = db.Instances.
+                                Where(Function(i) i.InstanceId = _rule.TargetId).
+                                FirstOrDefault()
+                            If inst IsNot Nothing Then
+                                t.InstanceId = inst.InstanceId
+                                t.InstanceName = inst.DisplayName
+                                t.GameId = inst.GameId
+                                t.InstallationId = inst.InstallationId
+                                ' Walk up to installation + node for
+                                ' richer token coverage. The user's
+                                ' message might reference {NodeName}
+                                ' even on an Instance-scoped rule.
+                                Dim install = db.Installations.
+                                    Where(Function(x) x.InstallationId = inst.InstallationId).
+                                    FirstOrDefault()
+                                If install IsNot Nothing Then
+                                    t.InstallationName = install.DisplayName
+                                    Dim node = db.Nodes.
+                                        Where(Function(n) n.NodeId = install.NodeId).
+                                        FirstOrDefault()
+                                    If node IsNot Nothing Then
+                                        t.NodeId = node.NodeId
+                                        t.NodeName = node.DisplayName
+                                    End If
+                                End If
+                            End If
+
+                        Case RuleScope.Installation
+                            Dim install = db.Installations.
+                                Where(Function(i) i.InstallationId = _rule.TargetId).
+                                FirstOrDefault()
+                            If install IsNot Nothing Then
+                                t.InstallationId = install.InstallationId
+                                t.InstallationName = install.DisplayName
+                                t.GameId = install.GameId
+                                Dim node = db.Nodes.
+                                    Where(Function(n) n.NodeId = install.NodeId).
+                                    FirstOrDefault()
+                                If node IsNot Nothing Then
+                                    t.NodeId = node.NodeId
+                                    t.NodeName = node.DisplayName
+                                End If
+                            End If
+
+                        Case RuleScope.Node
+                            Dim node = db.Nodes.
+                                Where(Function(n) n.NodeId = _rule.TargetId).
+                                FirstOrDefault()
+                            If node IsNot Nothing Then
+                                t.NodeId = node.NodeId
+                                t.NodeName = node.DisplayName
+                            End If
+                            ' GameFilter, when set, is the GameId
+                            ' for this rule's effective scope.
+                            If Not String.IsNullOrEmpty(_rule.GameFilter) Then
+                                t.GameId = _rule.GameFilter
+                            End If
+
+                        Case RuleScope.InstanceSet
+                            ' No first-class entity for sets — the
+                            ' tag IS the identity. Surface it via
+                            ' GameId only when a filter pins it down,
+                            ' otherwise leave per-target tokens empty.
+                            If Not String.IsNullOrEmpty(_rule.GameFilter) Then
+                                t.GameId = _rule.GameFilter
+                            End If
+
+                        Case RuleScope.AllInstances
+                            If Not String.IsNullOrEmpty(_rule.GameFilter) Then
+                                t.GameId = _rule.GameFilter
+                            End If
+                    End Select
+                End Using
+            Catch ex As Exception
+                ' Token resolution failure is non-fatal — the
+                ' notification still goes out, just with empty
+                ' substitutions where DB lookups failed.
+                _logger.LogWarning(ex,
+                    "Failed to resolve notification tokens for rule {Id}", _rule.RuleId)
+            End Try
+
+            Return t
         End Function
 
         Public Overrides Sub LogProgress(message As String)

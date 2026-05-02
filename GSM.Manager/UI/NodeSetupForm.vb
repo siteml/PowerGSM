@@ -1,5 +1,6 @@
 Imports System
 Imports System.Drawing
+Imports System.Threading.Tasks
 Imports System.Windows.Forms
 Imports System.Threading
 Imports Microsoft.Extensions.DependencyInjection
@@ -13,8 +14,23 @@ Imports GSM.Node.Api
 '  NodeSetupForm — add or edit a managed node
 '
 '  Collects host address, port, auth token, and display name.
-'  Has a "Test Connection" button that hits /api/version on
-'  the node to verify connectivity before saving.
+'  Has a "Test Connection" button that hits /api/status on the
+'  node to verify connectivity. Test success also surfaces the
+'  node's reported ServersDirectory so the user can confirm
+'  what path the manager will use as the parent for new
+'  installations on this node.
+'
+'  ServersDirectory is intentionally read-only here:
+'
+'    The node owns its own filesystem layout via nodesettings.json
+'    on the node machine. reloadOnChange:=True on that config
+'    binding means edits there pick up at runtime without a
+'    restart. Letting the manager remotely rewrite nodesettings.json
+'    would add a privileged endpoint and meaningful attack surface
+'     — a compromised manager could redirect a node to install
+'    into any directory it has write access to. The marginal UX
+'    win (don't have to SSH to change the path) doesn't justify
+'    that trade-off.
 ' ============================================================
 
 Namespace GSM.Manager.UI
@@ -26,6 +42,7 @@ Namespace GSM.Manager.UI
         Private _hostTextBox As TextBox
         Private _portNumeric As NumericUpDown
         Private _tokenTextBox As TextBox
+        Private _serversDirLabel As Label
         Private _testButton As Button
         Private _saveButton As Button
         Private _cancelButton As Button
@@ -34,16 +51,30 @@ Namespace GSM.Manager.UI
         Private ReadOnly _editNodeId As String  ' Nothing for new node
 
         Public Sub New(Optional editNodeId As String = Nothing)
+            FormIconHelper.ApplyTo(Me)
             _editNodeId = editNodeId
             InitializeControls()
             If _editNodeId IsNot Nothing Then
                 LoadExistingNode()
+                ' Fire-and-forget node status fetch so the form
+                ' opens with the ServersDirectory already populated
+                ' for an existing node. New-node path leaves it as
+                ' the placeholder until the user clicks Test
+                ' Connection — the host/port/token fields are blank
+                ' at that point so there's nothing to fetch with
+                ' anyway.
+                Task.Run(Async Function()
+                             Await FetchAndDisplayServersDirAsync(silent:=True)
+                         End Function)
             End If
         End Sub
 
         Private Sub InitializeControls()
             Me.Text = If(_editNodeId IsNot Nothing, "Edit Node", "Add Node")
-            Me.Size = New Size(500, 350)
+            ' Form height bumped from 350 to 400 to fit the
+            ' Servers Directory display row without the status
+            ' label and buttons getting clipped.
+            Me.Size = New Size(500, 400)
             Me.FormBorderStyle = FormBorderStyle.FixedDialog
             Me.MaximizeBox = False
             Me.MinimizeBox = False
@@ -78,6 +109,25 @@ Namespace GSM.Manager.UI
             _tokenTextBox = AddTextBox(150, y, 300)
             _tokenTextBox.UseSystemPasswordChar = True
             y += 35
+
+            ' Servers directory — read-only display populated by
+            ' Test Connection (and on form open for the edit path).
+            ' Using a Label rather than a disabled TextBox so the
+            ' value is selectable for copying without the visual
+            ' weight of a greyed-out edit control. AutoEllipsis
+            ' truncates long paths gracefully; full path is
+            ' available via tooltip.
+            AddLabel("Servers Directory:", 20, y)
+            _serversDirLabel = New Label()
+            _serversDirLabel.Location = New Point(150, y + 3)
+            _serversDirLabel.Size = New Size(300, 22)
+            _serversDirLabel.AutoSize = False
+            _serversDirLabel.AutoEllipsis = True
+            _serversDirLabel.ForeColor = Color.Gray
+            _serversDirLabel.Font = New Font("Segoe UI", 9)
+            _serversDirLabel.Text = "(test connection to fetch)"
+            Me.Controls.Add(_serversDirLabel)
+            y += 30
 
             ' Status label
             _statusLabel = New Label()
@@ -131,24 +181,104 @@ Namespace GSM.Manager.UI
             _statusLabel.Text = "Testing connection..."
             _statusLabel.ForeColor = Color.Gray
             _testButton.Enabled = False
+            Try
+                Await FetchAndDisplayServersDirAsync(silent:=False)
+            Finally
+                _testButton.Enabled = True
+            End Try
+        End Sub
 
+        ''' <summary>
+        ''' Hit the node's /api/status endpoint and update both the
+        ''' ServersDirectory display and (when not silent) the
+        ''' connection status label. Used by both the Test Connection
+        ''' button (silent=False, full status feedback) and the
+        ''' edit-mode auto-fetch on form open (silent=True, only
+        ''' updates the directory display so a network failure
+        ''' doesn't surprise the user with a red error message
+        ''' before they've touched anything).
+        ''' </summary>
+        Private Async Function FetchAndDisplayServersDirAsync(silent As Boolean) As Task
+            Dim host = ""
+            Dim port As Integer = 0
+            Dim token = ""
+            Try
+                ' Capture inputs on the UI thread; the rest runs off it.
+                If Me.IsDisposed Then Return
+                Me.Invoke(Sub()
+                              host = _hostTextBox.Text.Trim()
+                              port = CInt(_portNumeric.Value)
+                              token = _tokenTextBox.Text.Trim()
+                          End Sub)
+            Catch
+                Return
+            End Try
+
+            ' Empty host/token on the new-node path → nothing to fetch.
+            ' For the edit path LoadExistingNode populates these
+            ' before this runs, so they should be valid.
+            If String.IsNullOrEmpty(host) OrElse String.IsNullOrEmpty(token) Then
+                Return
+            End If
+
+            Dim status As NodeStatusResponse = Nothing
+            Dim errMsg As String = Nothing
             Try
                 Dim factory = ManagerProgram.Services.GetRequiredService(Of NodeHttpClientFactory)()
                 Dim client = factory.GetClient(
                     "test-" & Guid.NewGuid().ToString("N"),
-                    _hostTextBox.Text.Trim(),
-                    CInt(_portNumeric.Value),
-                    _tokenTextBox.Text.Trim())
-
-                Dim status = Await client.GetStatusAsync(CancellationToken.None)
-                _statusLabel.Text = $"Connected! Node: {status.MachineName}, Instances: {status.RunningInstanceCount}"
-                _statusLabel.ForeColor = Color.DarkGreen
+                    host, port, token)
+                status = Await client.GetStatusAsync(CancellationToken.None)
             Catch ex As Exception
-                _statusLabel.Text = $"Connection failed: {ex.Message}"
-                _statusLabel.ForeColor = Color.Red
-            Finally
-                _testButton.Enabled = True
+                errMsg = ex.Message
             End Try
+
+            If Me.IsDisposed Then Return
+            Me.BeginInvoke(Sub() ApplyStatusResult(status, errMsg, silent))
+        End Function
+
+        ''' <summary>
+        ''' UI-thread continuation: update the directory label and
+        ''' (when not silent) the connection status label based on
+        ''' the fetch outcome.
+        ''' </summary>
+        Private Sub ApplyStatusResult(status As NodeStatusResponse,
+                                       errMsg As String,
+                                       silent As Boolean)
+            If status IsNot Nothing Then
+                ' Older nodes pre-dating the ServersDirectory field
+                ' on NodeStatusResponse will return an empty/null
+                ' value here. Show a clear "not reported" message
+                ' so the user knows they need to upgrade the node
+                ' rather than thinking the field is just blank.
+                If String.IsNullOrEmpty(status.ServersDirectory) Then
+                    _serversDirLabel.Text = "(not reported — node may need upgrading)"
+                    _serversDirLabel.ForeColor = Color.DarkOrange
+                Else
+                    _serversDirLabel.Text = status.ServersDirectory
+                    _serversDirLabel.ForeColor = Color.Black
+                End If
+
+                If Not silent Then
+                    _statusLabel.Text = $"Connected! Node: {status.MachineName}, Instances: {status.RunningInstanceCount}"
+                    _statusLabel.ForeColor = Color.DarkGreen
+                End If
+            Else
+                ' Connection failed. In silent mode (auto-fetch on
+                ' edit-form open) we leave the status label alone
+                ' so the form doesn't open with a red error message
+                ' before the user has touched anything; just mark
+                ' the directory display as unavailable. In test
+                ' mode the user explicitly asked, so they get the
+                ' full failure detail.
+                _serversDirLabel.Text = "(could not reach node)"
+                _serversDirLabel.ForeColor = Color.Gray
+
+                If Not silent Then
+                    _statusLabel.Text = $"Connection failed: {errMsg}"
+                    _statusLabel.ForeColor = Color.Red
+                End If
+            End If
         End Sub
 
         Private Sub OnSave(sender As Object, e As EventArgs)

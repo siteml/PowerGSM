@@ -111,41 +111,6 @@ Namespace GSM.Manager.Core
         End Function
 
         ' ============================================================
-        '  Realm credentials
-        ' ============================================================
-
-        Public Sub SaveRealmCredential(db As GsmDbContext,
-                                       credentialId As String,
-                                       displayName As String,
-                                       gameId As String,
-                                       customerKey As String,
-                                       providerKey As String)
-
-            Dim existing = db.RealmCredentials.Find(credentialId)
-            If existing Is Nothing Then
-                existing = New RealmCredentialEntity With {
-                    .CredentialId = credentialId
-                }
-                db.RealmCredentials.Add(existing)
-            End If
-
-            existing.DisplayName = displayName
-            existing.GameId = gameId
-            existing.EncryptedCustomerKey = EncryptString(customerKey)
-            existing.EncryptedProviderKey = EncryptString(providerKey)
-
-            db.SaveChanges()
-        End Sub
-
-        Public Function DecryptRealmKeys(entity As RealmCredentialEntity) As (CustomerKey As String, ProviderKey As String)
-            Dim ck = If(entity.EncryptedCustomerKey IsNot Nothing AndAlso entity.EncryptedCustomerKey.Length > 0,
-                        DecryptString(entity.EncryptedCustomerKey), "")
-            Dim pk = If(entity.EncryptedProviderKey IsNot Nothing AndAlso entity.EncryptedProviderKey.Length > 0,
-                        DecryptString(entity.EncryptedProviderKey), "")
-            Return (ck, pk)
-        End Function
-
-        ' ============================================================
         '  DPAPI encryption helpers
         ' ============================================================
 

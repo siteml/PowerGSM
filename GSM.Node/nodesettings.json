@@ -8,6 +8,15 @@
     "LogRetentionDays": 30,
     "MetricsIntervalSeconds": 5
   },
+  "Security": {
+    "MaxFailedAttempts": 10,
+    "FailureWindowMinutes": 5,
+    "LockoutMinutes": 15,
+    "AuthFailureDelayMs": 250,
+    "RequestsPerMinutePerIp": 600,
+    "MaxRequestBodyBytes": 4194304,
+    "MaxConcurrentConnections": 100
+  },
   "Logging": {
     "LogLevel": {
       "Default": "Information",

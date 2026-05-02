@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace></RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OptionStrict>Off</OptionStrict>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionInfer>On</OptionInfer>
+    <AssemblyName>GSM.CtrlCSender</AssemblyName>
+    <!--
+      Helper is Windows-only (P/Invokes kernel32 console APIs that
+      have no Linux analogue) but we leave TargetFramework as plain
+      net8.0 so it builds on any host. Calling it on a non-Windows
+      OS is gated in the caller, not here.
+    -->
+  </PropertyGroup>
+
+</Project>

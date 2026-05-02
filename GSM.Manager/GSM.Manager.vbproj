@@ -10,20 +10,73 @@
     <OptionStrict>Off</OptionStrict>
     <OptionExplicit>On</OptionExplicit>
     <OptionInfer>On</OptionInfer>
+    <ApplicationIcon>PowerGSM.ico</ApplicationIcon>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\GSM.Contracts\GSM.Contracts.vbproj" />
+    <EmbeddedResource Include="PowerGSM.ico" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.0" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="8.0.0">
+    <!--
+      ExcludeFromSingleFile keeps GSM.Contracts.dll as a loose file
+      next to the .exe in single-file publish output. This is required
+      because PluginRegistry uses Roslyn at runtime to compile plugins,
+      and Roslyn needs Contracts as a MetadataReference. In a bundled
+      single-file build, Assembly.Location returns an empty string for
+      Contracts and there's no reliable way to feed it to Roslyn from
+      the bundle. Keeping Contracts loose costs ~10KB on disk and
+      sidesteps the entire problem.
+    -->
+    <ProjectReference Include="..\GSM.Contracts\GSM.Contracts.vbproj">
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </ProjectReference>
+  </ItemGroup>
+  
+  <ItemGroup>
+    <None Include="..\GSM.PluginsSource\*.vb">
+      <Link>Plugins\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+  
+  <ItemGroup>
+    <None Remove="ARRCON.exe" />
+  </ItemGroup>
+  
+  <ItemGroup>
+    <PackageReference Include="EntityFrameworkCore.VisualBasic" Version="8.0.0">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-    <PackageReference Include="Microsoft.CodeAnalysis.VisualBasic" Version="4.8.0" />
-    <PackageReference Include="NCrontab" Version="3.3.6" />
+    <PackageReference Include="Basic.Reference.Assemblies" Version="1.8.5" />
+    <PackageReference Include="Microsoft.CodeAnalysis.VisualBasic.Workspaces" Version="4.11.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="8.0.2">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.CodeAnalysis.VisualBasic" Version="4.11.0" />
+
+    <!--
+      Explicit pins on the CodeAnalysis transitive closure. Without
+      these, Microsoft.EntityFrameworkCore.Tools drags in
+      Microsoft.CodeAnalysis.CSharp 4.5.0 (and Workspaces 4.5.0),
+      which in turn pin Microsoft.CodeAnalysis.Common to 4.5.0 —
+      conflicting with the higher version required by
+      CodeAnalysis.VisualBasic above and by Basic.Reference.Assemblies.
+      Forcing the CSharp/Workspaces packages to the same 4.11.0 floor
+      aligns the whole Roslyn surface on one version.
+    -->
+    <PackageReference Include="Microsoft.CodeAnalysis.Common" Version="4.11.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.11.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.11.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.Common" Version="4.11.0" />
+
+    <PackageReference Include="NCrontab" Version="3.4.0" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />

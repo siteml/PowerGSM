@@ -1,6 +1,7 @@
 Imports System
 Imports System.Collections.Concurrent
 Imports System.Collections.Generic
+Imports System.Threading
 Imports System.Windows.Forms
 Imports Microsoft.EntityFrameworkCore
 Imports Microsoft.Extensions.DependencyInjection
@@ -38,9 +39,39 @@ Namespace GSM.Manager
             Dim serviceCollection As New ServiceCollection()
 
             ' Logging
+            '
+            ' WinForms apps don't have an attached console, so AddConsole
+            ' silently drops everything — messages exist nowhere unless
+            ' something else captures them. FileLoggerProvider writes
+            ' to logs/manager-YYYY-MM-DD.log next to the binary.
+            '
+            ' Category filters keep the file size sane. EF Core logs
+            ' every executed SQL statement at Information level under
+            ' Microsoft.EntityFrameworkCore.*, and ASP.NET / HTTP
+            ' lifecycle events fall under Microsoft.* and System.*.
+            ' Without these filters the file grew to ~90 MB/day on
+            ' a moderately active manager (95% framework chatter,
+            ' 5% application). Clamping framework categories to
+            ' Warning leaves us with our own GSM.Manager.*
+            ' Information lines plus genuine framework warnings
+            ' — useful diagnostic content, manageable volume.
+            Dim logsDir = IO.Path.Combine(AppContext.BaseDirectory, "logs")
+            Dim fileLogProvider As New FileLoggerProvider(logsDir, LogLevel.Information, "manager-")
+
+            ' Retention pass at startup. 30-day window picked to
+            ' cover "that thing happened a few weeks ago, can you
+            ' check the logs" without unbounded growth. Adjust if
+            ' the diagnostic horizon needs to be longer or the
+            ' disk pressure is real. Daily rotation means at most
+            ' one file is removed per startup until steady state.
+            fileLogProvider.PruneOldLogs(retentionDays:=30)
+
             serviceCollection.AddLogging(Sub(cfg)
                                              cfg.AddConsole()
+                                             cfg.AddProvider(fileLogProvider)
                                              cfg.SetMinimumLevel(LogLevel.Information)
+                                             cfg.AddFilter("Microsoft", LogLevel.Warning)
+                                             cfg.AddFilter("System", LogLevel.Warning)
                                          End Sub)
 
             ' Database
@@ -56,6 +87,11 @@ Namespace GSM.Manager
             ' Orphan detector
             serviceCollection.AddSingleton(Of PluginOrphanDetector)()
 
+            ' Register BEFORE InstanceManager / InstallationManager, since
+            ' those now take NotificationEmitter as a ctor parameter.
+            serviceCollection.AddSingleton(Of NotificationEmitter)()
+            serviceCollection.AddSingleton(Of DiscordWebhookPlugin)()
+
             ' ---- Phase 4 Core services ----
             serviceCollection.AddSingleton(Of NodeHttpClientFactory)()
             serviceCollection.AddSingleton(Of CredentialService)()
@@ -64,14 +100,24 @@ Namespace GSM.Manager
             serviceCollection.AddSingleton(Of InstallationManager)()
             serviceCollection.AddSingleton(Of NotificationService)()
             serviceCollection.AddSingleton(Of AutomationEngine)()
+            serviceCollection.AddSingleton(Of ChatRetentionPruner)()
+            serviceCollection.AddSingleton(Of VersionCheckService)()
+            serviceCollection.AddSingleton(Of HistoryQueryService)()
+            serviceCollection.AddSingleton(Of RestartCoordinator)()
 
             ' Build provider
             Services = serviceCollection.BuildServiceProvider()
 
-            ' Ensure database exists
+            ' Ensure database is up-to-date with current schema.
+            ' Migrate() applies any pending EF migrations — creates
+            ' the DB if it doesn't exist, adds new tables/columns
+            ' if we've added migrations since the last run, or no-ops
+            ' if we're current. This replaces the older
+            ' EnsureCreated() which didn't track migration history
+            ' and couldn't evolve the schema once created.
             Using scope = Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
-                db.Database.EnsureCreated()
+                db.Database.Migrate()
             End Using
 
             ' Load plugins on startup
@@ -86,10 +132,131 @@ Namespace GSM.Manager
                 MessageBox.Show(errMsg, "Plugin Errors", MessageBoxButtons.OK, MessageBoxIcon.Warning)
             End If
 
+            ' Register the Discord plugin with the NotificationService so
+            ' that BroadcastAsync reaches it. Blocks startup until the
+            ' plugin has its first config snapshot — otherwise early
+            ' events (from log streams reconnecting below, or from
+            ' anything the MainForm triggers on Shown) would be emitted
+            ' before the plugin knows which destinations are configured
+            ' and would silently drop.
+            Dim discordPlugin = Services.GetRequiredService(Of DiscordWebhookPlugin)()
+            Dim notifications = Services.GetRequiredService(Of NotificationService)()
+            Dim startupLogger = Services.
+                GetRequiredService(Of ILoggerFactory)().
+                CreateLogger("Startup")
+            Try
+                ' Webhooks are write-only — no inbound commands from
+                ' Discord, so pass Nothing for the IRemoteCommandHandler.
+                discordPlugin.InitialiseAsync(
+                    New Dictionary(Of String, String)(),
+                    Nothing,
+                    CancellationToken.None).GetAwaiter().GetResult()
+                notifications.RegisterPluginAsync(
+                    discordPlugin, CancellationToken.None).
+                    GetAwaiter().GetResult()
+            Catch ex As Exception
+                ' Never fatal — Manager runs with or without Discord.
+                startupLogger.LogWarning(ex, "Failed to register Discord plugin at startup")
+            End Try
+
+            ' After services built, before Application.Run(mainForm)
+            Dim mgr = Services.GetService(Of InstanceManager)()
+
+            ' Wire the restart coordinator to the instance manager.
+            ' Deferred bind (rather than ctor injection) breaks the
+            ' cycle: InstanceManager calls INTO RestartCoordinator
+            ' on TileLoaded events, and RestartCoordinator reads
+            ' live state FROM InstanceManager during ready-signal
+            ' waits. Ctor injection in both directions would
+            ' deadlock service construction.
+            Dim restartCoordinator = Services.GetService(Of RestartCoordinator)()
+            If restartCoordinator IsNot Nothing AndAlso mgr IsNot Nothing Then
+                restartCoordinator.AttachInstanceManager(mgr)
+                mgr.AttachRestartCoordinator(restartCoordinator)
+            End If
+
+            If mgr IsNot Nothing Then
+                Task.Run(Async Function()
+                             Await mgr.ReconnectLogStreamsAsync()
+                         End Function)
+
+                ' Kick off the background poller so crash / crash-loop
+                ' state transitions get detected for ALL instances, not
+                ' just whichever one the user has an open detail tab for.
+                mgr.StartBackgroundPolling()
+            End If
+
+            ' Start the chat-retention pruner. Idempotent + fail-soft
+            ' — pruner blow-ups log a warning but don't affect the app.
+            Dim pruner = Services.GetService(Of ChatRetentionPruner)()
+            If pruner IsNot Nothing Then
+                pruner.Start()
+            End If
+
+            ' Start the version-check service — polls each installation
+            ' on a 60-minute interval and raises VersionMismatch events
+            ' for rules that subscribed to them. Must start AFTER the
+            ' AutomationEngine because the service raises events into it.
+            Dim versionCheck = Services.GetService(Of VersionCheckService)()
+
+            ' Start the automation engine. Loads rules from the DB
+            ' and kicks off cron timers. Must happen AFTER services
+            ' are fully wired (coordinator + instance manager
+            ' attached above) because rule actions may depend on
+            ' those singletons at first fire.
+            Dim engine = Services.GetService(Of AutomationEngine)()
+            Try
+                engine?.Start()
+            Catch ex As Exception
+                startupLogger.LogWarning(ex, "AutomationEngine.Start threw at startup")
+            End Try
+
+            ' VersionCheckService starts AFTER the engine because it
+            ' calls AutomationEngine.RaiseVersionMismatchAsync when
+            ' it detects mismatches. If the engine isn't started
+            ' first, those calls would no-op silently.
+            If versionCheck IsNot Nothing Then
+                Try
+                    versionCheck.Start()
+                Catch ex As Exception
+                    startupLogger.LogWarning(ex, "VersionCheckService.Start threw at startup")
+                End Try
+            End If
+
             ' Launch main form
             Dim mainForm As New UI.MainForm()
             mainForm.SetStatus($"Plugins: {pluginSummary.LoadedPlugins.Count} loaded, {pluginSummary.CompilationErrors.Count} errors")
             Application.Run(mainForm)
+
+            ' Application.Run blocks until MainForm closes. Clean-shutdown
+            ' hooks go here — in reverse dependency order relative to startup.
+            Try
+                If versionCheck IsNot Nothing Then
+                    versionCheck.StopAsync().GetAwaiter().GetResult()
+                End If
+            Catch
+                ' Best-effort shutdown.
+            End Try
+
+            Try
+                engine?.Stop()
+            Catch
+            End Try
+
+            Try
+                If pruner IsNot Nothing Then
+                    pruner.StopAsync().GetAwaiter().GetResult()
+                End If
+            Catch
+                ' Best-effort shutdown — process is exiting anyway.
+            End Try
+
+            Try
+                If mgr IsNot Nothing Then
+                    mgr.StopBackgroundPollingAsync().GetAwaiter().GetResult()
+                End If
+            Catch
+            End Try
 
         End Sub
 

@@ -5,6 +5,7 @@ Imports Microsoft.AspNetCore.Http
 Imports Microsoft.Extensions.Logging
 Imports GSM.Node.Api
 Imports GSM.Node
+Imports GSM.Node.Security
 
 ' ============================================================
 '  System endpoints — version, status, auth
@@ -45,8 +46,7 @@ Namespace GSM.Node.Endpoints
                 Function(request As NodeAuthRequest,
                          config As NodeConfiguration) As IResult
 
-                    If String.Equals(request.SharedSecret, config.AuthToken,
-                                     StringComparison.Ordinal) Then
+                    If SecurityHelpers.FixedTimeStringEquals(request.SharedSecret, config.AuthToken) Then
                         Return Results.Ok(New NodeAuthResponse With {
                             .Accepted = True,
                             .SessionToken = Guid.NewGuid().ToString("N"),
@@ -81,6 +81,15 @@ Namespace GSM.Node.Endpoints
                         Return Results.Conflict(progress)
                     End If
                     Return Results.Accepted(Nothing, progress)
+                End Function)
+
+            ' Fast non-destructive version check
+            app.MapPost("/api/install/version-check",
+                Async Function(request As AppVersionCheckRequest,
+                               runner As InstallRunner,
+                               context As HttpContext) As Task(Of IResult)
+                    Dim result = Await runner.CheckAppVersionAsync(request, context.RequestAborted)
+                    Return Results.Ok(result)
                 End Function)
 
             ' Get install progress

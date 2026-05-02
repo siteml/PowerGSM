@@ -130,6 +130,40 @@ Namespace GSM.Node.Endpoints
                     Return Results.Ok(logStore.GetTail(instanceId, count))
                 End Function)
 
+            ' ---- Parsed events ----
+
+            app.MapGet("/api/instances/{instanceId}/players",
+                Function(instanceId As String,
+                         eventStore As EventStore) As IResult
+                    Return Results.Ok(eventStore.GetPlayers(instanceId))
+                End Function)
+
+            app.MapGet("/api/instances/{instanceId}/server-state",
+                Function(instanceId As String,
+                         eventStore As EventStore) As IResult
+                    Return Results.Ok(eventStore.GetServerState(instanceId))
+                End Function)
+
+            app.MapGet("/api/instances/{instanceId}/chat",
+                Function(instanceId As String,
+                         context As HttpContext,
+                         eventStore As EventStore) As IResult
+                    Dim limit = 500
+                    Integer.TryParse(context.Request.Query("limit").ToString(), limit)
+
+                    Dim sinceUtc As DateTime? = Nothing
+                    Dim sinceStr = context.Request.Query("since").ToString()
+                    If Not String.IsNullOrEmpty(sinceStr) Then
+                        Dim parsed As DateTime
+                        If DateTime.TryParse(sinceStr, Nothing,
+                                              Globalization.DateTimeStyles.RoundtripKind,
+                                              parsed) Then
+                            sinceUtc = parsed.ToUniversalTime()
+                        End If
+                    End If
+                    Return Results.Ok(eventStore.GetChatHistory(instanceId, sinceUtc, limit))
+                End Function)
+
         End Sub
 
     End Module

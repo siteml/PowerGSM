@@ -115,6 +115,55 @@ Namespace GSM.Manager.Core
             End Try
         End Function
 
+        Public Async Function GetRecentLogsAsync(instanceId As String,
+                                                  count As Integer,
+                                                  cancellation As CancellationToken) As Task(Of IReadOnlyList(Of LogLine)) Implements INodeClient.GetRecentLogsAsync
+            Try
+                Dim result = Await _httpClient.GetFromJsonAsync(Of List(Of LogLine))(
+                    $"/api/instances/{instanceId}/logs/recent?count={count}", cancellation)
+                Return If(result, New List(Of LogLine))
+            Catch ex As Exception
+                Throw WrapException("GetRecentLogs", ex)
+            End Try
+        End Function
+
+        Public Async Function GetPlayersAsync(instanceId As String,
+                                                cancellation As CancellationToken) As Task(Of IReadOnlyList(Of PlayerSession)) Implements INodeClient.GetPlayersAsync
+            Try
+                Dim result = Await _httpClient.GetFromJsonAsync(Of List(Of PlayerSession))(
+                    $"/api/instances/{instanceId}/players", cancellation)
+                Return If(result, New List(Of PlayerSession))
+            Catch ex As Exception
+                Throw WrapException("GetPlayers", ex)
+            End Try
+        End Function
+
+        Public Async Function GetServerStateAsync(instanceId As String,
+                                                    cancellation As CancellationToken) As Task(Of ServerStateResponse) Implements INodeClient.GetServerStateAsync
+            Try
+                Return Await _httpClient.GetFromJsonAsync(Of ServerStateResponse)(
+                    $"/api/instances/{instanceId}/server-state", cancellation)
+            Catch ex As Exception
+                Throw WrapException("GetServerState", ex)
+            End Try
+        End Function
+
+        Public Async Function GetChatHistoryAsync(instanceId As String,
+                                                    sinceUtc As DateTime?,
+                                                    limit As Integer,
+                                                    cancellation As CancellationToken) As Task(Of IReadOnlyList(Of ChatMessage)) Implements INodeClient.GetChatHistoryAsync
+            Try
+                Dim url = $"/api/instances/{instanceId}/chat?limit={limit}"
+                If sinceUtc.HasValue Then
+                    url &= "&since=" & Uri.EscapeDataString(sinceUtc.Value.ToString("o"))
+                End If
+                Dim result = Await _httpClient.GetFromJsonAsync(Of List(Of ChatMessage))(url, cancellation)
+                Return If(result, New List(Of ChatMessage))
+            Catch ex As Exception
+                Throw WrapException("GetChatHistory", ex)
+            End Try
+        End Function
+
         ' ---- Installation ----
 
         Public Async Function StartInstallAsync(request As InstallRequest,
@@ -125,6 +174,23 @@ Namespace GSM.Manager.Core
                 Return Await resp.Content.ReadFromJsonAsync(Of InstallProgressResponse)(cancellationToken:=cancellation)
             Catch ex As Exception
                 Throw WrapException("StartInstall", ex)
+            End Try
+        End Function
+
+        Public Async Function CheckAppVersionAsync(request As AppVersionCheckRequest,
+                                                     cancellation As CancellationToken) As Task(Of AppVersionCheckResponse) Implements INodeClient.CheckAppVersionAsync
+            Try
+                ' Version check can take a while because it runs
+                ' SteamCMD app_info_print. Give it a generous timeout.
+                Using cts = CancellationTokenSource.CreateLinkedTokenSource(cancellation)
+                    cts.CancelAfter(TimeSpan.FromMinutes(3))
+                    Dim resp = Await _httpClient.PostAsJsonAsync("/api/install/version-check",
+                                                                   request, cts.Token)
+                    resp.EnsureSuccessStatusCode()
+                    Return Await resp.Content.ReadFromJsonAsync(Of AppVersionCheckResponse)(cancellationToken:=cts.Token)
+                End Using
+            Catch ex As Exception
+                Throw WrapException("CheckAppVersion", ex)
             End Try
         End Function
 
