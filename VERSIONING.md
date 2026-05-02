@@ -253,22 +253,19 @@ tag is the trigger — it is **not** the source of version metadata.
 Assemblies stamp from `Directory.Build.props`, which must be bumped
 before tagging.
 
-### Cutting a release
+The full procedure (bumping, CHANGELOG, tagging, verification, plus
+troubleshooting for every failure mode seen during the 0.1.0 release
+candidates) lives in [RELEASE_PROCESS.md](RELEASE_PROCESS.md). The
+six-step happy path:
 
-1. Edit `Directory.Build.props` per the "Bumping build version"
-   section above (PATCH or MINOR rules).
-2. Edit `CHANGELOG.md`: add a `## [X.Y.Z] - YYYY-MM-DD` heading
-   below `## [Unreleased]`, move accumulated unreleased entries
-   into it. Call out any protocol or contracts bumps under
-   "Changed".
-3. If protocol or contracts versions changed, edit
-   `NodeApiContract.vb` to match. Update the corresponding history
-   table in this document.
-4. Commit: `Release X.Y.Z`.
-5. Tag: `git tag vX.Y.Z`.
-6. Push the tag: `git push origin vX.Y.Z`.
+1. `.\scripts\bump-version.ps1 X.Y.Z` (or edit `Directory.Build.props` by hand per the rules above)
+2. Add a `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`
+3. If MINOR/MAJOR, decide whether protocol or contracts versions need bumping; update history tables here
+4. `git commit -am "Release X.Y.Z"`
+5. `git tag vX.Y.Z && git push origin master vX.Y.Z`
+6. Watch the Actions tab; verify the Releases page
 
-The push triggers `release.yml`, which runs three jobs:
+What the pipeline produces:
 
 - **build-windows** — publishes Manager (single-file self-contained,
   win-x64) and Node + NodeSetup (win-x64) on a Windows runner.
@@ -277,15 +274,12 @@ The push triggers `release.yml`, which runs three jobs:
   CtrlCSender helper.
 - **build-linux** — publishes Node + NodeSetup (linux-x64) on a
   Linux runner. No Manager on Linux — WinForms is Windows-only.
-- **release** — downloads both artifact sets, extracts the
-  matching `## [X.Y.Z]` section from `CHANGELOG.md`, creates the
-  GitHub Release with that section as the body, and uploads three
-  zips: `PowerGSM-Manager-X.Y.Z-win-x64.zip`,
+- **release** — downloads both artifact sets, extracts the matching
+  `## [X.Y.Z]` section from `CHANGELOG.md`, creates the GitHub
+  Release with that section as the body, and uploads three zips:
+  `PowerGSM-Manager-X.Y.Z-win-x64.zip`,
   `PowerGSM-Node-X.Y.Z-win-x64.zip`,
   `PowerGSM-Node-X.Y.Z-linux-x64.zip`.
-
-If the changelog section is missing, the release job fails with a
-clear error rather than producing a release with empty notes.
 
 Tags containing a hyphen (`v0.2.0-rc1`, `v0.2.0-beta`) are flagged
 as pre-releases on the GitHub Releases page. Stable releases are

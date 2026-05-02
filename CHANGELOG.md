@@ -9,15 +9,6 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
-## [0.1.0-rc5] - 2026-05-02
-
-Release pipeline dry run for 0.1.0 (fifth attempt). Each rc fixes
-one CI snag: rc1 pubxml CLI path resolution, rc2 Manager PublishDir,
-rc3 EnableWindowsTargeting on inner CtrlCSender publish, rc4
-EnableWindowsTargeting on NodeSetup restore, rc5 explicit PublishDir
-and NodeDeploymentDir overrides for the Linux Node + NodeSetup
-publish chain. See `[0.1.0]` below for the actual changeset.
-
 ## [0.1.0] - 2026-05-02
 
 First named version. Establishes the versioning baseline; everything
