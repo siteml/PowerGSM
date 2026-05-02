@@ -301,7 +301,7 @@ exists to prevent.
 
 ### CI workflow
 
-`.github/workflows/ci.yml` runs on every push to `main` and on
+`.github/workflows/ci.yml` runs on every push to `master` and on
 every PR. It builds `PowerGSM.sln` in Release configuration on a
 Windows runner. It does not produce artifacts — just verifies the
 solution compiles. Linux build coverage happens during release
