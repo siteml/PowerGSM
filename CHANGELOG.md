@@ -9,12 +9,14 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
-## [0.1.0-rc3] - 2026-05-02
+## [0.1.0-rc4] - 2026-05-02
 
-Release pipeline dry run for 0.1.0 (third attempt). rc1 fixed VB.NET
-pubxml CLI path resolution, rc2 fixed Manager PublishDir on the
-runner, rc3 fixes Linux EnableWindowsTargeting on the inner CtrlCSender
-publish call. See `[0.1.0]` below for the actual changeset.
+Release pipeline dry run for 0.1.0 (fourth attempt). Each rc fixes
+one Linux-runner cross-compile snag: rc1 pubxml CLI path resolution,
+rc2 Manager PublishDir on the runner, rc3 EnableWindowsTargeting on
+the inner CtrlCSender publish, rc4 EnableWindowsTargeting on the
+NodeSetup restore (multi-TFM project, restore can't be filtered to
+one TFM). See `[0.1.0]` below for the actual changeset.
 
 ## [0.1.0] - 2026-05-02
 

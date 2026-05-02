@@ -170,10 +170,18 @@ jobs:
       # restore on Linux pulls in WinForms reference assemblies just
       # to satisfy GSM.Manager's restore graph, which works but adds
       # noise. Per-project restore keeps logs clean.
+      #
+      # EnableWindowsTargeting=true on the NodeSetup restore is
+      # needed because NodeSetup is multi-targeted (net8.0 +
+      # net8.0-windows). Restore resolves all TFMs unless told
+      # otherwise, and `dotnet restore` doesn't honor --framework,
+      # so the Windows-slot resolution trips the NETSDK1100 check
+      # on Linux runners. Set the flag here and the publish steps
+      # below stay simple.
       - name: Restore Node + NodeSetup
         run: |
           dotnet restore GSM.Node/GSM.Node.vbproj
-          dotnet restore GSM.NodeSetup/GSM.NodeSetup.vbproj
+          dotnet restore GSM.NodeSetup/GSM.NodeSetup.vbproj -p:EnableWindowsTargeting=true
 
       # See build-windows for the rationale on PublishProfileFullPath.
       # EnableWindowsTargeting=true is needed because Node's vbproj
