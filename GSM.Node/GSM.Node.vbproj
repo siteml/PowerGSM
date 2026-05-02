@@ -88,6 +88,15 @@
          * The runtime caller (ProcessManager.TrySendConsoleCtrlC)
            is gated behind OperatingSystem.IsWindows() so it only
            runs on Windows hosts anyway.
+
+       EnableWindowsTargeting=true is set on the inner MSBuild call
+       (and on direct CLI builds via PowerGSM's CI workflow) so this
+       cross-compile works from a Linux build host. The .NET 8 SDK
+       requires that flag whenever a self-contained publish targets
+       a win-* RID from a non-Windows OS, even when the project's
+       TargetFramework is plain net8.0 (as CtrlCSender's is) — the
+       check fires on the RID + SelfContained combination, not on
+       the TFM. On Windows hosts the flag is a no-op.
        ============================================================ -->
 
   <!--
@@ -130,7 +139,7 @@
   <Target Name="PublishCtrlCSender" BeforeTargets="Publish">
     <MSBuild Projects="..\GSM.CtrlCSender\GSM.CtrlCSender.vbproj"
              Targets="Publish"
-             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=true;PublishSingleFile=true;PublishDir=$(MSBuildThisFileDirectory)..\GSM.CtrlCSender\bin\$(Configuration)\win-x64\selfcontained\" />
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=true;PublishSingleFile=true;EnableWindowsTargeting=true;PublishDir=$(MSBuildThisFileDirectory)..\GSM.CtrlCSender\bin\$(Configuration)\win-x64\selfcontained\" />
   </Target>
 
   <Target Name="CopyCtrlCSenderToPublish" AfterTargets="Publish">

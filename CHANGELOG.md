@@ -9,12 +9,12 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
-## [0.1.0-rc2] - 2026-05-02
+## [0.1.0-rc3] - 2026-05-02
 
-Release pipeline dry run for 0.1.0 (second attempt; rc1 fixed the
-VB.NET pubxml path resolution issue, rc2 adds Linux
-EnableWindowsTargeting and Manager PublishDir overrides). See
-`[0.1.0]` below for the actual changeset captured in this release.
+Release pipeline dry run for 0.1.0 (third attempt). rc1 fixed VB.NET
+pubxml CLI path resolution, rc2 fixed Manager PublishDir on the
+runner, rc3 fixes Linux EnableWindowsTargeting on the inner CtrlCSender
+publish call. See `[0.1.0]` below for the actual changeset.
 
 ## [0.1.0] - 2026-05-02
 
