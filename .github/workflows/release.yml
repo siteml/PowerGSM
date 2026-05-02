@@ -87,8 +87,28 @@ jobs:
       - name: Publish NodeSetup into Node folder (win-x64)
         run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0-windows -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Win64.pubxml" --no-restore
 
+      # Manager: PublishDir overridden explicitly because the
+      # pubxml's <PublishDir>bin\Release\net8.0-windows\publish\win-x64\</PublishDir>
+      # appears to be ignored or recomputed by the SDK on CLI
+      # publish in some path-resolution path — the .NET 8 SDK's
+      # RID-aware default for self-contained publishes is
+      # bin\Release\TFM\RID\publish\ (RID before "publish"), and
+      # we'd rather pin the location explicitly than depend on
+      # which one wins. Path is relative to the project, so this
+      # lands at GSM.Manager\publish\manager-win-x64\.
       - name: Publish Manager (win-x64)
-        run: dotnet publish GSM.Manager/GSM.Manager.vbproj -p:PublishProfileFullPath="GSM.Manager/My Project/PublishProfiles/FolderProfile.pubxml" --no-restore
+        run: dotnet publish GSM.Manager/GSM.Manager.vbproj -p:PublishProfileFullPath="GSM.Manager/My Project/PublishProfiles/FolderProfile.pubxml" -p:PublishDir=publish/manager-win-x64/ --no-restore
+
+      # Diagnostic listings before each zip — cheap, and means
+      # the next time a path mystery happens we can see what's
+      # actually there rather than guessing.
+      - name: List Node publish output
+        shell: pwsh
+        run: Get-ChildItem GSM.Node\bin\Release\net8.0\publish | Select-Object -First 30
+
+      - name: List Manager publish output
+        shell: pwsh
+        run: Get-ChildItem GSM.Manager\publish\manager-win-x64 | Select-Object -First 30
 
       # PowerShell's Compress-Archive zips the directory's CONTENTS when
       # the path ends with \*. The zip therefore unpacks flat (no
@@ -108,7 +128,7 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.version }}"
           Compress-Archive `
-            -Path "GSM.Manager\bin\Release\net8.0-windows\publish\win-x64\*" `
+            -Path "GSM.Manager\publish\manager-win-x64\*" `
             -DestinationPath "PowerGSM-Manager-$version-win-x64.zip" `
             -CompressionLevel Optimal
 
@@ -156,8 +176,18 @@ jobs:
           dotnet restore GSM.NodeSetup/GSM.NodeSetup.vbproj
 
       # See build-windows for the rationale on PublishProfileFullPath.
+      # EnableWindowsTargeting=true is needed because Node's vbproj
+      # has a BeforeTargets="Publish" target that cross-compiles a
+      # win-x64 self-contained CtrlCSender helper as a side-effect
+      # of every publish (including Linux ones — the project
+      # deliberately ships an unused win-x64 CtrlCSender.exe in the
+      # Linux output rather than conditionalising it). Without this
+      # flag the inner MSBuild call fails on Linux runners with
+      # "To build a project targeting Windows on this operating
+      # system, set the EnableWindowsTargeting property to true."
+      # On Windows runners the flag is a no-op.
       - name: Publish Node (linux-x64)
-        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" --no-restore
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" -p:EnableWindowsTargeting=true --no-restore
 
       # See build-windows for why -f is explicit. Linux build uses
       # the net8.0 (non-Windows) TFM — the .vbproj's <Compile Remove>
