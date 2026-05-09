@@ -19,6 +19,19 @@
   <PropertyGroup Condition="'$(TargetFramework)'=='net8.0-windows'">
     <UseWindowsForms>true</UseWindowsForms>
     <DefineConstants>$(DefineConstants),WINDOWS_GUI=True</DefineConstants>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <!--
+    Linux-targeting net8.0 build needs its own RuntimeIdentifiers
+    declaration so restore generates a net8.0/linux-x64 slot in
+    obj/project.assets.json. Same NETSDK1047 reasoning as
+    GSM.Node.vbproj; per-TFM here because net8.0-windows can't
+    target linux-x64 (and net8.0 doesn't target win-x64 in this
+    project's CI flow).
+  -->
+  <PropertyGroup Condition="'$(TargetFramework)'=='net8.0'">
+    <RuntimeIdentifiers>linux-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
   <!-- Exclude the Windows\ folder from non-Windows builds.                       -->

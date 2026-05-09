@@ -2,6 +2,22 @@
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <!--
+      RuntimeIdentifiers must list every RID this project may be
+      published as, so NuGet restore generates a TFM/RID slot for
+      each in obj/project.assets.json. Without this, a publish
+      with -p:RuntimeIdentifier=<rid> --no-restore fails with
+      NETSDK1047 because the slot it needs ('net8.0/<rid>') was
+      never created. The CLI form `dotnet publish -r <rid>` does
+      a transitive restore-with-RID that compensates, but the
+      release workflow uses --no-restore (the solution-wide
+      restore at the top of each job is the only one), so the
+      slots have to exist ahead of time.
+
+      Same pattern as GSM.CtrlCSender.vbproj. Add a RID here when
+      adding a new platform target to the release workflow.
+    -->
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
     <RootNamespace></RootNamespace>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
