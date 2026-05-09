@@ -43,11 +43,24 @@
       DLL (we copy it explicitly via the targets below), and
       SkipGetTargetFrameworkProperties=true silences the TFM-mismatch
       warning that would otherwise fire for an OutputType=Exe project.
+
+      UndefineProperties=RuntimeIdentifier prevents the parent's RID
+      from propagating into CtrlCSender's regular Build via the
+      project reference. Without this, a `dotnet publish -r linux-x64`
+      of GSM.Node tries to build CtrlCSender as net8.0/linux-x64 and
+      fails with NETSDK1047 because CtrlCSender only declares win-x64
+      in its RuntimeIdentifiers (it's a Windows-only helper). The
+      win-x64 self-contained .exe we actually ship is produced by
+      PublishCtrlCSender's inner MSBuild call below, which passes
+      RuntimeIdentifier=win-x64 explicitly and is unaffected by this
+      scrub. The regular Build of CtrlCSender just needs the no-RID
+      net8.0 slot, which restore always generates.
     -->
     <ProjectReference Include="..\GSM.CtrlCSender\GSM.CtrlCSender.vbproj">
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <Private>false</Private>
       <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+      <UndefineProperties>RuntimeIdentifier</UndefineProperties>
     </ProjectReference>
   </ItemGroup>
 
