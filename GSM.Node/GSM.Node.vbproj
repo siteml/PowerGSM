@@ -45,24 +45,6 @@
     <None Update="nodesettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <!--
-      install-service.bat / uninstall-service.bat are Windows-only.
-      Skip them entirely when publishing for a non-Windows RID — they
-      pollute the Linux deployment otherwise. The conditional metadata
-      only fires at publish time; the regular Build still copies the
-      files to bin\ on Windows so dev workflows aren't affected.
-      (GSM.NodeSetup is the actual install path for both platforms
-      now; the .bat files are kept around for any operator who still
-      scripts against the old filenames.)
-    -->
-    <None Update="install-service.bat">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory Condition="'$(RuntimeIdentifier)' != '' And !$(RuntimeIdentifier.StartsWith('win'))">Never</CopyToPublishDirectory>
-    </None>
-    <None Update="uninstall-service.bat">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory Condition="'$(RuntimeIdentifier)' != '' And !$(RuntimeIdentifier.StartsWith('win'))">Never</CopyToPublishDirectory>
-    </None>
   </ItemGroup>
 
   <!-- ============================================================
@@ -98,15 +80,19 @@
            is gated behind OperatingSystem.IsWindows() so it only
            runs on Windows hosts anyway.
 
-       The Publish-side targets below are gated on the RID:
-       skipped when RuntimeIdentifier is set and doesn't start
-       with 'win', so a `dotnet publish -r linux-x64` produces a
-       clean Linux deployment without a stray Windows .exe.
-       Mirrors the same pattern used for install-service.bat /
-       uninstall-service.bat above. When RID is unset (legacy
-       framework-dependent publish, no platform commitment) the
-       helper is still included on the Windows-bias assumption —
-       parallel to the .bat files' behaviour.
+       Both the Build-side and Publish-side targets below are
+       gated on the RID: skipped when RuntimeIdentifier is set and
+       doesn't start with 'win', so a `dotnet publish -r linux-x64`
+       produces a clean Linux deployment without a stray Windows
+       .exe. The Build gate matters because Microsoft.NET.Sdk.Web
+       sweeps the build OutDir into the publish dir as part of
+       its standard publish flow — anything CopyCtrlCSenderToOutput
+       drops there at Build time gets carried into Publish whether
+       the publish-time gate fires or not. Locking the front door
+       isn't enough; the build-side door has to be locked too.
+       When RID is unset (legacy framework-dependent publish, no
+       platform commitment) the helper is still included on the
+       Windows-bias assumption.
 
        EnableWindowsTargeting=true is set on the inner MSBuild call
        (and on direct CLI builds via PowerGSM's CI workflow) so this
@@ -121,11 +107,15 @@
   <!--
     BUILD path: copy the framework-dependent helper next to
     GSM.Node.exe. Works at dev time because the dev machine has
-    .NET 8 installed. Condition="Exists('%(Identity)')" tolerates
-    files that don't exist in every config (e.g. .pdb is normally
-    only present in Debug).
+    .NET 8 installed. Condition="Exists('%(Identity)')" on the
+    Copy task tolerates files that don't exist in every config
+    (e.g. .pdb is normally only present in Debug). Target-level
+    Condition gates on RID so a Linux publish doesn't pull the
+    Windows .exe through the OutDir-to-PublishDir sweep that the
+    Web SDK does as part of its standard publish flow.
   -->
-  <Target Name="CopyCtrlCSenderToOutput" AfterTargets="Build">
+  <Target Name="CopyCtrlCSenderToOutput" AfterTargets="Build"
+          Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
     <ItemGroup>
       <_CtrlCSenderOutput Include="..\GSM.CtrlCSender\bin\$(Configuration)\net8.0\GSM.CtrlCSender.exe" />
       <_CtrlCSenderOutput Include="..\GSM.CtrlCSender\bin\$(Configuration)\net8.0\GSM.CtrlCSender.dll" />

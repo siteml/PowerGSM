@@ -77,15 +77,30 @@ jobs:
       # path or it silently falls back to framework defaults
       # (NETSDK1198 warning, but build still "succeeds" with the
       # wrong shape — no SelfContained, no PublishSingleFile, etc.).
+      #
+      # PublishDir overridden explicitly for the same reason as
+      # the Manager step below and the Linux jobs further down:
+      # pubxml <PublishDir> values are unreliable on CLI publish
+      # for self-contained / multi-TFM scenarios. The .NET 8 SDK's
+      # RID-aware default and the pubxml's value race, and which
+      # wins depends on path-resolution mood. Pin it explicitly.
+      # Lands at GSM.Node\publish\node-win-x64\.
       - name: Publish Node (win-x64)
-        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/winx64.pubxml" --no-restore
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/winx64.pubxml" -p:PublishDir=publish/node-win-x64/ --no-restore
 
       # NodeSetup is multi-targeted (net8.0;net8.0-windows). The SDK's
       # CrossTargeting check fires BEFORE the pubxml's TargetFramework
       # is read, so even though Win64.pubxml says net8.0-windows, the
       # CLI errors with NETSDK1129 unless we pass -f explicitly.
+      #
+      # NodeDeploymentDir overridden so DeployToNodeFolder copies
+      # into the new Node publish location set above. The pubxml's
+      # default points at GSM.Node\bin\Release\net8.0\publish\,
+      # which we just stopped using. Absolute path because relative
+      # paths in MSBuild properties resolve against the project
+      # being built (NodeSetup), not the workspace root.
       - name: Publish NodeSetup into Node folder (win-x64)
-        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0-windows -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Win64.pubxml" --no-restore
+        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0-windows -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Win64.pubxml" -p:NodeDeploymentDir=${{ github.workspace }}/GSM.Node/publish/node-win-x64/ --no-restore
 
       # Manager: PublishDir overridden explicitly because the
       # pubxml's <PublishDir>bin\Release\net8.0-windows\publish\win-x64\</PublishDir>
@@ -101,10 +116,15 @@ jobs:
 
       # Diagnostic listings before each zip — cheap, and means
       # the next time a path mystery happens we can see what's
-      # actually there rather than guessing.
+      # actually there rather than guessing. No -First N truncation
+      # here: the Node publish folder has hundreds of runtime DLLs
+      # and the files we actually care about (GSM.NodeSetup.exe,
+      # GSM.CtrlCSender.exe) sort alphabetically AFTER all the
+      # Microsoft.* DLLs, so a truncated listing hides exactly
+      # what we'd want to verify.
       - name: List Node publish output
         shell: pwsh
-        run: Get-ChildItem GSM.Node\bin\Release\net8.0\publish | Select-Object -First 30
+        run: Get-ChildItem GSM.Node\publish\node-win-x64
 
       - name: List Manager publish output
         shell: pwsh
@@ -119,7 +139,7 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.version }}"
           Compress-Archive `
-            -Path "GSM.Node\bin\Release\net8.0\publish\*" `
+            -Path "GSM.Node\publish\node-win-x64\*" `
             -DestinationPath "PowerGSM-Node-$version-win-x64.zip" `
             -CompressionLevel Optimal
 
