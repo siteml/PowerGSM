@@ -85,8 +85,22 @@ jobs:
       # RID-aware default and the pubxml's value race, and which
       # wins depends on path-resolution mood. Pin it explicitly.
       # Lands at GSM.Node\publish\node-win-x64\.
+      #
+      # RuntimeIdentifier passed explicitly even though the pubxml
+      # already sets it. The pubxml's value isn't visible to
+      # target Condition expressions on BeforeTargets="Publish"
+      # hooks (which fire before _ResolvePublishProfile imports
+      # the pubxml), so RID-gated targets in GSM.Node.vbproj see
+      # an empty $(RuntimeIdentifier) and the gate's "empty means
+      # default-Windows" clause fires when it shouldn't. Pinning
+      # via -p: applies it at command-line scope, before any
+      # target evaluates. On Windows this is mostly belt-and-
+      # suspenders since the wrong-reason path produces the right
+      # outcome (CtrlCSender wants win-x64 anyway), but the Linux
+      # job legitimately needs the same fix and we want both jobs
+      # symmetric.
       - name: Publish Node (win-x64)
-        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/winx64.pubxml" -p:PublishDir=publish/node-win-x64/ --no-restore
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/winx64.pubxml" -p:RuntimeIdentifier=win-x64 -p:PublishDir=publish/node-win-x64/ --no-restore
 
       # NodeSetup is multi-targeted (net8.0;net8.0-windows). The SDK's
       # CrossTargeting check fires BEFORE the pubxml's TargetFramework
@@ -99,8 +113,16 @@ jobs:
       # which we just stopped using. Absolute path because relative
       # paths in MSBuild properties resolve against the project
       # being built (NodeSetup), not the workspace root.
+      #
+      # PublishDir overridden too. The pubxml's value silently loses
+      # to the SDK's RID-aware default on multi-TFM publish. With
+      # the wrong PublishDir, DeployToNodeFolder's source glob
+      # ($(PublishDir)**\*) matches an empty directory and 0 files
+      # get copied into the node folder — NodeSetup.exe goes
+      # missing without any error. Pinning a project-relative path
+      # makes the publish output and the deploy source agree.
       - name: Publish NodeSetup into Node folder (win-x64)
-        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0-windows -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Win64.pubxml" -p:NodeDeploymentDir=${{ github.workspace }}/GSM.Node/publish/node-win-x64/ --no-restore
+        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0-windows -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Win64.pubxml" -p:PublishDir=publish/nodesetup-win-x64/ -p:NodeDeploymentDir=${{ github.workspace }}/GSM.Node/publish/node-win-x64/ --no-restore
 
       # Manager: PublishDir overridden explicitly because the
       # pubxml's <PublishDir>bin\Release\net8.0-windows\publish\win-x64\</PublishDir>
@@ -204,23 +226,32 @@ jobs:
           dotnet restore GSM.NodeSetup/GSM.NodeSetup.vbproj -p:EnableWindowsTargeting=true
 
       # See build-windows for the rationale on PublishProfileFullPath.
-      # EnableWindowsTargeting=true is needed because Node's vbproj
-      # has a BeforeTargets="Publish" target that cross-compiles a
-      # win-x64 self-contained CtrlCSender helper as a side-effect
-      # of every publish (including Linux ones — the project
-      # deliberately ships an unused win-x64 CtrlCSender.exe in the
-      # Linux output rather than conditionalising it). Without this
-      # flag the inner MSBuild call fails on Linux runners with
-      # "To build a project targeting Windows on this operating
-      # system, set the EnableWindowsTargeting property to true."
-      # On Windows runners the flag is a no-op.
+      #
+      # RuntimeIdentifier pinned via -p: rather than relying on the
+      # pubxml's <RuntimeIdentifier>. The pubxml's value isn't
+      # visible to target Condition expressions on
+      # BeforeTargets="Publish" hooks (which fire before
+      # _ResolvePublishProfile imports the pubxml), so the RID
+      # gates on GSM.Node.vbproj's CtrlCSender targets see an
+      # empty $(RuntimeIdentifier) and the gate's empty-means-
+      # Windows clause fires — the Linux job ends up cross-
+      # compiling a win-x64 self-contained CtrlCSender.exe and
+      # shipping it in the Linux zip. Pinning via -p: applies the
+      # value at command-line scope, before any target evaluates.
+      #
+      # EnableWindowsTargeting=true was originally needed because
+      # the cross-compile fired anyway (see above) and the inner
+      # MSBuild needed Windows-targeting permission to succeed.
+      # With the gate working, no win-targeting happens here.
+      # We keep the flag as belt-and-suspenders against future
+      # changes that might legitimately want to cross-target.
       #
       # PublishDir overridden for the same reason as Manager on the
       # Windows job: the pubxml's path doesn't reliably win against
       # the SDK's RID-aware default. Lands at
       # GSM.Node/publish/node-linux-x64/ relative to the project.
       - name: Publish Node (linux-x64)
-        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" -p:EnableWindowsTargeting=true -p:PublishDir=publish/node-linux-x64/ --no-restore
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" -p:RuntimeIdentifier=linux-x64 -p:EnableWindowsTargeting=true -p:PublishDir=publish/node-linux-x64/ --no-restore
 
       # See build-windows for why -f is explicit. Linux build uses
       # the net8.0 (non-Windows) TFM — the .vbproj's <Compile Remove>
@@ -231,8 +262,15 @@ jobs:
       # Default in the pubxml points at the SDK-pubxml path that we
       # just stopped using. Absolute path because relative paths
       # would be relative to NodeSetup's project, not the workspace.
+      #
+      # PublishDir overridden too. Same propagation issue as the
+      # Windows NodeSetup step — pubxml <PublishDir> loses to the
+      # SDK's RID-aware default on multi-TFM publish, and the
+      # mismatch makes DeployToNodeFolder's source glob hit an
+      # empty directory. On the Linux job this manifested as zero
+      # files deployed and a missing NodeSetup binary in the zip.
       - name: Publish NodeSetup into Node folder (linux-x64)
-        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0 -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Linux64.pubxml" -p:NodeDeploymentDir=$GITHUB_WORKSPACE/GSM.Node/publish/node-linux-x64/ --no-restore
+        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0 -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Linux64.pubxml" -p:PublishDir=publish/nodesetup-linux-x64/ -p:NodeDeploymentDir=$GITHUB_WORKSPACE/GSM.Node/publish/node-linux-x64/ --no-restore
 
       # Diagnostic listing — same rationale as the Windows job.
       - name: List Node publish output

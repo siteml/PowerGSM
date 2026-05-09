@@ -53,7 +53,7 @@
           AfterTargets="Publish"
           Condition="'$(NodeDeploymentDir)' != ''">
     <Message Importance="high"
-             Text="Deploying GSM.NodeSetup output to $(NodeDeploymentDir)" />
+             Text="Deploying GSM.NodeSetup output from $(PublishDir) to $(NodeDeploymentDir)" />
     <ItemGroup>
       <_NodeSetupPublishedFiles Include="$(PublishDir)**\*" />
     </ItemGroup>
@@ -62,8 +62,15 @@
           SkipUnchangedFiles="true"
           Retries="3"
           RetryDelayMilliseconds="500" />
+    <!--
+      Item-count syntax is @(...->Count()), not $(...->Count()).
+      The latter silently renders empty (property-syntax against
+      what's actually an item group), which on the v0.2.0 release
+      run made it impossible to tell from logs whether the deploy
+      copied 12 files or 0. Prints "Deployed N file(s)..." properly.
+    -->
     <Message Importance="high"
-             Text="Deployed $(_NodeSetupPublishedFiles->Count()) file(s) to $(NodeDeploymentDir)" />
+             Text="Deployed @(_NodeSetupPublishedFiles->Count()) file(s) to $(NodeDeploymentDir)" />
   </Target>
 
 </Project>
