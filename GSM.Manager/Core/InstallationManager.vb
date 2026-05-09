@@ -38,6 +38,34 @@ Namespace GSM.Manager.Core
         Private ReadOnly _logger As ILogger(Of InstallationManager)
         Private ReadOnly _installLocks As New ConcurrentDictionary(Of String, SemaphoreSlim)
 
+        ' Live operations table for UI subscribers — populated when
+        ' an install/update reaches the polling phase, updated on
+        ' every poll tick, removed in the Finally that wraps the
+        ' polling block. Panels query this on open to render any
+        ' operation already in flight, then subscribe to the events
+        ' below for incremental updates. Keyed by installationId
+        ' since at most one operation per installation runs at a
+        ' time (enforced by _installLocks).
+        Private ReadOnly _activeOps As New ConcurrentDictionary(Of String, InstallProgressResponse)
+
+        ' UI-subscription events. These run alongside the existing
+        ' _emitter notifications (which feed Discord/webhooks) but
+        ' target a different audience — InstallationPanel in the
+        ' Manager UI, where operators want live byte/percent progress
+        ' and tab-switching based on whether they kicked the
+        ' operation off themselves vs. an automation rule firing in
+        ' the background. Both audiences fire from the same lifecycle
+        ' points so events stay consistent.
+        '
+        ' Raised from the polling thread (background ThreadPool) —
+        ' subscribers that touch UI controls must marshal back to the
+        ' UI thread on their own (Control.BeginInvoke). The Raise*
+        ' helpers below wrap each event in a try/catch so a single
+        ' subscriber that throws can't take down the polling loop.
+        Public Event OperationStarted As EventHandler(Of InstallationOperationStartedEventArgs)
+        Public Event ProgressChanged As EventHandler(Of InstallationProgressEventArgs)
+        Public Event OperationCompleted As EventHandler(Of InstallationOperationCompletedEventArgs)
+
         Public Sub New(clientFactory As NodeHttpClientFactory,
                        pluginRegistry As PluginRegistry,
                        credentialService As CredentialService,
@@ -70,19 +98,22 @@ Namespace GSM.Manager.Core
         Public Async Function InstallAsync(installationId As String,
                                             Optional steamCredentialId As String = Nothing,
                                             Optional promptHandler As PromptHandlerDelegate = Nothing,
-                                            Optional cancellation As CancellationToken = Nothing) As Task(Of Boolean)
+                                            Optional userInitiated As Boolean = False,
+                                            Optional cancellation As CancellationToken = Nothing) As Task(Of InstallationOperationResult)
 
             Dim lockSem = GetLock(installationId)
             Dim acquired = Await lockSem.WaitAsync(0)
             If Not acquired Then
                 _logger.LogWarning("Installation {Id} is locked (in use or updating)", installationId)
-                Return False
+                Return InstallationOperationResult.Fail(
+                    "This installation is currently in use by another operation (an install, update, or running instance).")
             End If
 
             Try
                 Return Await ExecuteInstallInternal(installationId, isUpdate:=False,
                                                     steamCredentialId:=steamCredentialId,
                                                     promptHandler:=promptHandler,
+                                                    userInitiated:=userInitiated,
                                                     cancellation:=cancellation)
             Finally
                 lockSem.Release()
@@ -97,13 +128,15 @@ Namespace GSM.Manager.Core
                                            Optional steamCredentialId As String = Nothing,
                                            Optional promptHandler As PromptHandlerDelegate = Nothing,
                                            Optional restartAfter As Boolean = True,
-                                           Optional cancellation As CancellationToken = Nothing) As Task(Of Boolean)
+                                           Optional userInitiated As Boolean = False,
+                                           Optional cancellation As CancellationToken = Nothing) As Task(Of InstallationOperationResult)
 
             Dim lockSem = GetLock(installationId)
             Dim acquired = Await lockSem.WaitAsync(0)
             If Not acquired Then
                 _logger.LogWarning("Installation {Id} is locked", installationId)
-                Return False
+                Return InstallationOperationResult.Fail(
+                    "This installation is currently in use by another operation (an install, update, or running instance).")
             End If
 
             Dim instanceIds As IReadOnlyList(Of String) = Nothing
@@ -143,11 +176,12 @@ Namespace GSM.Manager.Core
                 Dim ok = Await ExecuteInstallInternal(installationId, isUpdate:=True,
                                                       steamCredentialId:=steamCredentialId,
                                                       promptHandler:=promptHandler,
+                                                      userInitiated:=userInitiated,
                                                       cancellation:=cancellation)
 
                 ' Restart only the instances that were running before.
                 ' Instances the user had intentionally stopped stay stopped.
-                If ok AndAlso restartAfter Then
+                If ok.Success AndAlso restartAfter Then
                     For Each instId In runningBeforeUpdate
                         Await _instanceManager.StartInstanceAsync(instId)
                     Next
@@ -169,27 +203,43 @@ Namespace GSM.Manager.Core
                                                        isUpdate As Boolean,
                                                        steamCredentialId As String,
                                                        promptHandler As PromptHandlerDelegate,
-                                                       cancellation As CancellationToken) As Task(Of Boolean)
+                                                       userInitiated As Boolean,
+                                                       cancellation As CancellationToken) As Task(Of InstallationOperationResult)
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
                 Dim installEntity = db.Installations.Find(installationId)
                 If installEntity Is Nothing Then
                     _logger.LogError("Installation {Id} not found", installationId)
-                    Return False
+                    Return InstallationOperationResult.Fail("Installation not found in the database.")
                 End If
 
                 Dim nodeEntity = db.Nodes.Find(installEntity.NodeId)
                 If nodeEntity Is Nothing Then
                     _logger.LogError("Node {Id} not found for installation {InstId}",
                                      installEntity.NodeId, installationId)
-                    Return False
+                    Return InstallationOperationResult.Fail(
+                        "The node assigned to this installation could not be found in the database.")
                 End If
+
+                ' Resolve the node client up front so we can fetch
+                ' its OS platform before invoking plugin methods.
+                ' Plugins use the platform answer to pick install
+                ' steps and post-install touch-ups specific to the
+                ' target OS (e.g. UE4-on-Linux's steamclient.so
+                ' symlink dance). NodeHttpClient caches the version
+                ' response per-client, so this stays cheap on every
+                ' call past the first per node lifetime.
+                Dim client = _clientFactory.GetClient(
+                    nodeEntity.NodeId, nodeEntity.HostAddress,
+                    nodeEntity.Port, nodeEntity.AuthToken)
+                Dim nodePlatform = Await NodePlatformResolver.ResolveAsync(client, cancellation)
 
                 ' Resolve plugin
                 Dim plugin = _pluginRegistry.GetPlugin(installEntity.GameId)
                 If plugin Is Nothing Then
                     _logger.LogError("No plugin loaded for game {GameId}", installEntity.GameId)
-                    Return False
+                    Return InstallationOperationResult.Fail(
+                        $"No plugin is loaded for game '{installEntity.GameId}'. Reload plugins and try again.")
                 End If
 
                 ' Build installation config
@@ -199,7 +249,8 @@ Namespace GSM.Manager.Core
                     .DisplayName = installEntity.DisplayName,
                     .InstallPath = installEntity.InstallPath,
                     .NodeId = installEntity.NodeId,
-                    .CustomFields = DeserializeConfig(installEntity.ConfigJson)
+                    .CustomFields = DeserializeConfig(installEntity.ConfigJson),
+                    .Platform = nodePlatform
                 }
                 installConfig.InstallMethod = ParseInstallMethod(installEntity.InstallMethod)
 
@@ -240,9 +291,8 @@ Namespace GSM.Manager.Core
                 }
 
                 ' Send to node
-                Dim client = _clientFactory.GetClient(
-                    nodeEntity.NodeId, nodeEntity.HostAddress,
-                    nodeEntity.Port, nodeEntity.AuthToken)
+                ' (client already resolved above, before the plugin
+                ' call, so we could pre-fetch the node's platform.)
 
                 ' Emit UpdateStarted event — we fire this even for the
                 ' fresh-install path; consumers that only care about
@@ -250,9 +300,31 @@ Namespace GSM.Manager.Core
                 ' today). The "Started" signal is useful either way.
                 If _emitter IsNot Nothing Then _emitter.UpdateStarted(installationId)
 
+                ' Local state for the Finally block: `started` flips
+                ' to True once we're past the StartInstallAsync call
+                ' (so the Finally knows whether to fire
+                ' OperationCompleted and clean up _activeOps); `result`
+                ' holds the eventual return value so we can capture
+                ' it in early-exit paths and surface it through the
+                ' Finally cleanup before returning.
+                Dim started As Boolean = False
+                Dim result As InstallationOperationResult = Nothing
+
                 Try
                     Dim progress = Await client.StartInstallAsync(request,
                         cancellation)
+
+                    ' Mark active and notify UI subscribers. Order
+                    ' matters: _activeOps populated first so a
+                    ' subscriber querying GetActiveProgress from
+                    ' inside its own OperationStarted handler sees
+                    ' a populated state; `started = True` last so
+                    ' the Finally only triggers cleanup after the
+                    ' dictionary is in a consistent state.
+                    _activeOps(installationId) = progress
+                    started = True
+                    RaiseOperationStarted(installationId, isUpdate, userInitiated)
+                    RaiseProgressChanged(installationId, progress)
 
                     ' Poll for completion
                     While progress.OperationState <> InstallationOperationState.Completed AndAlso
@@ -262,6 +334,14 @@ Namespace GSM.Manager.Core
                         Await Task.Delay(2000, cancellation)
                         progress = Await client.GetInstallProgressAsync(installationId,
                             cancellation)
+
+                        ' Surface this tick to UI subscribers. The
+                        ' panel uses ProgressChanged to update its
+                        ' progress bar / phase label / byte counter
+                        ' between polls — same data the existing
+                        ' _logger.LogDebug below also reports.
+                        _activeOps(installationId) = progress
+                        RaiseProgressChanged(installationId, progress)
 
                         ' Handle interactive prompts (Steam Guard, 2FA)
                         If progress.OperationState = InstallationOperationState.WaitingForInput AndAlso
@@ -286,9 +366,15 @@ Namespace GSM.Manager.Core
                                 Await client.RespondToPromptAsync(promptResp, cancellation)
                                 _logger.LogInformation("Sent prompt response for {Id}", installationId)
                             Else
-                                ' User cancelled or no handler — cancel the install
+                                ' User cancelled or no handler — cancel
+                                ' the install. Exit Try (rather than
+                                ' Return) so the Finally below fires
+                                ' OperationCompleted and cleans up
+                                ' _activeOps before we return.
                                 _logger.LogWarning("No response to prompt, cancelling install {Id}", installationId)
-                                Return False
+                                result = InstallationOperationResult.Fail(
+                                    "Cancelled: no response provided to a Steam Guard / two-factor prompt.")
+                                Exit Try
                             End If
                         End If
 
@@ -298,20 +384,115 @@ Namespace GSM.Manager.Core
                     End While
 
                     If progress.OperationState = InstallationOperationState.Completed Then
-                        ' Stamp a version string on the install. True
-                        ' version tracking (e.g. Steam buildid from the
-                        ' ACF manifest on the node) is a TODO — for now
-                        ' we record a provenance string that tells us
-                        ' the install method, the AppId (if SteamCMD),
-                        ' and when this install completed. That's enough
-                        ' to know whether a "Check for Updates" run is
-                        ' called for based on install age, and it won't
-                        ' falsely match against a future real buildid.
-                        ' Stamp a provenance placeholder now — the real
-                        ' Steam buildid will overwrite it on the first
-                        ' Check for Updates (or we attempt it below if
-                        ' the install included a SteamCmdStep).
-                        installEntity.InstalledVersion = BuildVersionStamp(steps)
+                        ' Stamp a version string on the install. Three
+                        ' paths in priority order:
+                        '
+                        '   1. Non-SteamCMD installs with an
+                        '      IVersionAwarePlugin (e.g. Factorio):
+                        '      ask the plugin to read the actual
+                        '      version off disk in the same format its
+                        '      GetLatestVersionAsync returns. Critical
+                        '      for the version-check comparison
+                        '      ("up to date" vs "update available")
+                        '      to render correctly — a synthetic
+                        '      "download (timestamp)" stamp can
+                        '      never match upstream's "2.0.76".
+                        '
+                        '   2. SteamCMD installs: use the buildid the
+                        '      node captured from appmanifest_{appid}.acf
+                        '      after the SteamCMD step finished. Builds
+                        '      "steam:{appId}@{branch} build {N}" —
+                        '      the same shape VersionCheckService
+                        '      produces from app_info_print, so the
+                        '      label flips to "up to date"
+                        '      immediately. Replaces the previous
+                        '      timestamp-placeholder + fire-and-forget
+                        '      upgrade pattern, which left the UI
+                        '      showing "update available" for the
+                        '      ~10-20s window between completion and
+                        '      the upgrade landing (and didn't refresh
+                        '      the UI when it did).
+                        '
+                        '   3. Fallback: BuildVersionStamp produces a
+                        '      synthetic "installed (timestamp)"
+                        '      placeholder. Used when neither path
+                        '      above produced a stamp — e.g. an old
+                        '      node that doesn't populate
+                        '      InstalledBuildId, a SteamCMD install
+                        '      that didn't write an ACF, a plugin
+                        '      whose GetInstalledVersionAsync threw.
+                        Dim stampedVersion As String = Nothing
+                        Dim hasRealStamp As Boolean = False
+
+                        ' Path 1: plugin-driven version read for
+                        ' non-SteamCMD installs.
+                        If installConfig.InstallMethod <> InstallMethod.SteamCmd Then
+                            Dim versionAware = TryCast(plugin, IVersionAwarePlugin)
+                            If versionAware IsNot Nothing Then
+                                Try
+                                    stampedVersion = Await versionAware.GetInstalledVersionAsync(
+                                        installConfig, client, cancellation)
+                                Catch ex As Exception
+                                    _logger.LogDebug(ex,
+                                        "Plugin GetInstalledVersionAsync threw for {Id}; falling back",
+                                        installationId)
+                                End Try
+                            End If
+                            If Not String.IsNullOrEmpty(stampedVersion) Then hasRealStamp = True
+                        End If
+
+                        ' Path 2: SteamCMD buildid captured by the node.
+                        If String.IsNullOrEmpty(stampedVersion) Then
+                            Dim capturedBuildId = If(progress IsNot Nothing, progress.InstalledBuildId, "")
+                            If Not String.IsNullOrEmpty(capturedBuildId) Then
+                                Dim steamStep As SteamCmdStep = Nothing
+                                For Each s In steps
+                                    steamStep = TryCast(s, SteamCmdStep)
+                                    If steamStep IsNot Nothing Then Exit For
+                                Next
+                                If steamStep IsNot Nothing Then
+                                    Dim branchName = If(String.IsNullOrEmpty(steamStep.BetaBranch),
+                                                          "public", steamStep.BetaBranch)
+                                    stampedVersion = $"steam:{steamStep.AppId}@{branchName} build {capturedBuildId}"
+                                    hasRealStamp = True
+                                End If
+                            End If
+                        End If
+
+                        ' Path 3: synthetic placeholder fallback.
+                        If String.IsNullOrEmpty(stampedVersion) Then
+                            stampedVersion = BuildVersionStamp(steps)
+                            ' hasRealStamp stays False — a synthetic
+                            ' stamp won't compare cleanly against
+                            ' upstream values, so we don't propagate
+                            ' it to LatestKnownVersion below.
+                        End If
+
+                        installEntity.InstalledVersion = stampedVersion
+
+                        ' By definition the install just succeeded,
+                        ' so the installed version IS the latest of
+                        ' the requested branch as of right now.
+                        ' Update LatestKnownVersion + LastVersionCheckUtc
+                        ' to match so the version label flips from
+                        ' "update available, checked Nh ago" to
+                        ' "up to date, just now" without waiting on
+                        ' a separate Check for Updates click. The
+                        ' next scheduled VersionCheckService poll
+                        ' will pick up any new upstream version
+                        ' published after this point.
+                        '
+                        ' Skipped for the synthetic-placeholder path
+                        ' since that string can't compare cleanly
+                        ' against upstream values — mirroring it to
+                        ' LatestKnownVersion would just produce a
+                        ' false "up to date" until the next poll
+                        ' overwrote it.
+                        If hasRealStamp Then
+                            installEntity.LatestKnownVersion = stampedVersion
+                            installEntity.LastVersionCheckUtc = DateTime.UtcNow
+                        End If
+
                         installEntity.UpdatedUtc = DateTime.UtcNow
                         db.SaveChanges()
 
@@ -323,37 +504,64 @@ Namespace GSM.Manager.Core
                         ' both boil down to "installation is now ready".
                         If _emitter IsNot Nothing Then _emitter.UpdateCompleted(installationId, Nothing)
 
-                        ' Fire-and-forget a version check so the stored
-                        ' InstalledVersion gets upgraded to the real
-                        ' buildid without requiring the user to click
-                        ' Check for Updates. We don't block the install
-                        ' return on this — if the version check fails
-                        ' for any reason, the synthetic stamp stays put.
-                        Try
-                            Dim _unused = Task.Run(Async Function()
-                                                       Try
-                                                           Await CheckForUpdatesAsync(installationId, CancellationToken.None)
-                                                       Catch
-                                                       End Try
-                                                   End Function)
-                        Catch
-                        End Try
+                        ' No fire-and-forget version check here — we
+                        ' already stamped InstalledVersion correctly
+                        ' from progress.InstalledBuildId (or the
+                        ' plugin's IVersionAwarePlugin) and synced
+                        ' LatestKnownVersion to match. A redundant
+                        ' app_info_print round trip would just spawn
+                        ' SteamCMD on the node for ~10-20s to
+                        ' confirm what we already know.
 
-                        Return True
+                        result = InstallationOperationResult.Ok()
                     Else
                         _logger.LogError("{Op} failed for {Id}: {Err}",
                                          If(isUpdate, "Update", "Install"), installationId,
                                          progress.ErrorMessage)
                         If _emitter IsNot Nothing Then _emitter.UpdateFailed(installationId, progress.ErrorMessage)
-                        Return False
+                        ' Surface the node-side error message back to the
+                        ' caller. Without this, the UI just sees a Boolean
+                        ' false and falls back to a generic "check the
+                        ' logs" message — losing the carefully-crafted
+                        ' diagnostics the node prepared (e.g. SteamCMD's
+                        ' distro-tailored "32-bit runtime libraries are
+                        ' missing" hint).
+                        result = InstallationOperationResult.Fail(
+                            If(progress.ErrorMessage,
+                               $"{If(isUpdate, "Update", "Install")} failed (no error message returned by node)."))
                     End If
 
                 Catch ex As Exception
                     _logger.LogError(ex, "{Op} exception for {Id}",
                                      If(isUpdate, "Update", "Install"), installationId)
                     If _emitter IsNot Nothing Then _emitter.UpdateFailed(installationId, ex.Message)
-                    Return False
+                    result = InstallationOperationResult.Fail(ex.Message)
+
+                Finally
+                    ' Pair every OperationStarted with an
+                    ' OperationCompleted for UI subscribers, and
+                    ' clear the active-ops entry so GetActiveProgress
+                    ' returns Nothing post-completion. Guarded by
+                    ' `started` so a failure inside StartInstallAsync
+                    ' (before we put anything into _activeOps and
+                    ' before OperationStarted fired) doesn't fire a
+                    ' phantom OperationCompleted with no matching
+                    ' OperationStarted.
+                    If started Then
+                        Dim _tmp As InstallProgressResponse = Nothing
+                        _activeOps.TryRemove(installationId, _tmp)
+
+                        Dim success = (result IsNot Nothing AndAlso result.Success)
+                        Dim errMsg As String = Nothing
+                        If Not success Then
+                            If result IsNot Nothing Then errMsg = result.ErrorMessage
+                            If String.IsNullOrEmpty(errMsg) Then errMsg = "Operation failed"
+                        End If
+                        RaiseOperationCompleted(installationId, isUpdate, success, errMsg)
+                    End If
                 End Try
+
+                Return result
             End Using
         End Function
 
@@ -375,6 +583,99 @@ Namespace GSM.Manager.Core
             If Not _installLocks.TryGetValue(installationId, sem) Then Return False
             Return sem.CurrentCount = 0
         End Function
+
+        ' ============================================================
+        '  Live operation lookup (for panels opened mid-flight)
+        ' ============================================================
+
+        ''' <summary>
+        ''' Returns the latest progress snapshot for an in-flight
+        ''' install or update, or Nothing if no operation is active.
+        ''' Intended for UI panels that open while an operation is
+        ''' already running — they call this once on construction to
+        ''' render the current state, then subscribe to ProgressChanged
+        ''' for incremental updates.
+        '''
+        ''' Distinct from GetProgress on the node: this is the
+        ''' last-polled snapshot the manager already holds, so it's
+        ''' free to call (no HTTP round trip) and safe to call from
+        ''' the UI thread.
+        ''' </summary>
+        Public Function GetActiveProgress(installationId As String) As InstallProgressResponse
+            Dim p As InstallProgressResponse = Nothing
+            _activeOps.TryGetValue(installationId, p)
+            Return p
+        End Function
+
+        ''' <summary>
+        ''' Returns whether an install or update is currently in the
+        ''' polling phase (between StartInstallAsync returning and
+        ''' the operation reaching a terminal state). Distinct from
+        ''' IsLocked, which also stays True during the pre-start
+        ''' lock acquisition and instance-stop steps that precede
+        ''' the actual install activity — IsActive is narrower and
+        ''' matches the window during which OperationStarted has
+        ''' fired but OperationCompleted hasn't yet.
+        ''' </summary>
+        Public Function IsActive(installationId As String) As Boolean
+            Return _activeOps.ContainsKey(installationId)
+        End Function
+
+        ' ============================================================
+        '  Event raising helpers
+        ' ============================================================
+
+        ' Each helper wraps RaiseEvent in a try/catch so a single
+        ' subscriber that throws can't take down the polling loop
+        ' or block subsequent subscribers in the invocation list.
+        ' Logged at Warning level so the issue surfaces without
+        ' looking like a fatal error — the operation itself isn't
+        ' affected, just one consumer's reaction to it.
+
+        Private Sub RaiseOperationStarted(installationId As String,
+                                            isUpdate As Boolean,
+                                            userInitiated As Boolean)
+            Try
+                RaiseEvent OperationStarted(Me, New InstallationOperationStartedEventArgs With {
+                    .InstallationId = installationId,
+                    .IsUpdate = isUpdate,
+                    .UserInitiated = userInitiated
+                })
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "OperationStarted handler threw for {Id}", installationId)
+            End Try
+        End Sub
+
+        Private Sub RaiseProgressChanged(installationId As String,
+                                           progress As InstallProgressResponse)
+            Try
+                RaiseEvent ProgressChanged(Me, New InstallationProgressEventArgs With {
+                    .InstallationId = installationId,
+                    .Progress = progress
+                })
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "ProgressChanged handler threw for {Id}", installationId)
+            End Try
+        End Sub
+
+        Private Sub RaiseOperationCompleted(installationId As String,
+                                              isUpdate As Boolean,
+                                              success As Boolean,
+                                              errorMessage As String)
+            Try
+                RaiseEvent OperationCompleted(Me, New InstallationOperationCompletedEventArgs With {
+                    .InstallationId = installationId,
+                    .IsUpdate = isUpdate,
+                    .Success = success,
+                    .ErrorMessage = errorMessage
+                })
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "OperationCompleted handler threw for {Id}", installationId)
+            End Try
+        End Sub
 
         ' ============================================================
         '  Helpers
@@ -461,6 +762,16 @@ Namespace GSM.Manager.Core
                     Return result
                 End If
 
+                ' Resolve client + platform up front so the InstallationConfig
+                ' we hand the plugin carries the right Platform value
+                ' — plugins keying their update steps off platform
+                ' (e.g. UE4 on Linux needing different SteamCMD args)
+                ' need the answer before GetUpdateSteps runs.
+                Dim client = _clientFactory.GetClient(
+                    nodeEntity.NodeId, nodeEntity.HostAddress,
+                    nodeEntity.Port, nodeEntity.AuthToken)
+                Dim nodePlatform = Await NodePlatformResolver.ResolveAsync(client, cancellation)
+
                 ' Build minimal InstallationConfig for plugin
                 Dim installConfig As New InstallationConfig With {
                     .InstallationId = installationId,
@@ -468,7 +779,8 @@ Namespace GSM.Manager.Core
                     .DisplayName = installEntity.DisplayName,
                     .InstallPath = installEntity.InstallPath,
                     .NodeId = installEntity.NodeId,
-                    .CustomFields = DeserializeConfig(installEntity.ConfigJson)
+                    .CustomFields = DeserializeConfig(installEntity.ConfigJson),
+                    .Platform = nodePlatform
                 }
                 installConfig.InstallMethod = ParseInstallMethod(installEntity.InstallMethod)
 
@@ -502,9 +814,8 @@ Namespace GSM.Manager.Core
                 }
 
                 Try
-                    Dim client = _clientFactory.GetClient(
-                        nodeEntity.NodeId, nodeEntity.HostAddress,
-                        nodeEntity.Port, nodeEntity.AuthToken)
+                    ' Client already resolved above the schema-build
+                    ' so we could pre-fetch the platform.
                     Dim resp = Await client.CheckAppVersionAsync(req, cancellation)
                     result.InstalledBuildId = resp.InstalledBuildId
                     result.LatestBuildId = resp.LatestBuildId
@@ -531,6 +842,88 @@ Namespace GSM.Manager.Core
             Return result
         End Function
 
+    End Class
+
+    ' ============================================================
+    '  Event arguments for InstallationManager UI events
+    ' ============================================================
+
+    ''' <summary>
+    ''' Fired when an install or update reaches the polling phase
+    ''' (after StartInstallAsync returns, before the first poll).
+    ''' Carries the discriminator (isUpdate) so subscribers that only
+    ''' care about one direction can filter, and userInitiated so the
+    ''' panel knows whether to auto-select its Progress tab.
+    ''' </summary>
+    Public Class InstallationOperationStartedEventArgs
+        Inherits EventArgs
+        Public Property InstallationId As String
+        Public Property IsUpdate As Boolean
+
+        ''' <summary>
+        ''' True when the operation was kicked off by an explicit
+        ''' user action (right-click → Update, New Installation form,
+        ''' etc.) rather than by an automation rule firing in the
+        ''' background. The InstallationPanel uses this to decide
+        ''' whether to switch to its Progress tab on receipt —
+        ''' user-initiated operations get focus, automation-initiated
+        ''' ones run quietly.
+        ''' </summary>
+        Public Property UserInitiated As Boolean
+    End Class
+
+    ''' <summary>
+    ''' Fired on every poll tick during the operation. Carries the
+    ''' full progress snapshot so subscribers can update bytes /
+    ''' percent / phase / message without a separate fetch.
+    ''' </summary>
+    Public Class InstallationProgressEventArgs
+        Inherits EventArgs
+        Public Property InstallationId As String
+        Public Property Progress As InstallProgressResponse
+    End Class
+
+    ''' <summary>
+    ''' Fired exactly once per OperationStarted, in the Finally block
+    ''' of ExecuteInstallInternal. Success is true only when the
+    ''' operation reached the Completed state cleanly; cancellation,
+    ''' failure, and exceptions all surface as Success=False with the
+    ''' best-available error message.
+    ''' </summary>
+    Public Class InstallationOperationCompletedEventArgs
+        Inherits EventArgs
+        Public Property InstallationId As String
+        Public Property IsUpdate As Boolean
+        Public Property Success As Boolean
+        Public Property ErrorMessage As String
+    End Class
+
+    ''' <summary>
+    ''' Result of an install or update operation. Carries success +
+    ''' the failure reason so callers can surface meaningful messages
+    ''' to the user instead of the generic "check the logs" fallback
+    ''' that a Boolean return would force.
+    '''
+    ''' Success path is constructed via Ok(); failure via Fail(msg).
+    ''' The Boolean operator overload preserves the historical
+    ''' `If result Then` convenience for callers that don't need the
+    ''' message (the IRuleContext.UpdateInstallation contract on the
+    ''' automation side, in particular).
+    ''' </summary>
+    Public Class InstallationOperationResult
+        Public Property Success As Boolean
+        Public Property ErrorMessage As String
+
+        Public Shared Function Ok() As InstallationOperationResult
+            Return New InstallationOperationResult With {.Success = True}
+        End Function
+
+        Public Shared Function Fail(message As String) As InstallationOperationResult
+            Return New InstallationOperationResult With {
+                .Success = False,
+                .ErrorMessage = message
+            }
+        End Function
     End Class
 
     ''' <summary>

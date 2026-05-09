@@ -2326,13 +2326,145 @@ Namespace GSM.Manager.UI
 
                 schema = schema.Concat(CommonConfigFields.GetInstanceLifecycleFields()).ToList()
 
-                _schemaResult = SchemaFormBuilder.Build(schema, existingValues)
+                ' Build a file-list provider so any ManagedFilePicker
+                ' fields in the schema render with a populated dropdown.
+                ' Captures only _instanceId; everything else is re-
+                ' resolved on each call so a node addr / token edit
+                ' takes effect on the next dropdown open without form
+                ' rebuild. Returns Nothing on any failure path so the
+                ' combo silently degrades to free-text-only.
+                Dim fileListProvider As Func(Of String, Task(Of IReadOnlyList(Of String))) =
+                    AddressOf BuildSavesProviderForCurrentInstance
+
+                _schemaResult = SchemaFormBuilder.Build(schema, existingValues, fileListProvider)
                 If _schemaResult.Panel IsNot Nothing Then
                     _schemaResult.Panel.Dock = DockStyle.Fill
                     _configPanel.Controls.Add(_schemaResult.Panel)
                 End If
             End Using
         End Sub
+
+        ''' <summary>
+        ''' File-list provider for ManagedFilePicker fields on the
+        ''' edit form. Looks up the instance's plugin, finds the
+        ''' ManagedDirectory whose RelativePath matches dirRef, then
+        ''' calls the node's ListFilesAsync endpoint and returns just
+        ''' the basenames (the dropdown shows "foo.zip", not
+        ''' "saves/foo.zip"). Returns an empty list on any failure —
+        ''' the combo's free-text path stays usable regardless.
+        '''
+        ''' Why this lives on EditInstanceForm rather than as a
+        ''' shared helper: the provider needs _instanceId in scope
+        ''' and is the sole caller. If a second form needs the same
+        ''' resolution — say AddInstanceForm gets a save picker too —
+        ''' lift this to a shared static at that point. Right now
+        ''' AddInstanceForm doesn't run because the install path may
+        ''' not even exist yet, so there's nothing meaningful to list.
+        ''' </summary>
+        Private Async Function BuildSavesProviderForCurrentInstance(dirRef As String) As Task(Of IReadOnlyList(Of String))
+            If String.IsNullOrEmpty(dirRef) Then Return New List(Of String)
+            Try
+                Dim factory = ManagerProgram.Services.GetService(Of NodeHttpClientFactory)()
+                If factory Is Nothing Then Return New List(Of String)
+
+                Dim installPath As String = Nothing
+                Dim nodeId As String = Nothing
+                Dim hostAddress As String = Nothing
+                Dim port As Integer = 0
+                Dim authToken As String = Nothing
+                Dim gameId As String = Nothing
+                Dim displayName As String = Nothing
+                Dim installationId As String = Nothing
+
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim instanceEntity = db.Instances.Find(_instanceId)
+                    If instanceEntity Is Nothing Then Return New List(Of String)
+                    Dim installEntity = db.Installations.Find(instanceEntity.InstallationId)
+                    If installEntity Is Nothing Then Return New List(Of String)
+                    Dim nodeEntity = db.Nodes.Find(installEntity.NodeId)
+                    If nodeEntity Is Nothing Then Return New List(Of String)
+
+                    installPath = installEntity.InstallPath
+                    nodeId = nodeEntity.NodeId
+                    hostAddress = nodeEntity.HostAddress
+                    port = nodeEntity.Port
+                    authToken = nodeEntity.AuthToken
+                    gameId = instanceEntity.GameId
+                    displayName = instanceEntity.DisplayName
+                    installationId = instanceEntity.InstallationId
+                End Using
+
+                ' Resolve the ManagedDirectory whose RelativePath
+                ' matches dirRef so we use the plugin-declared
+                ' permissions / extension allowlist on the node call.
+                ' Falls back to a permissive call (no extension
+                ' filter) if the lookup fails — the dropdown showing
+                ' too many files is far better than showing none.
+                Dim resolvedRel As String = dirRef
+                Dim allowedExtensions As IReadOnlyList(Of String) = Nothing
+                Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+                If registry IsNot Nothing Then
+                    Dim plugin = registry.GetPlugin(gameId)
+                    Dim provider = TryCast(plugin, IManagedDirectoriesProvider)
+                    If provider IsNot Nothing Then
+                        Dim minimalConfig As New InstanceConfig With {
+                            .InstanceId = _instanceId,
+                            .GameId = gameId,
+                            .DisplayName = displayName,
+                            .InstallationId = installationId
+                        }
+                        Dim dirs = provider.GetManagedDirectories(minimalConfig)
+                        If dirs IsNot Nothing Then
+                            For Each d In dirs
+                                If d Is Nothing Then Continue For
+                                If String.Equals(d.RelativePath, dirRef,
+                                                  StringComparison.OrdinalIgnoreCase) Then
+                                    resolvedRel = If(d.RelativePath, dirRef).
+                                        Replace("{InstanceId}", _instanceId)
+                                    allowedExtensions = d.AllowedExtensions
+                                    Exit For
+                                End If
+                            Next
+                        End If
+                    End If
+                End If
+
+                Dim client = factory.GetClient(nodeId, hostAddress, port, authToken)
+                Dim allowedRoots As IReadOnlyList(Of String) = New String() {resolvedRel}
+
+                Dim entries = Await client.ListFilesAsync(
+                    _instanceId,
+                    installPath,
+                    resolvedRel,
+                    allowedRoots,
+                    allowedExtensions,
+                    System.Threading.CancellationToken.None)
+
+                If entries Is Nothing Then Return New List(Of String)
+
+                ' Strip the directory prefix — the dropdown shows
+                ' "foo.zip", not "saves/foo.zip". Sort newest-first by
+                ' ModifiedUtc so a freshly-uploaded backup lands at
+                ' the top of the dropdown without the user having to
+                ' scroll. Matches the ordering the ManagedFilesPanel
+                ' already uses for the same listing.
+                Return entries.
+                    OrderByDescending(Function(f) f.ModifiedUtc).
+                    Select(Function(f) ShortName(f.RelativePath)).
+                    Where(Function(n) Not String.IsNullOrEmpty(n)).
+                    ToList()
+            Catch
+                Return New List(Of String)
+            End Try
+        End Function
+
+        Private Shared Function ShortName(relativePath As String) As String
+            If String.IsNullOrEmpty(relativePath) Then Return ""
+            Dim slashIdx = relativePath.LastIndexOfAny(New Char() {"/"c, "\"c})
+            If slashIdx < 0 Then Return relativePath
+            Return relativePath.Substring(slashIdx + 1)
+        End Function
 
         Private Sub OnSave(sender As Object, e As EventArgs)
             If String.IsNullOrWhiteSpace(_nameTextBox.Text) Then
@@ -2604,6 +2736,7 @@ Namespace GSM.Manager.UI
         Private ReadOnly _installationId As String
         Private _nameTextBox As TextBox
         Private _pathLabel As Label
+        Private _credLabel As Label
         Private _steamCredCombo As ComboBox
         Private _runRedistCheckBox As CheckBox
         Private _configPanel As Panel
@@ -2650,10 +2783,17 @@ Namespace GSM.Manager.UI
             ' Steam account (if any) is associated with this installation.
             ' Stored credentials come from the Steam Credentials form in
             ' Tools → Settings.
-            Dim credLbl As New Label() With {
+            '
+            ' For non-SteamCmd installs (DirectDownload, Manual) the
+            ' credential isn't used by the install runner, so the row
+            ' is hidden in LoadExistingValues based on the entity's
+            ' InstallMethod — leaving it visible would suggest the
+            ' choice mattered when it doesn't. The label is tracked
+            ' as a field so we can hide it alongside the combo.
+            _credLabel = New Label() With {
                 .Text = "Steam Account:", .AutoSize = True,
                 .Location = New Point(20, y + 3)}
-            Me.Controls.Add(credLbl)
+            Me.Controls.Add(_credLabel)
             _steamCredCombo = New ComboBox() With {
                 .Location = New Point(160, y),
                 .Size = New Size(380, 24),
@@ -2709,6 +2849,17 @@ Namespace GSM.Manager.UI
                 _nameTextBox.Text = installEntity.DisplayName
                 _pathLabel.Text = installEntity.InstallPath
                 _runRedistCheckBox.Checked = installEntity.RunCommonRedist
+
+                ' Hide the Steam-credential row entirely for non-
+                ' SteamCmd installs. Mirrors NewInstallationForm's
+                ' OnMethodChanged behaviour. Install method can't
+                ' be changed after creation so this is a one-shot
+                ' visibility set, not a live toggle.
+                Dim isSteamInstall = String.Equals(installEntity.InstallMethod,
+                                                    InstallMethod.SteamCmd.ToString(),
+                                                    StringComparison.OrdinalIgnoreCase)
+                If _credLabel IsNot Nothing Then _credLabel.Visible = isSteamInstall
+                If _steamCredCombo IsNot Nothing Then _steamCredCombo.Visible = isSteamInstall
 
                 ' Populate the Steam credential dropdown with all stored
                 ' credentials plus an "(anonymous)" option. Tag each item

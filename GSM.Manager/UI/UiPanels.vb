@@ -401,6 +401,7 @@ Namespace GSM.Manager.UI
         Private _nameLabel As Label
         Private _gameLabel As Label
         Private _pathLabel As Label
+        Private _methodLabel As Label
         Private _versionLabel As Label
         Private _credentialLabel As Label
         Private _checkUpdatesButton As Button
@@ -415,10 +416,45 @@ Namespace GSM.Manager.UI
         Private _downButton As Button
         Private _configContent As Panel
 
+        ' Progress-tab support — fields populated when an
+        ' install/update operation is observed via
+        ' InstallationManager events. Tab is added on
+        ' OperationStarted, never auto-removed (stays until panel
+        ' disposed) so the user can continue reading the final
+        ' status after completion.
+        Private _progressTab As TabPage
+        Private _progressView As InstallationProgressView
+
+        ' Cached InstallationManager reference — needed in Dispose
+        ' to RemoveHandler with the same delegate target we passed
+        ' to AddHandler. Resolved once in the constructor; Nothing
+        ' if DI lookup fails (in which case we simply don't get
+        ' progress UI — not a fatal condition).
+        Private _installationMgr As InstallationManager
+
         Public Sub New(installationId As String)
             _installationId = installationId
             InitializeControls()
             LoadInstallationData()
+            ' Subscribe to InstallationManager UI events for
+            ' install/update progress on this installation. Done
+            ' after InitializeControls so _tabs exists when an
+            ' OperationStarted event fires and adds the Progress
+            ' tab. Also queries GetActiveProgress synchronously so
+            ' a panel opened mid-flight renders current state
+            ' without waiting for the next 2s poll tick.
+            SubscribeToInstallationManager()
+        End Sub
+
+        Protected Overrides Sub Dispose(disposing As Boolean)
+            If disposing Then
+                ' Unsubscribe BEFORE base Dispose disposes child
+                ' controls — otherwise an in-flight event from the
+                ' polling thread could land in a handler that
+                ' touches a half-disposed control.
+                UnsubscribeFromInstallationManager()
+            End If
+            MyBase.Dispose(disposing)
         End Sub
 
         Private Sub InitializeControls()
@@ -439,15 +475,28 @@ Namespace GSM.Manager.UI
                 .AutoSize = True,
                 .Location = New Point(2, 75)
             }
+            ' Install method indicator. Sits between path and
+            ' version so users can tell at a glance whether the
+            ' install is Steam-managed (and therefore answers to
+            ' SteamCMD-based update checks + the Steam-account row
+            ' below) or a direct-download install (which uses the
+            ' plugin's IVersionAwarePlugin path and has no Steam
+            ' credential to show).
+            _methodLabel = New Label() With {
+                .Font = New Font("Segoe UI", 9),
+                .ForeColor = Color.DimGray,
+                .AutoSize = True,
+                .Location = New Point(2, 95)
+            }
             _versionLabel = New Label() With {
                 .Font = New Font("Segoe UI", 9),
                 .AutoSize = True,
-                .Location = New Point(2, 95)
+                .Location = New Point(2, 115)
             }
             _credentialLabel = New Label() With {
                 .Font = New Font("Segoe UI", 9),
                 .AutoSize = True,
-                .Location = New Point(2, 115)
+                .Location = New Point(2, 135)
             }
 
             ' Check-for-updates button + status label (to the right of
@@ -468,9 +517,13 @@ Namespace GSM.Manager.UI
 
             Dim header As New Panel()
             header.Dock = DockStyle.Top
-            header.Height = 150
+            ' Bumped from 150 → 170 to make room for the new
+            ' Install Method line. The other rows shift down by
+            ' 20px in lockstep so the visual rhythm stays even.
+            header.Height = 170
             header.Controls.AddRange(New Control() {
-                _nameLabel, _gameLabel, _pathLabel, _versionLabel, _credentialLabel,
+                _nameLabel, _gameLabel, _pathLabel, _methodLabel,
+                _versionLabel, _credentialLabel,
                 _checkUpdatesButton, _updateStatusLabel
             })
 
@@ -586,31 +639,49 @@ Namespace GSM.Manager.UI
                 _nameLabel.Text = inst.DisplayName
                 _gameLabel.Text = $"Game: {inst.GameId}"
                 _pathLabel.Text = $"Path: {inst.InstallPath}"
+                ApplyMethodLabel(inst)
                 ApplyVersionLabel(inst)
 
-                ' Steam credential label — use reflection so we don't
-                ' hard-bind to a specific property name on the entity
-                ' (could be AccountName, Username, Login, etc.).
-                If Not String.IsNullOrEmpty(inst.SteamCredentialId) Then
-                    Try
-                        Dim cred = db.SteamCredentials.Find(inst.SteamCredentialId)
-                        If cred IsNot Nothing Then
-                            Dim acctName = GetStringProperty(cred,
-                                {"Username", "UserName", "AccountName", "Login", "DisplayName"})
-                            If String.IsNullOrEmpty(acctName) Then acctName = "(assigned)"
-                            _credentialLabel.Text = $"Steam account: {acctName}"
-                            _credentialLabel.ForeColor = Color.DarkGreen
-                        Else
-                            _credentialLabel.Text = "Steam account: (credential missing)"
-                            _credentialLabel.ForeColor = Color.Firebrick
-                        End If
-                    Catch
-                        _credentialLabel.Text = "Steam account: (assigned)"
-                        _credentialLabel.ForeColor = Color.DarkGreen
-                    End Try
+                ' Steam credential label — only meaningful for
+                ' SteamCmd installs. For DirectDownload / Manual the
+                ' credential field doesn't get used at install time
+                ' and would mislead the user into thinking the
+                ' install logged in to Steam, so we hide the row
+                ' entirely. The InstallMethod label above already
+                ' tells the user which kind of install they're
+                ' looking at; the Steam-account line just adds noise
+                ' for non-Steam installs.
+                Dim isSteamInstall = String.Equals(inst.InstallMethod,
+                                                    InstallMethod.SteamCmd.ToString(),
+                                                    StringComparison.OrdinalIgnoreCase)
+                If Not isSteamInstall Then
+                    _credentialLabel.Visible = False
                 Else
-                    _credentialLabel.Text = "Steam account: anonymous (default)"
-                    _credentialLabel.ForeColor = Color.Gray
+                    _credentialLabel.Visible = True
+                    ' Use reflection so we don't hard-bind to a
+                    ' specific property name on the entity (could be
+                    ' AccountName, Username, Login, etc.).
+                    If Not String.IsNullOrEmpty(inst.SteamCredentialId) Then
+                        Try
+                            Dim cred = db.SteamCredentials.Find(inst.SteamCredentialId)
+                            If cred IsNot Nothing Then
+                                Dim acctName = GetStringProperty(cred,
+                                    {"Username", "UserName", "AccountName", "Login", "DisplayName"})
+                                If String.IsNullOrEmpty(acctName) Then acctName = "(assigned)"
+                                _credentialLabel.Text = $"Steam account: {acctName}"
+                                _credentialLabel.ForeColor = Color.DarkGreen
+                            Else
+                                _credentialLabel.Text = "Steam account: (credential missing)"
+                                _credentialLabel.ForeColor = Color.Firebrick
+                            End If
+                        Catch
+                            _credentialLabel.Text = "Steam account: (assigned)"
+                            _credentialLabel.ForeColor = Color.DarkGreen
+                        End Try
+                    Else
+                        _credentialLabel.Text = "Steam account: anonymous (default)"
+                        _credentialLabel.ForeColor = Color.Gray
+                    End If
                 End If
 
                 ' Load child instances ordered by SortOrder so the
@@ -654,6 +725,37 @@ Namespace GSM.Manager.UI
                 ' Populate the installation config schema (read-only)
                 PopulateConfigTab(inst)
             End Using
+        End Sub
+
+        ''' <summary>
+        ''' Render the install-method indicator ("Install method:
+        ''' Steam (SteamCMD)" / "Install method: Direct download" /
+        ''' "Install method: Manual"). Lives on its own header line
+        ''' so the user can tell SteamCmd from non-SteamCmd installs
+        ''' at a glance — previously the only signal was the
+        ''' presence of the Steam-account row, which is implicit
+        ''' enough that users didn't pick up on it. The label
+        ''' renders verbatim for unknown method strings rather than
+        ''' hiding, so a future install method (or a manually-edited
+        ''' DB row) is still visible.
+        ''' </summary>
+        Private Sub ApplyMethodLabel(inst As InstallationEntity)
+            Dim raw = If(inst.InstallMethod, "")
+            Dim parsed As InstallMethod
+            If Not [Enum].TryParse(raw, True, parsed) Then
+                _methodLabel.Text = $"Install method: {raw}"
+                Return
+            End If
+            Select Case parsed
+                Case InstallMethod.SteamCmd
+                    _methodLabel.Text = "Install method: Steam (SteamCMD)"
+                Case InstallMethod.DirectDownload
+                    _methodLabel.Text = "Install method: Direct download"
+                Case InstallMethod.Manual
+                    _methodLabel.Text = "Install method: Manual"
+                Case Else
+                    _methodLabel.Text = $"Install method: {raw}"
+            End Select
         End Sub
 
         ''' <summary>
@@ -998,6 +1100,361 @@ Namespace GSM.Manager.UI
             End Try
         End Sub
 
+        ' ============================================================
+        '  Install/update progress event subscription
+        ' ============================================================
+
+        ''' <summary>
+        ''' Resolve the InstallationManager from DI, render any
+        ''' already-in-flight operation, and subscribe to the three
+        ''' lifecycle events for future updates. Called once from
+        ''' the constructor.
+        '''
+        ''' Order matters: GetActiveProgress is queried BEFORE
+        ''' AddHandler so we don't double-render the initial state
+        ''' (the AddHandler subscription doesn't replay missed events,
+        ''' so a synchronous initial query covers the gap between
+        ''' "op started" and "panel constructed").
+        ''' </summary>
+        Private Sub SubscribeToInstallationManager()
+            Try
+                _installationMgr = ManagerProgram.Services.GetService(Of InstallationManager)()
+            Catch
+                _installationMgr = Nothing
+            End Try
+            If _installationMgr Is Nothing Then Return
+
+            ' Render any operation already in flight on this
+            ' installation. We don't know IsUpdate from the
+            ' progress snapshot alone (only OperationStarted carries
+            ' that flag), so default to False here — the title shows
+            ' "Operation in progress..." generically and the phase
+            ' label tells the user what's actually happening. Don't
+            ' auto-select the tab on this path: the user navigated
+            ' here themselves, they get to choose whether to look at
+            ' Progress or stay on Instances.
+            Try
+                Dim active = _installationMgr.GetActiveProgress(_installationId)
+                If active IsNot Nothing Then
+                    EnsureProgressTab(isUpdate:=False, autoSelect:=False)
+                    If _progressView IsNot Nothing Then
+                        _progressView.UpdateProgress(active)
+                    End If
+                End If
+            Catch
+                ' Best-effort rendering of initial state — if it
+                ' fails the events will catch up on the next tick.
+            End Try
+
+            AddHandler _installationMgr.OperationStarted, AddressOf OnInstallationOperationStarted
+            AddHandler _installationMgr.ProgressChanged, AddressOf OnInstallationProgressChanged
+            AddHandler _installationMgr.OperationCompleted, AddressOf OnInstallationOperationCompleted
+        End Sub
+
+        Private Sub UnsubscribeFromInstallationManager()
+            If _installationMgr Is Nothing Then Return
+            Try
+                RemoveHandler _installationMgr.OperationStarted, AddressOf OnInstallationOperationStarted
+                RemoveHandler _installationMgr.ProgressChanged, AddressOf OnInstallationProgressChanged
+                RemoveHandler _installationMgr.OperationCompleted, AddressOf OnInstallationOperationCompleted
+            Catch
+                ' RemoveHandler is forgiving of unsubscribed delegates;
+                ' this catch is for any unexpected manager-side error.
+            End Try
+            _installationMgr = Nothing
+        End Sub
+
+        ' ---- Event handlers ----
+        '
+        ' Each handler does the same dance: filter on installationId,
+        ' marshal to UI thread, then delegate to an Apply* method that
+        ' assumes UI-thread context. Keeping the dispatch and the
+        ' work in separate methods makes the apply side trivial to
+        ' read without the threading boilerplate cluttering it.
+
+        Private Sub OnInstallationOperationStarted(sender As Object, e As InstallationOperationStartedEventArgs)
+            If e Is Nothing OrElse Not String.Equals(e.InstallationId, _installationId, StringComparison.Ordinal) Then Return
+            Try
+                If Me.IsDisposed Then Return
+                If Me.IsHandleCreated AndAlso Me.InvokeRequired Then
+                    Me.BeginInvoke(New Action(Sub() ApplyOperationStarted(e)))
+                Else
+                    ApplyOperationStarted(e)
+                End If
+            Catch
+                ' BeginInvoke can race with handle destruction — swallow.
+            End Try
+        End Sub
+
+        Private Sub OnInstallationProgressChanged(sender As Object, e As InstallationProgressEventArgs)
+            If e Is Nothing OrElse Not String.Equals(e.InstallationId, _installationId, StringComparison.Ordinal) Then Return
+            Try
+                If Me.IsDisposed Then Return
+                If Me.IsHandleCreated AndAlso Me.InvokeRequired Then
+                    Me.BeginInvoke(New Action(Sub() ApplyProgressChanged(e)))
+                Else
+                    ApplyProgressChanged(e)
+                End If
+            Catch
+            End Try
+        End Sub
+
+        Private Sub OnInstallationOperationCompleted(sender As Object, e As InstallationOperationCompletedEventArgs)
+            If e Is Nothing OrElse Not String.Equals(e.InstallationId, _installationId, StringComparison.Ordinal) Then Return
+            Try
+                If Me.IsDisposed Then Return
+                If Me.IsHandleCreated AndAlso Me.InvokeRequired Then
+                    Me.BeginInvoke(New Action(Sub() ApplyOperationCompleted(e)))
+                Else
+                    ApplyOperationCompleted(e)
+                End If
+            Catch
+            End Try
+        End Sub
+
+        Private Sub ApplyOperationStarted(e As InstallationOperationStartedEventArgs)
+            If Me.IsDisposed Then Return
+            EnsureProgressTab(isUpdate:=e.IsUpdate, autoSelect:=e.UserInitiated)
+        End Sub
+
+        Private Sub ApplyProgressChanged(e As InstallationProgressEventArgs)
+            If Me.IsDisposed Then Return
+            If _progressView IsNot Nothing AndAlso Not _progressView.IsDisposed Then
+                _progressView.UpdateProgress(e.Progress)
+            End If
+        End Sub
+
+        Private Sub ApplyOperationCompleted(e As InstallationOperationCompletedEventArgs)
+            If Me.IsDisposed Then Return
+            If _progressView IsNot Nothing AndAlso Not _progressView.IsDisposed Then
+                _progressView.ShowCompletion(e.Success, e.ErrorMessage)
+            End If
+            ' On successful completion the InstalledVersion field
+            ' on the entity has been updated by ExecuteInstallInternal
+            ' — reload the header version label to pick that up
+            ' without forcing the user to navigate away and back.
+            If e.Success Then
+                Try
+                    Using scope = ManagerProgram.Services.CreateScope()
+                        Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                        Dim inst = db.Installations.Find(_installationId)
+                        If inst IsNot Nothing Then ApplyVersionLabel(inst)
+                    End Using
+                Catch
+                End Try
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Add the Progress tab to _tabs if not already present, and
+        ''' optionally select it. Idempotent — a second call after
+        ''' the tab exists just sets the operation kind on the
+        ''' existing view (in case the kind changed, e.g. an aborted
+        ''' install retried as an update).
+        ''' </summary>
+        Private Sub EnsureProgressTab(isUpdate As Boolean, autoSelect As Boolean)
+            If _progressTab Is Nothing Then
+                _progressView = New InstallationProgressView()
+                _progressView.Dock = DockStyle.Fill
+
+                _progressTab = New TabPage("Progress")
+                _progressTab.Controls.Add(_progressView)
+
+                If _tabs IsNot Nothing Then _tabs.TabPages.Add(_progressTab)
+            End If
+
+            _progressView.SetOperationKind(isUpdate)
+
+            If autoSelect AndAlso _tabs IsNot Nothing AndAlso _progressTab IsNot Nothing Then
+                Try
+                    _tabs.SelectedTab = _progressTab
+                Catch
+                    ' SelectedTab can throw if the tab control isn't
+                    ' fully initialized yet (rare) — swallow.
+                End Try
+            End If
+        End Sub
+
+    End Class
+
+    ' ============================================================
+    '  InstallationProgressView — inline progress display for
+    '  install/update operations on the InstallationPanel
+    ' ============================================================
+
+    ''' <summary>
+    ''' Read-only view of an in-flight or recently-completed
+    ''' install/update. Hosted in the InstallationPanel's Progress
+    ''' tab, populated by InstallationPanel via the InstallationManager
+    ''' UI events. Three public mutators:
+    '''
+    '''   - SetOperationKind: called from OperationStarted with the
+    '''     IsUpdate flag, sets the title ("Installing..." vs
+    '''     "Updating...").
+    '''   - UpdateProgress: called on each ProgressChanged tick,
+    '''     refreshes the phase label, step label, progress bar, and
+    '''     status message from the InstallProgressResponse.
+    '''   - ShowCompletion: called on OperationCompleted, swaps the
+    '''     in-progress UI for a success/failure summary.
+    '''
+    ''' All mutators must be called on the UI thread — that's the
+    ''' caller's responsibility (the InstallationPanel handles
+    ''' marshaling via Control.BeginInvoke before invoking these).
+    ''' </summary>
+    Public Class InstallationProgressView
+        Inherits UserControl
+
+        Private _titleLabel As Label
+        Private _phaseLabel As Label
+        Private _stepLabel As Label
+        Private _progressBar As ProgressBar
+        Private _statusLabel As Label
+        Private _resultLabel As Label
+
+        Public Sub New()
+            InitializeControls()
+        End Sub
+
+        Private Sub InitializeControls()
+            _titleLabel = New Label() With {
+                .Font = New Font("Segoe UI", 14, FontStyle.Bold),
+                .AutoSize = True,
+                .Location = New Point(10, 12),
+                .Text = "Operation in progress..."
+            }
+
+            _phaseLabel = New Label() With {
+                .Font = New Font("Segoe UI", 11),
+                .AutoSize = True,
+                .Location = New Point(10, 50),
+                .Text = "Phase: —"
+            }
+
+            _stepLabel = New Label() With {
+                .Font = New Font("Segoe UI", 9.5F),
+                .ForeColor = Color.Gray,
+                .AutoSize = True,
+                .Location = New Point(10, 80),
+                .MaximumSize = New Size(700, 0)
+            }
+
+            ' Fixed width with Top|Left anchor only — Padding on a
+            ' UserControl doesn't reserve space for anchored children
+            ' (anchors snap to the actual control edge, not the padded
+            ' inset), so a Right-anchored bar pinned to the panel edge
+            ' reads as cut off. Hardcoded width matches how most
+            ' desktop installers render their progress bars and gives
+            ' clear breathing room on the right regardless of how wide
+            ' the host panel gets.
+            _progressBar = New ProgressBar() With {
+                .Location = New Point(10, 110),
+                .Size = New Size(480, 22),
+                .Minimum = 0,
+                .Maximum = 100,
+                .Style = ProgressBarStyle.Continuous,
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left
+            }
+
+            _statusLabel = New Label() With {
+                .Font = New Font("Segoe UI", 9.5F),
+                .AutoSize = True,
+                .Location = New Point(10, 144),
+                .MaximumSize = New Size(700, 0)
+            }
+
+            ' Result label hidden until OperationCompleted fires.
+            ' MaximumSize bounded so a long error message wraps
+            ' inside the panel rather than running off-screen.
+            _resultLabel = New Label() With {
+                .Font = New Font("Segoe UI", 11, FontStyle.Bold),
+                .AutoSize = True,
+                .Location = New Point(10, 180),
+                .Visible = False,
+                .MaximumSize = New Size(700, 0)
+            }
+
+            Me.Controls.AddRange(New Control() {
+                _titleLabel, _phaseLabel, _stepLabel,
+                _progressBar, _statusLabel, _resultLabel
+            })
+            Me.Padding = New Padding(10, 10, 10, 10)
+        End Sub
+
+        ''' <summary>
+        ''' Set the title bar text based on whether the operation is
+        ''' a fresh install or an update. Idempotent; safe to call
+        ''' multiple times. No-op once ShowCompletion has fired — the
+        ''' result-state title takes precedence over the in-progress
+        ''' one.
+        ''' </summary>
+        Public Sub SetOperationKind(isUpdate As Boolean)
+            If _resultLabel IsNot Nothing AndAlso _resultLabel.Visible Then Return
+            _titleLabel.Text = If(isUpdate, "Updating...", "Installing...")
+        End Sub
+
+        Public Sub UpdateProgress(progress As InstallProgressResponse)
+            If progress Is Nothing Then Return
+
+            ' Phase: prefer the SteamCMD phase string when present
+            ' ("Reconfiguring" / "Verifying" / "Preallocating" /
+            ' "Downloading" / "Committing"), fall back to the broader
+            ' OperationState enum ("Queued" / "Downloading" /
+            ' "WaitingForInput") when SteamCMD hasn't surfaced a
+            ' phase yet (early start, non-Steam install methods).
+            Dim phase = If(progress.SteamCmdPhase, "")
+            If String.IsNullOrEmpty(phase) Then
+                phase = progress.OperationState.ToString()
+            End If
+            _phaseLabel.Text = $"Phase: {phase}"
+
+            ' Step indicator. CurrentStepIndex is 0-based; show as
+            ' 1-based to match user expectations. Suppress entirely
+            ' for single-step operations to keep the UI clean.
+            If progress.TotalSteps > 1 Then
+                Dim stepName = If(progress.CurrentStepName, "")
+                _stepLabel.Text = $"Step {progress.CurrentStepIndex + 1} of {progress.TotalSteps}: {stepName}"
+            ElseIf Not String.IsNullOrEmpty(progress.CurrentStepName) Then
+                _stepLabel.Text = progress.CurrentStepName
+            Else
+                _stepLabel.Text = ""
+            End If
+
+            ' Progress bar. Clamp to 0..100; the source is a Double
+            ' so out-of-range values are theoretically possible.
+            Dim pct = CInt(Math.Floor(progress.ProgressPercent))
+            If pct < 0 Then pct = 0
+            If pct > 100 Then pct = 100
+            _progressBar.Value = pct
+
+            _statusLabel.Text = If(progress.Message, "")
+        End Sub
+
+        ''' <summary>
+        ''' Final-state display. Replaces the in-progress title and
+        ''' phase, fills the bar to 100% on success (already there
+        ''' if the operation reached 99%, but normalises the visual
+        ''' on faster paths that completed before a 99% read), and
+        ''' shows the result label with a bold green/red message.
+        ''' </summary>
+        Public Sub ShowCompletion(success As Boolean, errorMessage As String)
+            If success Then
+                _titleLabel.Text = "Completed"
+                _phaseLabel.Text = "Phase: Completed"
+                _phaseLabel.ForeColor = Color.DarkGreen
+                _progressBar.Value = 100
+                _resultLabel.Text = "✓ Completed successfully"
+                _resultLabel.ForeColor = Color.DarkGreen
+            Else
+                _titleLabel.Text = "Failed"
+                _phaseLabel.Text = "Phase: Failed"
+                _phaseLabel.ForeColor = Color.Firebrick
+                _resultLabel.Text = If(String.IsNullOrEmpty(errorMessage),
+                                         "✗ Failed (no error message reported)",
+                                         $"✗ Failed: {errorMessage}")
+                _resultLabel.ForeColor = Color.Firebrick
+            End If
+            _resultLabel.Visible = True
+        End Sub
     End Class
 
     ' ============================================================
@@ -1032,6 +1489,35 @@ Namespace GSM.Manager.UI
         Private _logAutoScrollCheckBox As CheckBox
         Private _logRefreshTimer As Timer
         Private _lastLogTimestamp As DateTime = DateTime.MinValue
+
+        ' Manual line-count + offset bookkeeping for the Logs tab.
+        ' Replaces the old `_logTextBox.Lines.Length` / `Lines = keep`
+        ' approach that was the root cause of the catastrophic UI
+        ' lockup: RichTextBox.Lines is an O(text size) accessor that
+        ' walks the whole control and allocates a fresh String() array
+        ' on every read, and the assignment setter re-parsed the
+        ' entire content as RTF. Both were running on every 250ms
+        ' tick once the buffer reached the cap, saturating the UI
+        ' thread badly enough that even mouse cursor rendering stuttered.
+        '
+        ' New scheme — never reads .Lines:
+        '   _logLineCount: how many lines are currently in the control
+        '   _logTotalCharsWritten: monotonic count of all chars ever
+        '       appended to the control, including chars since trimmed
+        '   _logBaseCharOffset: how many of those chars have been trimmed
+        '       away (so TextLength == _logTotalCharsWritten - _logBaseCharOffset)
+        '   _logLineEndAbsoluteOffsets: queue of absolute offsets (in
+        '       the "ever written" coordinate system) one past each
+        '       newline currently visible. On trim we dequeue the
+        '       offsets being removed; the last dequeued offset minus
+        '       _logBaseCharOffset is the relative cut point inside
+        '       the control's current text. Remaining queue entries
+        '       stay valid because they're absolute — no per-trim
+        '       rewrite of the queue contents needed.
+        Private _logLineCount As Integer = 0
+        Private _logTotalCharsWritten As Long = 0
+        Private _logBaseCharOffset As Long = 0
+        Private ReadOnly _logLineEndAbsoluteOffsets As New Queue(Of Long)()
 
         ' Overview tab controls
         Private _playerCountLabel As Label
@@ -1272,6 +1758,22 @@ Namespace GSM.Manager.UI
                 ' Populate the Configuration tab with the plugin's schema
                 ' form. Values come from the instance's stored ConfigJson.
                 PopulateConfigTab(instanceEntity)
+
+                ' Phase 4c-4 — structured file editors (e.g.
+                ' Factorio's server-settings.json). Built BEFORE
+                ' managed-files tabs so editor tabs land closer to
+                ' Configuration in the tab order. Both insert at
+                ' the current chat-index; editor tabs going first
+                ' means managed-dirs find chat shifted by N and
+                ' insert after the editors.
+                BuildEditorTabs(instanceEntity)
+
+                ' Phase 4c-2 — build the file-management tabs (Saves,
+                ' etc.) for plugins that opt in via
+                ' IManagedDirectoriesProvider. No-op for plugins that
+                ' don't (Last Oasis), so those instances see the same
+                ' three-tab layout as before.
+                BuildManagedFilesTabs(instanceEntity)
             End Using
 
             ' Seed with cached state immediately, then kick off refresh
@@ -1395,6 +1897,231 @@ Namespace GSM.Manager.UI
                 If child.HasChildren Then DisableControls(child)
             Next
         End Sub
+
+        ''' <summary>
+        ''' Phase 4c-2 — build the file-management tab(s) for plugins
+        ''' that opt in via IManagedDirectoriesProvider. Inserts one
+        ''' tab per ManagedDirectory between Configuration and Chat
+        ''' so the display order is Overview | Configuration |
+        ''' [managed dirs…] | Chat. No-op when the plugin doesn't
+        ''' implement the interface or returns an empty list — Last
+        ''' Oasis takes that branch and gets the same three-tab
+        ''' layout it had before this phase.
+        '''
+        ''' {InstanceId} substitution in RelativePath happens here on
+        ''' the manager side per the contract (see ManagedDirectory
+        ''' docstring). Plugins return literal "{InstanceId}" tokens
+        ''' and never see the substituted form. Today's plugins
+        ''' (Factorio) don't use the token because their
+        ''' MaxInstancesPerInstallation = 1 means saves are inherently
+        ''' install-scoped; the substitution is reserved for future
+        ''' multi-instance-per-installation games.
+        ''' </summary>
+        Private Sub BuildManagedFilesTabs(instanceEntity As InstanceEntity)
+            Try
+                Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+                If registry Is Nothing Then Return
+                Dim plugin = registry.GetPlugin(instanceEntity.GameId)
+                If plugin Is Nothing Then Return
+
+                ' Plugins opt in via IManagedDirectoriesProvider;
+                ' bail silently if the plugin doesn't implement it.
+                Dim provider = TryCast(plugin, IManagedDirectoriesProvider)
+                If provider Is Nothing Then Return
+
+                ' Minimal InstanceConfig — Phase 4c-2 plugins (Factorio)
+                ' don't reference CustomFields in GetManagedDirectories.
+                ' If a future plugin needs merged install+instance
+                ' config here, build it via the same dictionary-merge
+                ' logic InstanceManager.StartInstanceAsync uses
+                ' (install fields overlaid by instance fields).
+                Dim config As New InstanceConfig With {
+                    .InstanceId = instanceEntity.InstanceId,
+                    .GameId = instanceEntity.GameId,
+                    .DisplayName = instanceEntity.DisplayName,
+                    .InstallationId = instanceEntity.InstallationId
+                }
+
+                Dim dirs = provider.GetManagedDirectories(config)
+                If dirs Is Nothing OrElse dirs.Count = 0 Then Return
+
+                ' Tabs go between Configuration and Chat. Find Chat's
+                ' index and insert there so the display order is
+                ' Overview | Configuration | [managed dirs…] | Chat.
+                ' If Chat got removed somehow, fall back to appending.
+                Dim insertAt = _tabs.TabPages.IndexOf(_chatTab)
+                If insertAt < 0 Then insertAt = _tabs.TabPages.Count
+
+                For Each rawDir In dirs
+                    If rawDir Is Nothing Then Continue For
+                    Dim resolvedRel = If(rawDir.RelativePath, "").
+                        Replace("{InstanceId}", _instanceId)
+                    Dim resolved As New ManagedDirectory With {
+                        .RelativePath = resolvedRel,
+                        .DisplayName = rawDir.DisplayName,
+                        .Permissions = rawDir.Permissions,
+                        .AllowedExtensions = rawDir.AllowedExtensions
+                    }
+
+                    Dim tab As New TabPage(If(rawDir.DisplayName, resolvedRel))
+                    Dim panel As New ManagedFilesPanel(_instanceId, resolved) With {
+                        .Dock = DockStyle.Fill
+                    }
+                    tab.Controls.Add(panel)
+                    _tabs.TabPages.Insert(insertAt, tab)
+                    insertAt += 1
+                Next
+            Catch ex As Exception
+                ' A failure in plugin code or panel construction
+                ' shouldn't take down the whole InstancePanel. The
+                ' missing tab is its own UI signal that something
+                ' went wrong; the message goes to debug output for
+                ' a developer running under VS.
+                System.Diagnostics.Debug.WriteLine(
+                    $"BuildManagedFilesTabs failed: {ex.Message}")
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Phase 4c-4 — build structured editor tabs (e.g.
+        ''' "Server Settings") for plugins that opt in via
+        ''' IInstanceFileEditorProvider. Inserts one tab per
+        ''' returned editor between Configuration and the
+        ''' managed-files tabs (which haven't been built yet at
+        ''' call time, so we insert before Chat and the managed-
+        ''' files pass picks up the new chat-index after).
+        '''
+        ''' Plugin's GetInstanceFileEditors may read fields from
+        ''' the merged install+instance ConfigJson — Factorio's
+        ''' implementation reads ServerSettings to find the
+        ''' correct file path. We mirror the merge logic from
+        ''' BuildPreFlightValidationWarnings so the plugin sees
+        ''' the same merged view it sees at instance start time.
+        '''
+        ''' {InstanceId} substitution in RelativePath is the
+        ''' Manager's responsibility per the contract. Plugins
+        ''' return literal tokens and never see the substituted
+        ''' form. None of today's editors use the token, but
+        ''' applying the substitution here keeps the contract
+        ''' consistent with managed directories.
+        ''' </summary>
+        Private Sub BuildEditorTabs(instanceEntity As InstanceEntity)
+            Try
+                Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+                If registry Is Nothing Then Return
+                Dim plugin = registry.GetPlugin(instanceEntity.GameId)
+                If plugin Is Nothing Then Return
+
+                Dim provider = TryCast(plugin, IInstanceFileEditorProvider)
+                If provider Is Nothing Then Return
+
+                ' Build merged config so plugins reading either
+                ' install-level OR instance-level CustomFields see
+                ' a consistent dictionary. Same merge order as
+                ' InstanceManager.StartInstanceAsync — install
+                ' first, instance overlays.
+                Dim merged As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+                Dim installEntity = TryFindInstall(instanceEntity.InstallationId)
+                If installEntity IsNot Nothing AndAlso
+                   Not String.IsNullOrEmpty(installEntity.ConfigJson) Then
+                    Try
+                        Dim installDict = System.Text.Json.JsonSerializer.Deserialize(
+                            Of Dictionary(Of String, String))(installEntity.ConfigJson)
+                        If installDict IsNot Nothing Then
+                            For Each kvp In installDict
+                                merged(kvp.Key) = kvp.Value
+                            Next
+                        End If
+                    Catch
+                    End Try
+                End If
+                If Not String.IsNullOrEmpty(instanceEntity.ConfigJson) Then
+                    Try
+                        Dim instDict = System.Text.Json.JsonSerializer.Deserialize(
+                            Of Dictionary(Of String, String))(instanceEntity.ConfigJson)
+                        If instDict IsNot Nothing Then
+                            For Each kvp In instDict
+                                ' Same guard as BuildPreFlightValidationWarnings:
+                                ' empty instance values must not clobber
+                                ' non-empty install values. Editor tabs that
+                                ' surface paths from the merged config
+                                ' (Factorio's ServerSettings) would
+                                ' otherwise pick the empty override over
+                                ' the configured install path.
+                                If String.IsNullOrEmpty(kvp.Value) AndAlso
+                                   merged.ContainsKey(kvp.Key) AndAlso
+                                   Not String.IsNullOrEmpty(merged(kvp.Key)) Then
+                                    Continue For
+                                End If
+                                merged(kvp.Key) = kvp.Value
+                            Next
+                        End If
+                    Catch
+                    End Try
+                End If
+
+                Dim config As New InstanceConfig With {
+                    .InstanceId = instanceEntity.InstanceId,
+                    .GameId = instanceEntity.GameId,
+                    .DisplayName = instanceEntity.DisplayName,
+                    .InstallationId = instanceEntity.InstallationId,
+                    .CustomFields = merged
+                }
+
+                Dim editors = provider.GetInstanceFileEditors(config)
+                If editors Is Nothing OrElse editors.Count = 0 Then Return
+
+                ' Insert before Chat — same anchor as
+                ' BuildManagedFilesTabs. Order: Overview |
+                ' Configuration | [editor tabs] | [managed dirs
+                ' inserted later] | Chat.
+                Dim insertAt = _tabs.TabPages.IndexOf(_chatTab)
+                If insertAt < 0 Then insertAt = _tabs.TabPages.Count
+
+                For Each rawEditor In editors
+                    If rawEditor Is Nothing Then Continue For
+                    Dim resolvedRel = If(rawEditor.RelativePath, "").
+                        Replace("{InstanceId}", _instanceId)
+                    Dim resolved As New InstanceFileEditor With {
+                        .Key = rawEditor.Key,
+                        .TabTitle = rawEditor.TabTitle,
+                        .RelativePath = resolvedRel,
+                        .Schema = rawEditor.Schema
+                    }
+
+                    Dim tab As New TabPage(If(rawEditor.TabTitle, resolvedRel))
+                    Dim panel As New InstanceFileEditorPanel(_instanceId, resolved) With {
+                        .Dock = DockStyle.Fill
+                    }
+                    tab.Controls.Add(panel)
+                    _tabs.TabPages.Insert(insertAt, tab)
+                    insertAt += 1
+                Next
+            Catch ex As Exception
+                ' Same fail-soft policy as BuildManagedFilesTabs:
+                ' a missing editor tab is its own UI signal.
+                System.Diagnostics.Debug.WriteLine(
+                    $"BuildEditorTabs failed: {ex.Message}")
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Helper: open a fresh DB scope and find an installation
+        ''' by id. Used by BuildEditorTabs to find the install
+        ''' entity for ConfigJson merging without holding the
+        ''' caller's scope across the whole tab-build operation.
+        ''' </summary>
+        Private Function TryFindInstall(installationId As String) As InstallationEntity
+            If String.IsNullOrEmpty(installationId) Then Return Nothing
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Return db.Installations.Find(installationId)
+                End Using
+            Catch
+                Return Nothing
+            End Try
+        End Function
 
         ' ---- Refresh ----
 
@@ -1604,6 +2331,35 @@ Namespace GSM.Manager.UI
         ' ---- Button handlers ----
 
         Private Async Sub OnStartInstance()
+            ' Pre-flight: ask the plugin to validate the merged
+            ' instance+install config, surface any warnings as
+            ' warn-and-confirm before kicking off the start. The
+            ' canonical example is Factorio's "no save selected"
+            ' check — starting without a save just produces an
+            ' immediate crash, and the user is much better served
+            ' by a clear MessageBox than by digging through the
+            ' first 30 lines of factorio-current.log.
+            '
+            ' Failure modes (DB error, plugin missing, etc.) skip
+            ' validation rather than blocking start — we don't want
+            ' a transient lookup failure to brick the Start button.
+            Try
+                Dim warnings = BuildPreFlightValidationWarnings()
+                If warnings IsNot Nothing AndAlso warnings.Count > 0 Then
+                    Dim msg = "Configuration warnings:" & vbCrLf & vbCrLf &
+                              String.Join(vbCrLf & vbCrLf, warnings) & vbCrLf & vbCrLf &
+                              "Start anyway?"
+                    Dim resp = MessageBox.Show(Me, msg, "Start Instance",
+                                                MessageBoxButtons.YesNo,
+                                                MessageBoxIcon.Warning)
+                    If resp <> DialogResult.Yes Then Return
+                End If
+            Catch
+                ' Validation lookup failed — fall through to the
+                ' normal start path. Real config problems will
+                ' surface as a crash with the usual diagnostics.
+            End Try
+
             SetButtonsEnabled(False)
             _statusLabel.Text = "Starting..."
             _statusLabel.ForeColor = Color.DarkOrange
@@ -1631,6 +2387,95 @@ Namespace GSM.Manager.UI
                 RefreshButtonsFromState()
             End Try
         End Sub
+
+        ''' <summary>
+        ''' Resolve the plugin and merged config, then run
+        ''' ValidateConfig against it. Returns the warning list, or
+        ''' an empty list when the plugin is unavailable / config
+        ''' lookup fails. Mirrors the install+instance ConfigJson
+        ''' merge logic in InstanceManager.StartInstanceAsync —
+        ''' install fields go in first, instance fields overlay
+        ''' on top — so plugins see exactly the same merged config
+        ''' the runtime will hand them.
+        ''' </summary>
+        Private Function BuildPreFlightValidationWarnings() As IReadOnlyList(Of String)
+            Dim empty As IReadOnlyList(Of String) = New List(Of String)
+            Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+            If registry Is Nothing Then Return empty
+
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim instanceEntity = db.Instances.Find(_instanceId)
+                If instanceEntity Is Nothing Then Return empty
+                Dim installEntity = db.Installations.Find(instanceEntity.InstallationId)
+                If installEntity Is Nothing Then Return empty
+
+                Dim plugin = registry.GetPlugin(instanceEntity.GameId)
+                If plugin Is Nothing Then Return empty
+
+                ' Merge install ConfigJson under instance ConfigJson —
+                ' instance fields win on collision. Case-insensitive
+                ' dict to match the runtime path's key handling.
+                Dim merged As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+                If Not String.IsNullOrEmpty(installEntity.ConfigJson) Then
+                    Try
+                        Dim installDict = System.Text.Json.JsonSerializer.Deserialize(
+                            Of Dictionary(Of String, String))(installEntity.ConfigJson)
+                        If installDict IsNot Nothing Then
+                            For Each kvp In installDict
+                                merged(kvp.Key) = kvp.Value
+                            Next
+                        End If
+                    Catch
+                    End Try
+                End If
+                If Not String.IsNullOrEmpty(instanceEntity.ConfigJson) Then
+                    Try
+                        Dim instDict = System.Text.Json.JsonSerializer.Deserialize(
+                            Of Dictionary(Of String, String))(instanceEntity.ConfigJson)
+                        If instDict IsNot Nothing Then
+                            For Each kvp In instDict
+                                ' Critical guard, mirrors the merge rule in
+                                ' InstanceManager.StartInstanceAsync: an
+                                ' empty instance value must NOT overwrite
+                                ' a non-empty install value. The Edit
+                                ' Instance form persists every override
+                                ' field as a key (with empty string when
+                                ' the user left it blank), which means
+                                ' a blind overlay would clobber
+                                ' install-level CustomerKey / ProviderKey
+                                ' / etc. with empty strings — producing
+                                ' "CustomerKey is required" warnings on
+                                ' instances whose installations have the
+                                ' key set just fine. The actual start
+                                ' path doesn't have this bug because
+                                ' InstanceManager applies the same guard
+                                ' before invoking the plugin.
+                                If String.IsNullOrEmpty(kvp.Value) AndAlso
+                                   merged.ContainsKey(kvp.Key) AndAlso
+                                   Not String.IsNullOrEmpty(merged(kvp.Key)) Then
+                                    Continue For
+                                End If
+                                merged(kvp.Key) = kvp.Value
+                            Next
+                        End If
+                    Catch
+                    End Try
+                End If
+
+                Dim cfg As New InstanceConfig With {
+                    .InstanceId = instanceEntity.InstanceId,
+                    .GameId = instanceEntity.GameId,
+                    .DisplayName = instanceEntity.DisplayName,
+                    .InstallationId = instanceEntity.InstallationId,
+                    .CustomFields = merged
+                }
+
+                Dim result = plugin.ValidateConfig(cfg)
+                If result Is Nothing Then Return empty
+                Return result
+            End Using
+        End Function
 
         Private Async Sub OnStopInstance()
             SetButtonsEnabled(False)
@@ -1795,6 +2640,32 @@ Namespace GSM.Manager.UI
         End Sub
 
         ''' <summary>
+        ''' Public entry point used by MainForm's right-click
+        ''' "View Logs" menu item. Enables the Show Logs toggle if
+        ''' it isn't already (which builds the tab and starts the
+        ''' polling timer via the toggle's CheckedChanged handler
+        ''' running synchronously) and brings the tab to the front.
+        ''' Idempotent: a redundant call when logs are already
+        ''' visible just re-selects the tab.
+        ''' </summary>
+        Public Sub ActivateLogsTab()
+            If Not _showLogsToggle.Checked Then
+                ' Setting Checked fires CheckedChanged synchronously,
+                ' which routes through OnToggleShowLogs -> ShowLogsTab.
+                ' By the time this assignment returns, _logsTab is
+                ' non-Nothing and already SelectedTab. Re-selecting
+                ' below is therefore redundant in this branch but
+                ' harmless — keeping it makes the contract clearer:
+                ' after ActivateLogsTab returns, the logs tab is
+                ' visible and selected, regardless of prior state.
+                _showLogsToggle.Checked = True
+            End If
+            If _logsTab IsNot Nothing Then
+                _tabs.SelectedTab = _logsTab
+            End If
+        End Sub
+
+        ''' <summary>
         ''' Build the Logs tab UI on demand, hook up the polling
         ''' timer, and seed it with the manager's ring-buffer tail.
         ''' Idempotent — a redundant call is a no-op (defensive
@@ -1867,7 +2738,17 @@ Namespace GSM.Manager.UI
             ' Seed with the manager's ring-buffer tail so the user
             ' sees recent context immediately, not just whatever
             ' arrives after they toggled on.
-            LoadInitialLogs()
+            '
+            ' Deferred via BeginInvoke so OnToggleShowLogs returns
+            ' before the (potentially several-hundred-line) initial
+            ' fill runs. Without this, the toggle blocks on the
+            ' synchronous fill and the tab doesn't paint until
+            ' LoadInitialLogs returns — showing up to the user as a
+            ' "couple of seconds frozen" UX. With the deferral the
+            ' empty tab paints instantly, then content fills in on
+            ' the next pump cycle. AppendLineRun's bulk-append keeps
+            ' the actual fill cost in the tens of milliseconds.
+            Me.BeginInvoke(Sub() LoadInitialLogs())
 
             ' Kick off a node-side history fetch too — covers the
             ' freshly-restarted-Manager case where the ring buffer
@@ -1876,14 +2757,15 @@ Namespace GSM.Manager.UI
                          Await LoadLogsFromNodeAsync()
                      End Function)
 
-            ' 250ms feels noticeably more live than 500ms without
-            ' the trade-offs that bite below ~200ms (selection loss
-            ' during copy, UI thread saturation under log floods).
-            ' If logs ever feel sluggish at this interval the right
-            ' move isn't a faster timer — it's switching to a
-            ' subscription on ManagerRingBufferStore.LineSubscription
-            ' so updates push instead of poll.
-            _logRefreshTimer = New Timer() With {.Interval = 250}
+            ' 500ms is the same cadence as the (now-removed)
+            ' detached LogViewerForm. Per-tick cost is now small
+            ' enough that we could go faster, but the rate-limiting
+            ' factor is the human reader — noticeable updates at
+            ' 500ms, no benefit to going lower. If logs ever feel
+            ' sluggish here the right move is switching to a push
+            ' subscription on ManagerRingBufferStore rather than
+            ' faster polling.
+            _logRefreshTimer = New Timer() With {.Interval = 500}
             AddHandler _logRefreshTimer.Tick, AddressOf OnLogsRefreshTick
             _logRefreshTimer.Start()
         End Sub
@@ -1911,6 +2793,16 @@ Namespace GSM.Manager.UI
             _logTextBox = Nothing
             _logAutoScrollCheckBox = Nothing
             _lastLogTimestamp = DateTime.MinValue
+
+            ' Reset offset bookkeeping so the next ShowLogsTab
+            ' starts from a clean coordinate system. Without this,
+            ' a second toggle-on would inherit absolute offsets
+            ' from the first session and the first trim's relative
+            ' cut math would produce a negative number.
+            _logLineCount = 0
+            _logTotalCharsWritten = 0
+            _logBaseCharOffset = 0
+            _logLineEndAbsoluteOffsets.Clear()
         End Sub
 
         Private Sub LoadInitialLogs()
@@ -1967,11 +2859,18 @@ Namespace GSM.Manager.UI
             Dim logStore = ManagerProgram.Services.GetService(Of ManagerRingBufferStore)()
             If logStore Is Nothing Then Return
 
-            ' Same cursor-by-timestamp pattern as LogViewerForm — pull
-            ' a generous tail and find where our cursor lands. Avoids
+            ' Same cursor-by-timestamp pattern as before — pull a
+            ' generous tail and find where our cursor lands. Avoids
             ' the "buffer rolls past our index" gap problem.
             Dim lines = logStore.GetTail(_instanceId, 2000)
             If lines Is Nothing OrElse lines.Count = 0 Then Return
+
+            ' Cheap early bail: if the most recent line in the
+            ' buffer is at or before our cursor, no new content has
+            ' arrived since the last tick. Skip the cursor scan and
+            ' the UI work entirely. Idle servers spend most of their
+            ' time in this branch.
+            If lines(lines.Count - 1).Timestamp <= _lastLogTimestamp Then Return
 
             Dim startIdx = 0
             For i = lines.Count - 1 To 0 Step -1
@@ -1989,19 +2888,30 @@ Namespace GSM.Manager.UI
         ''' <summary>
         ''' Append a range of lines to the Logs tab's RichTextBox.
         '''
-        ''' Three things this does that the old LogViewerForm did not:
-        '''  1. Smart timestamp prefix — if the source line already has
-        '''     one we don't add another. If it doesn't, we add a full
-        '''     date+time so multi-day sessions remain disambiguable.
-        '''  2. Auto-scroll OFF actually preserves position. We snapshot
-        '''     the scroll point with EM_GETSCROLLPOS before any
-        '''     mutation and restore it after.
-        '''  3. Trim compensation — when the buffer hits the cap and we
-        '''     remove old lines from the top, the saved scroll Y is
-        '''     adjusted by approximately the height of the removed
-        '''     lines so the user's view stays anchored on the same
-        '''     content. Approximate (font height ignores line spacing
-        '''     deltas) but visibly correct in practice.
+        ''' Trim is offset-based: when _logLineCount exceeds the cap,
+        ''' we dequeue the recorded character offsets for the lines
+        ''' being removed and use Select() + SelectedText = "" to
+        ''' delete the prefix in place. This avoids the O(N)
+        ''' RichTextBox.Lines accessor entirely — the previous
+        ''' implementation called .Lines.Length on every tick (just
+        ''' the .Length read walks the whole control and allocates
+        ''' a String() array) and on cap-hit did `.Lines = keep`
+        ''' which forced a full RTF re-parse. Once the buffer
+        ''' reached ~4000 lines that was costing 100+ ms per tick
+        ''' and saturating the UI thread badly enough to stutter
+        ''' the mouse cursor. The new path touches only the prefix
+        ''' being removed.
+        '''
+        ''' Two other things this method does:
+        '''  1. Smart timestamp prefix — if the source line already
+        '''     has one we don't add another. If it doesn't, we add
+        '''     a full date+time so multi-day sessions remain
+        '''     disambiguable.
+        '''  2. Auto-scroll OFF preserves position. Scroll point is
+        '''     snapshotted via EM_GETSCROLLPOS before any mutation
+        '''     and restored after, with a per-trimmed-line height
+        '''     adjustment so the user's view stays anchored on the
+        '''     same content.
         ''' </summary>
         Private Sub AppendLogLinesToTab(lines As IReadOnlyList(Of LogLine),
                                           startIdx As Integer,
@@ -2022,30 +2932,55 @@ Namespace GSM.Manager.UI
             SendMessage(_logTextBox.Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero)
             Dim trimmedLineCount As Integer = 0
             Try
-                If _logTextBox.Lines.Length > MaxLogBufferedLines Then
-                    Dim allLines = _logTextBox.Lines
-                    trimmedLineCount = allLines.Length - TrimToLines
-                    Dim keep = allLines.Skip(trimmedLineCount).ToArray()
-                    _logTextBox.Clear()
-                    _logTextBox.Lines = keep
+                ' Offset-based trim. _logLineCount is our own counter
+                ' incremented per AppendOneLine call below; we never
+                ' read _logTextBox.Lines (which is O(text size) and
+                ' allocates a fresh String() array every call).
+                If _logLineCount > MaxLogBufferedLines Then
+                    trimmedLineCount = _logLineCount - TrimToLines
+                    Dim cutAbsoluteOffset As Long = 0
+                    For i = 1 To trimmedLineCount
+                        cutAbsoluteOffset = _logLineEndAbsoluteOffsets.Dequeue()
+                    Next
+                    Dim relativeCut As Integer = CInt(cutAbsoluteOffset - _logBaseCharOffset)
+                    ' Defensive: never select past TextLength. A
+                    ' bookkeeping drift (which shouldn't happen, but
+                    ' worth not crashing over) would otherwise throw
+                    ' inside Select().
+                    If relativeCut > _logTextBox.TextLength Then
+                        relativeCut = _logTextBox.TextLength
+                    End If
+                    If relativeCut > 0 Then
+                        _logTextBox.Select(0, relativeCut)
+                        _logTextBox.SelectedText = ""
+                    End If
+                    _logBaseCharOffset = cutAbsoluteOffset
+                    _logLineCount = TrimToLines
                 End If
 
-                For i = startIdx To endIdx - 1
-                    Dim line = lines(i)
-                    Dim textToAppend As String
-                    If HasOwnTimestamp(line.Text) Then
-                        textToAppend = line.Text & vbCrLf
-                    Else
-                        Dim ts = line.Timestamp.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
-                        textToAppend = $"[{ts}] {line.Text}{vbCrLf}"
+                ' Group consecutive same-color lines into runs and
+                ' append each run as one chunk. Per-line AppendText
+                ' was the second-tier bottleneck after we fixed the
+                ' .Lines accessor: each line costs ~3 Win32 messages
+                ' (selection, color, append), so an initial-load of
+                ' 500 lines added up to ~1500 messages serialized on
+                ' the UI thread — a couple of perceptible seconds.
+                ' Coalescing into runs takes a typical all-normal-
+                ' color tail down to a single AppendText call. A
+                ' line where IsError flips starts a new run; in
+                ' pathological alternating-color logs we'd be back
+                ' to per-line cost, but real-world error rates are
+                ' well under 1% so the average case is one run.
+                Dim runStart = startIdx
+                Dim runIsError = lines(startIdx).IsError
+                For i = startIdx + 1 To endIdx - 1
+                    If lines(i).IsError <> runIsError Then
+                        AppendLineRun(lines, runStart, i, runIsError)
+                        runStart = i
+                        runIsError = lines(i).IsError
                     End If
-                    Dim lineColor = If(line.IsError,
-                                        Color.FromArgb(255, 100, 100),
-                                        Color.FromArgb(220, 220, 220))
-                    _logTextBox.SelectionStart = _logTextBox.TextLength
-                    _logTextBox.SelectionColor = lineColor
-                    _logTextBox.AppendText(textToAppend)
                 Next
+                AppendLineRun(lines, runStart, endIdx, runIsError)
             Finally
                 SendMessage(_logTextBox.Handle, WM_SETREDRAW, New IntPtr(1), IntPtr.Zero)
                 _logTextBox.Invalidate()
@@ -2068,6 +3003,63 @@ Namespace GSM.Manager.UI
                 SendMessageScrollPos(_logTextBox.Handle, EM_SETSCROLLPOS,
                                       IntPtr.Zero, savedScroll)
             End If
+        End Sub
+
+        ''' <summary>
+        ''' Append a contiguous run of same-color lines to
+        ''' _logTextBox as a single chunk. Building the chunk in
+        ''' a StringBuilder and calling AppendText once is a large
+        ''' win over per-line appends — see the coalescing comment
+        ''' in AppendLogLinesToTab for the why. Updates
+        ''' _logLineCount, _logTotalCharsWritten, and the newline-
+        ''' offset queue atomically once the chunk is committed to
+        ''' the control.
+        '''
+        ''' chunkEndOffsets accumulates the offset (within the
+        ''' chunk text) at which each line ends — i.e. one past the
+        ''' vbCrLf that terminates that line. Adding the pre-append
+        ''' _logTotalCharsWritten value (baseOffset) to each entry
+        ''' gives the absolute coordinate-system position of each
+        ''' newline, which is what _logLineEndAbsoluteOffsets stores.
+        ''' </summary>
+        Private Sub AppendLineRun(lines As IReadOnlyList(Of LogLine),
+                                    startIdx As Integer,
+                                    endIdx As Integer,
+                                    isError As Boolean)
+            If startIdx >= endIdx Then Return
+
+            Dim sb As New System.Text.StringBuilder()
+            Dim chunkEndOffsets As New List(Of Integer)(endIdx - startIdx)
+            For i = startIdx To endIdx - 1
+                Dim line = lines(i)
+                If HasOwnTimestamp(line.Text) Then
+                    sb.Append(line.Text)
+                Else
+                    Dim ts = line.Timestamp.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
+                    sb.Append("["c)
+                    sb.Append(ts)
+                    sb.Append("] ")
+                    sb.Append(line.Text)
+                End If
+                sb.Append(vbCrLf)
+                chunkEndOffsets.Add(sb.Length)
+            Next
+
+            Dim chunkText = sb.ToString()
+            Dim baseOffset = _logTotalCharsWritten
+            Dim runColor = If(isError,
+                                Color.FromArgb(255, 100, 100),
+                                Color.FromArgb(220, 220, 220))
+
+            _logTextBox.SelectionStart = _logTextBox.TextLength
+            _logTextBox.SelectionColor = runColor
+            _logTextBox.AppendText(chunkText)
+
+            _logTotalCharsWritten += chunkText.Length
+            For Each lineEnd In chunkEndOffsets
+                _logLineEndAbsoluteOffsets.Enqueue(baseOffset + lineEnd)
+            Next
+            _logLineCount += chunkEndOffsets.Count
         End Sub
 
         ''' <summary>
@@ -2101,238 +3093,6 @@ Namespace GSM.Manager.UI
     End Class
 
     ' ============================================================
-    '  LogViewerForm — separate window showing live log output
-    ' ============================================================
-
-    Public Class LogViewerForm
-        Inherits Form
-
-        Private ReadOnly _instanceId As String
-        Private _logTextBox As RichTextBox
-        Private _autoScrollCheckBox As CheckBox
-        Private _refreshTimer As Timer
-        Private _lastSeenTimestamp As DateTime = DateTime.MinValue
-
-        Public Sub New(instanceId As String)
-            FormIconHelper.ApplyTo(Me)
-            _instanceId = instanceId
-            InitializeControls()
-
-            ' Reconnect the log stream if it's not active (e.g. after
-            ' the Manager restarted while the instance kept running).
-            Dim mgr = ManagerProgram.Services.GetService(Of InstanceManager)()
-            If mgr IsNot Nothing Then
-                Task.Run(Async Function()
-                             Await mgr.EnsureLogStreamAsync(instanceId)
-                         End Function)
-            End If
-
-            LoadRecentLogs()
-            StartRefreshTimer()
-
-            ' Kick off a history fetch from the node so even a freshly
-            ' restarted Manager shows context immediately.
-            Task.Run(Async Function()
-                         Await LoadHistoryFromNodeAsync()
-                     End Function)
-        End Sub
-
-        Private Async Function LoadHistoryFromNodeAsync() As Task
-            Dim mgr = ManagerProgram.Services.GetService(Of InstanceManager)()
-            If mgr Is Nothing Then Return
-
-            Dim lines As IReadOnlyList(Of LogLine) = Nothing
-            Try
-                lines = Await mgr.GetRecentLogsAsync(_instanceId, 500)
-            Catch
-                Return
-            End Try
-
-            If lines Is Nothing OrElse lines.Count = 0 Then Return
-
-            ' Only display lines newer than what we already have. If the
-            ' Manager buffer was empty on open, _lastSeenTimestamp is
-            ' DateTime.MinValue and everything qualifies.
-            If Me.IsDisposed Then Return
-            Me.BeginInvoke(Sub() MergeHistory(lines))
-        End Function
-
-        Private Sub MergeHistory(lines As IReadOnlyList(Of LogLine))
-            Dim startIdx = 0
-            For i = lines.Count - 1 To 0 Step -1
-                If lines(i).Timestamp <= _lastSeenTimestamp Then
-                    startIdx = i + 1
-                    Exit For
-                End If
-            Next
-            If startIdx >= lines.Count Then Return
-
-            AppendLogLinesBatch(lines, startIdx, lines.Count)
-            _lastSeenTimestamp = lines(lines.Count - 1).Timestamp
-        End Sub
-
-        Private Sub StartRefreshTimer()
-            _refreshTimer = New Timer()
-            _refreshTimer.Interval = 500
-            AddHandler _refreshTimer.Tick, AddressOf OnRefreshTick
-            _refreshTimer.Start()
-        End Sub
-
-        Private Const WM_SETREDRAW As Integer = &HB
-
-        <Runtime.InteropServices.DllImport("user32.dll")>
-        Private Shared Function SendMessage(hWnd As IntPtr, msg As Integer, wParam As IntPtr, lParam As IntPtr) As IntPtr
-        End Function
-
-        Private Sub OnRefreshTick(sender As Object, e As EventArgs)
-            Dim logStore = ManagerProgram.Services.GetService(Of ManagerRingBufferStore)()
-            If logStore Is Nothing Then Return
-
-            ' Pull a generous tail and find where our cursor falls.
-            ' Using timestamp as cursor avoids the "count stalls at 1000"
-            ' problem when the ring buffer tail is full.
-            Dim lines = logStore.GetTail(_instanceId, 2000)
-            If lines Is Nothing OrElse lines.Count = 0 Then Return
-
-            ' Find the first index whose timestamp is strictly greater
-            ' than what we've already rendered. If the buffer has rolled
-            ' far enough that our cursor is off the front, we start from
-            ' index 0 — which may duplicate a line if timestamps are equal,
-            ' but is the safest way to avoid gaps.
-            Dim startIdx = 0
-            For i = lines.Count - 1 To 0 Step -1
-                If lines(i).Timestamp <= _lastSeenTimestamp Then
-                    startIdx = i + 1
-                    Exit For
-                End If
-            Next
-
-            If startIdx >= lines.Count Then Return
-
-            AppendLogLinesBatch(lines, startIdx, lines.Count)
-            _lastSeenTimestamp = lines(lines.Count - 1).Timestamp
-        End Sub
-
-        Private Const MaxBufferedLines As Integer = 5000
-        Private Const TrimToLines As Integer = 4000
-
-        ''' <summary>
-        ''' Appends a range of lines in one batch. Suspends RichTextBox
-        ''' redraws during the append so the UI doesn't thrash through
-        ''' hundreds of scroll/paint cycles.
-        ''' </summary>
-        Private Sub AppendLogLinesBatch(lines As IReadOnlyList(Of LogLine), startIdx As Integer, endIdx As Integer)
-            If startIdx >= endIdx Then Return
-
-            ' Suspend redraw while we batch-append
-            SendMessage(_logTextBox.Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero)
-            Try
-                ' Trim oldest lines first if we're above the cap, so we
-                ' don't let the control grow unbounded. Keep the newest
-                ' TrimToLines so there's still useful history visible.
-                If _logTextBox.Lines.Length > MaxBufferedLines Then
-                    Dim allLines = _logTextBox.Lines
-                    Dim keep = allLines.Skip(allLines.Length - TrimToLines).ToArray()
-                    _logTextBox.Clear()
-                    _logTextBox.Lines = keep
-                End If
-
-                For i = startIdx To endIdx - 1
-                    Dim line = lines(i)
-                    Dim timestamp = line.Timestamp.ToString("HH:mm:ss.fff")
-                    Dim lineColor = If(line.IsError, Color.FromArgb(255, 100, 100), Color.FromArgb(220, 220, 220))
-
-                    _logTextBox.SelectionStart = _logTextBox.TextLength
-                    _logTextBox.SelectionColor = Color.Gray
-                    _logTextBox.AppendText($"[{timestamp}] ")
-                    _logTextBox.SelectionColor = lineColor
-                    _logTextBox.AppendText(line.Text & vbCrLf)
-                Next
-            Finally
-                ' Resume redraw and invalidate so one paint covers everything
-                SendMessage(_logTextBox.Handle, WM_SETREDRAW, New IntPtr(1), IntPtr.Zero)
-                _logTextBox.Invalidate()
-            End Try
-
-            If _autoScrollCheckBox.Checked Then
-                _logTextBox.SelectionStart = _logTextBox.TextLength
-                _logTextBox.ScrollToCaret()
-            End If
-        End Sub
-
-        Protected Overrides Sub Dispose(disposing As Boolean)
-            If disposing AndAlso _refreshTimer IsNot Nothing Then
-                _refreshTimer.Stop()
-                _refreshTimer.Dispose()
-                _refreshTimer = Nothing
-            End If
-            MyBase.Dispose(disposing)
-        End Sub
-
-        Private Sub InitializeControls()
-            Me.Text = $"Logs — {_instanceId}"
-            Me.Size = New Size(900, 600)
-            Me.StartPosition = FormStartPosition.CenterParent
-
-            _autoScrollCheckBox = New CheckBox()
-            _autoScrollCheckBox.Text = "Auto-scroll"
-            _autoScrollCheckBox.Checked = True
-            _autoScrollCheckBox.Dock = DockStyle.Top
-            _autoScrollCheckBox.Padding = New Padding(5)
-
-            _logTextBox = New RichTextBox()
-            _logTextBox.Dock = DockStyle.Fill
-            _logTextBox.ReadOnly = True
-            _logTextBox.Font = New Font("Consolas", 9.5F)
-            _logTextBox.BackColor = Color.FromArgb(30, 30, 30)
-            _logTextBox.ForeColor = Color.FromArgb(220, 220, 220)
-            _logTextBox.WordWrap = False
-            _logTextBox.MaxLength = Integer.MaxValue
-
-            Me.Controls.Add(_logTextBox)
-            Me.Controls.Add(_autoScrollCheckBox)
-        End Sub
-
-        Private Sub LoadRecentLogs()
-            Dim logStore = ManagerProgram.Services.GetService(Of ManagerRingBufferStore)()
-            If logStore Is Nothing Then Return
-
-            Dim lines = logStore.GetTail(_instanceId, 500)
-            If lines Is Nothing OrElse lines.Count = 0 Then Return
-
-            AppendLogLinesBatch(lines, 0, lines.Count)
-            _lastSeenTimestamp = lines(lines.Count - 1).Timestamp
-        End Sub
-
-        ''' <summary>
-        ''' Appends a log line to the display. Can be called from
-        ''' any thread — marshals to UI thread automatically.
-        ''' </summary>
-        Public Sub AppendLogLine(line As LogLine)
-            If Me.InvokeRequired Then
-                Me.BeginInvoke(Sub() AppendLogLine(line))
-                Return
-            End If
-
-            Dim timestamp = line.Timestamp.ToString("HH:mm:ss.fff")
-            Dim prefix = $"[{timestamp}] "
-            Dim lineColor = If(line.IsError, Color.FromArgb(255, 100, 100), Color.FromArgb(220, 220, 220))
-
-            _logTextBox.SelectionStart = _logTextBox.TextLength
-            _logTextBox.SelectionColor = Color.Gray
-            _logTextBox.AppendText(prefix)
-            _logTextBox.SelectionColor = lineColor
-            _logTextBox.AppendText(line.Text & vbCrLf)
-
-            If _autoScrollCheckBox.Checked Then
-                _logTextBox.SelectionStart = _logTextBox.TextLength
-                _logTextBox.ScrollToCaret()
-            End If
-        End Sub
-
-    End Class
-
-    ' ============================================================
     '  SchemaFormBuilder — builds a dynamic form from
     '  ConfigFieldDescriptor arrays returned by plugins
     ' ============================================================
@@ -2346,6 +3106,31 @@ Namespace GSM.Manager.UI
         ''' </summary>
         Public Shared Function Build(schema As IReadOnlyList(Of ConfigFieldDescriptor),
                                      currentValues As Dictionary(Of String, String)
+                                     ) As SchemaFormResult
+            ' Two-arg form preserved for the read-only Configuration
+            ' tabs on InstancePanel / InstallationPanel that don't
+            ' have a node connection to enumerate files. ManagedFilePicker
+            ' fields render as an empty-dropdown combo — still readable,
+            ' the value lives in the .Text just like a TextBox.
+            Return Build(schema, currentValues, fileListProvider:=Nothing)
+        End Function
+
+        ''' <summary>
+        ''' Three-arg form that lets callers supply a file-list
+        ''' provider for ManagedFilePicker fields. The provider is
+        ''' invoked once per ManagedFilePicker field at render time
+        ''' with the descriptor's ManagedDirectoryRef value as input;
+        ''' the returned filenames populate that combo's dropdown.
+        '''
+        ''' The provider call is fire-and-forget on a background
+        ''' thread (so a slow node doesn't block form construction)
+        ''' and re-marshals back to the UI thread to fill the combo.
+        ''' During the in-flight window the combo is fully usable
+        ''' for free-text entry; only the dropdown list arrives late.
+        ''' </summary>
+        Public Shared Function Build(schema As IReadOnlyList(Of ConfigFieldDescriptor),
+                                     currentValues As Dictionary(Of String, String),
+                                     fileListProvider As Func(Of String, Task(Of IReadOnlyList(Of String)))
                                      ) As SchemaFormResult
 
             Dim panel As New Panel()
@@ -2470,6 +3255,47 @@ Namespace GSM.Manager.UI
                         cmb.Location = New Point(10, yOffset)
                         inputControl = cmb
 
+                    Case ConfigFieldType.ManagedFilePicker
+                        ' DropDown (not DropDownList) so the user can
+                        ' still type a name that doesn't yet appear
+                        ' in the listing — covers manual SCP uploads,
+                        ' newly-uploaded files, and the case where
+                        ' the file list provider isn't available.
+                        ' AutoComplete makes the typing path actually
+                        ' useful: as the user types, the suggestions
+                        ' narrow to matching listed files.
+                        Dim cmb As New ComboBox()
+                        cmb.DropDownStyle = ComboBoxStyle.DropDown
+                        cmb.AutoCompleteMode = AutoCompleteMode.SuggestAppend
+                        cmb.AutoCompleteSource = AutoCompleteSource.ListItems
+                        cmb.Size = New Size(400, 24)
+                        cmb.Location = New Point(10, yOffset)
+                        cmb.Text = currentValue
+
+                        ' Lazy-populate. The provider call goes off
+                        ' the UI thread (HTTP round trip) and the
+                        ' results land back here via BeginInvoke.
+                        ' Capture the dirRef and currentValue locally
+                        ' so a later iteration of this loop doesn't
+                        ' overwrite them in the closure.
+                        '
+                        ' The actual await machinery lives in a named
+                        ' async helper rather than a lambda — VB.Net
+                        ' infers Task(Of Object) on Async Function()
+                        ' lambdas that don't return a value, which
+                        ' triggers "doesn't return value on all paths"
+                        ' warnings. The named function with explicit
+                        ' `As Task` return type sidesteps that.
+                        If fileListProvider IsNot Nothing AndAlso
+                           Not String.IsNullOrEmpty(field.ManagedDirectoryRef) Then
+                            Dim dirRef = field.ManagedDirectoryRef
+                            Dim valueAtRender = currentValue
+                            Dim targetCombo = cmb
+                            Dim _unused = PopulateManagedFilePickerAsync(
+                                targetCombo, fileListProvider, dirRef, valueAtRender)
+                        End If
+                        inputControl = cmb
+
                     Case Else
                         Dim txt As New TextBox()
                         txt.Text = currentValue
@@ -2509,6 +3335,52 @@ Namespace GSM.Manager.UI
                                       Return values
                                   End Function
             }
+        End Function
+
+        ''' <summary>
+        ''' Background helper: invokes the file-list provider on the
+        ''' calling thread (which the caller has arranged to be the
+        ''' UI thread during form construction — Await's first hop
+        ''' bounces it off automatically), then re-marshals via
+        ''' BeginInvoke to populate the combo's dropdown. Extracted
+        ''' from the field-rendering loop so the lambda's Task(Of
+        ''' Object) inference quirk doesn't bite — see comment at
+        ''' the call site for context.
+        '''
+        ''' Doesn't touch .Text — the combo's initial text was set
+        ''' from currentValue at construction time, and the user may
+        ''' have started typing during the in-flight window. Items
+        ''' start empty so we just append; no Items.Clear() to
+        ''' clobber state. valueAtRender is kept as a parameter for
+        ''' a future fallback if the .Text-preservation behaviour
+        ''' ever needs to change.
+        '''
+        ''' All exceptions are swallowed: the user is mid-edit on
+        ''' the form when this runs, and a popup over a half-built
+        ''' dialog would be jarring. The combo's free-text path
+        ''' remains usable on failure, which is functionally
+        ''' equivalent to the pre-ManagedFilePicker behaviour.
+        ''' </summary>
+        Private Shared Async Function PopulateManagedFilePickerAsync(
+                targetCombo As ComboBox,
+                provider As Func(Of String, Task(Of IReadOnlyList(Of String))),
+                dirRef As String,
+                valueAtRender As String) As Task
+            Try
+                Dim files = Await provider.Invoke(dirRef)
+                If files Is Nothing Then Return
+                If targetCombo.IsDisposed Then Return
+                targetCombo.BeginInvoke(
+                    Sub()
+                        If targetCombo.IsDisposed Then Return
+                        For Each fileName In files
+                            If Not String.IsNullOrEmpty(fileName) Then
+                                targetCombo.Items.Add(fileName)
+                            End If
+                        Next
+                    End Sub)
+            Catch
+            End Try
         End Function
 
     End Class

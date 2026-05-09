@@ -60,7 +60,7 @@ Namespace GSM.Manager.Core
             If isAnonymous Then
                 existing.EncryptedPassword = Array.Empty(Of Byte)()
             Else
-                existing.EncryptedPassword = EncryptString(password)
+                existing.EncryptedPassword = ProtectString(password)
             End If
 
             db.SaveChanges()
@@ -86,7 +86,7 @@ Namespace GSM.Manager.Core
             If Not entity.IsAnonymous AndAlso
                entity.EncryptedPassword IsNot Nothing AndAlso
                entity.EncryptedPassword.Length > 0 Then
-                cred.Password = DecryptString(entity.EncryptedPassword)
+                cred.Password = UnprotectString(entity.EncryptedPassword)
             End If
 
             Return cred
@@ -112,12 +112,24 @@ Namespace GSM.Manager.Core
 
         ' ============================================================
         '  DPAPI encryption helpers
+        '
+        '  Public so other components that need encrypted-at-rest
+        '  string storage (e.g. Discord bot tokens in
+        '  DiscordBotConfigEntity) can centralise the
+        '  ProtectedData.Protect/Unprotect calls here rather than
+        '  duplicating them. Same DataProtectionScope.CurrentUser
+        '  semantics — the encrypted bytes are only decryptable by
+        '  the Windows account that encrypted them, which is
+        '  consistent with how Steam credentials are handled.
         ' ============================================================
 
         ''' <summary>
         ''' Encrypts a string using DPAPI (CurrentUser scope).
+        ''' Returns Array.Empty(Of Byte)() for null/empty input so
+        ''' callers can store "no value" without a separate flag
+        ''' column.
         ''' </summary>
-        Private Shared Function EncryptString(plainText As String) As Byte()
+        Public Shared Function ProtectString(plainText As String) As Byte()
             If String.IsNullOrEmpty(plainText) Then Return Array.Empty(Of Byte)()
             Dim plainBytes = Encoding.UTF8.GetBytes(plainText)
             Return ProtectedData.Protect(plainBytes, Nothing,
@@ -125,9 +137,13 @@ Namespace GSM.Manager.Core
         End Function
 
         ''' <summary>
-        ''' Decrypts DPAPI-protected bytes back to a string.
+        ''' Decrypts DPAPI-protected bytes back to a string. Returns
+        ''' empty string when the input is null/empty so callers can
+        ''' treat "no value stored" the same as "empty value". Throws
+        ''' on a corrupted blob — caller decides whether to surface
+        ''' that as a UI error or silently ignore.
         ''' </summary>
-        Private Shared Function DecryptString(encryptedBytes As Byte()) As String
+        Public Shared Function UnprotectString(encryptedBytes As Byte()) As String
             If encryptedBytes Is Nothing OrElse encryptedBytes.Length = 0 Then Return ""
             Dim plainBytes = ProtectedData.Unprotect(encryptedBytes, Nothing,
                                                       DataProtectionScope.CurrentUser)

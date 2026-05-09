@@ -9,10 +9,10 @@ Imports Microsoft.VisualBasic
 
 Namespace Global.Migrations
     <DbContext(GetType(GsmDbContext))>
-    Partial Class GsmDbContextModelSnapshot
-        Inherits ModelSnapshot
-
-        Protected Overrides Sub BuildModel(modelBuilder As ModelBuilder)
+    <Migration("20260504164019_AddPanelLayoutAndGrouping")>
+    Partial Class AddPanelLayoutAndGrouping
+        ''' <inheritdoc />
+        Protected Overrides Sub BuildTargetModel(modelBuilder As ModelBuilder)
             modelBuilder.HasAnnotation("ProductVersion", "8.0.2")
 
             modelBuilder.Entity("GSM.Manager.Data.AppSettingEntity",
@@ -208,12 +208,6 @@ Namespace Global.Migrations
                         HasMaxLength(50).
                         HasColumnType("TEXT")
 
-                    b.Property(Of String)("PanelId").
-                        ValueGeneratedOnAdd().
-                        HasMaxLength(64).
-                        HasColumnType("TEXT").
-                        HasDefaultValue("")
-
                     b.Property(Of String)("RoleId").
                         HasMaxLength(50).
                         HasColumnType("TEXT")
@@ -232,7 +226,7 @@ Namespace Global.Migrations
                     b.Property(Of Date)("UpdatedUtc").
                         HasColumnType("TEXT")
 
-                    b.HasKey("GuildId", "PanelId", "RoleId")
+                    b.HasKey("GuildId", "RoleId")
 
                     b.ToTable("DiscordRoleMappings")
                 End Sub)

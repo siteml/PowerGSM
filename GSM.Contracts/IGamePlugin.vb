@@ -86,6 +86,19 @@ Namespace GSM.Plugin
         Password
         FilePath
         FolderPath
+        ''' <summary>
+        ''' Renders as a free-text combo box whose dropdown items are
+        ''' populated at edit time from the contents of one of the
+        ''' plugin's IManagedDirectoriesProvider entries (specified
+        ''' via ConfigFieldDescriptor.ManagedDirectoryRef). Edit-form
+        ''' implementations that don't supply a file-list provider
+        ''' show an empty dropdown but still accept free text — the
+        ''' field round-trips like Text in the absence of a provider,
+        ''' which keeps the read-only Configuration tab on InstancePanel
+        ''' working unchanged. Underlying storage is a plain string
+        ''' (the chosen filename), same wire shape as Text.
+        ''' </summary>
+        ManagedFilePicker
     End Enum
 
     ''' <summary>
@@ -95,6 +108,30 @@ Namespace GSM.Plugin
         SteamCmd
         DirectDownload
         Manual
+    End Enum
+
+    ''' <summary>
+    ''' OS platform of a GSM node, surfaced on /api/version and
+    ''' /api/status responses and propagated to plugins via
+    ''' InstanceConfig.Platform / InstallationConfig.Platform. Lets
+    ''' a plugin pick the right executable name, archive type, post-
+    ''' install steps, etc. without sniffing path-shape heuristics or
+    ''' assuming the node OS matches the manager's.
+    '''
+    ''' Wire format is the string name ("Windows", "Linux", "Unknown")
+    ''' via the JsonStringEnumConverter attribute, so adding new
+    ''' platforms in the future doesn't depend on integer ordering.
+    ''' Unknown is the natural default for old nodes that pre-date
+    ''' this contract field — the manager treats Unknown as "fall back
+    ''' to legacy best-effort behaviour" (e.g. emit dual-candidate
+    ''' executable paths so its candidate-probe loop can find the
+    ''' right one).
+    ''' </summary>
+    <JsonConverter(GetType(JsonStringEnumConverter))>
+    Public Enum NodePlatform
+        Unknown = 0
+        Windows = 1
+        Linux = 2
     End Enum
 
     ' ============================================================
@@ -114,6 +151,35 @@ Namespace GSM.Plugin
     Public MustInherit Class InstallStep
         Public Property StepName As String
         Public Property Description As String
+
+        ''' <summary>
+        ''' Relative weight this step contributes to the overall
+        ''' install progress bar. The runner converts step indices
+        ''' to bar percent using a weighted sum: bar = (sum of
+        ''' completed-step weights + current-step weight ×
+        ''' within-step pct) / total weight × 100. So a step with
+        ''' weight 10 occupies ten times as much of the bar as a
+        ''' weight-1 step.
+        '''
+        ''' Defaults are tuned for time-to-completion ratios: the
+        ''' download/SteamCMD steps that dominate install time get
+        ''' a 10× weight via their constructors, and the
+        ''' seconds-long copy/write/finalise steps stay at the
+        ''' base 1.0. The result is a bar that visually tracks
+        ''' real elapsed time rather than steps-completed — a
+        ''' multi-minute download fills most of the bar instead
+        ''' of competing for equal slices with a 5-second copy.
+        '''
+        ''' Plugins may override per construction site for cases
+        ''' the defaults don't fit (e.g. a tiny 2 MB ancillary
+        ''' download alongside the main game archive can be
+        ''' constructed with Weight = 1).
+        '''
+        ''' 0 or negative weights are treated as 1.0 by the runner
+        ''' so a plugin can't accidentally produce a divide-by-
+        ''' zero or a step that contributes nothing.
+        ''' </summary>
+        Public Property Weight As Double = 1.0
     End Class
 
     ''' <summary>
@@ -121,6 +187,14 @@ Namespace GSM.Plugin
     ''' </summary>
     Public Class SteamCmdStep
         Inherits InstallStep
+
+        ' Default Weight to 10× — SteamCMD download dominates
+        ' install time on every game we ship for, so the bar
+        ' should reflect that. Plugins can still set Weight
+        ' explicitly via the With initializer to override.
+        Public Sub New()
+            Weight = 10.0
+        End Sub
 
         Public Property AppId As Integer
         Public Property BetaBranch As String
@@ -132,13 +206,50 @@ Namespace GSM.Plugin
 
     ''' <summary>
     ''' Download a file from a URL.
+    '''
+    ''' Archive extraction notes:
+    '''
+    '''   - ExtractArchive=True triggers the node's archive
+    '''     extractor, which uses the file extension to dispatch
+    '''     (.zip via System.IO.Compression, .tar.xz / .txz via
+    '''     SharpCompress's XZStream + TarReader, everything else
+    '''     via SharpCompress.ArchiveFactory). Pax extended-header
+    '''     pseudo-entries are filtered out automatically — they
+    '''     used to leak onto disk as garbage "@PaxHeader" files
+    '''     in earlier versions.
+    '''
+    '''   - StripTopLevelDirectory=True asks the extractor to
+    '''     hoist contents up one level when the archive's entries
+    '''     all sit under a single top-level directory. Many
+    '''     release tarballs follow this convention (autotools-
+    '''     style "factorio_2.0.76.tar.xz" → everything under
+    '''     factorio/) and without stripping, the install ends up
+    '''     a level deeper than every other code path expects:
+    '''     plugin-relative paths like "bin/x64/factorio" wouldn't
+    '''     resolve, version-detection reads of
+    '''     "data/base/info.json" wouldn't find the file, and
+    '''     working-directory-relative launch args wouldn't match
+    '''     the binary's actual location. When the flag is set
+    '''     and the archive does NOT have a single top-level
+    '''     directory (multiple top-level entries), the extractor
+    '''     leaves the layout alone — the flag is a request, not
+    '''     a guarantee.
     ''' </summary>
     Public Class DownloadFileStep
         Inherits InstallStep
 
+        ' Default Weight to 10× — large game-archive downloads
+        ' (Factorio's ~600 MB tarball, etc.) dominate install
+        ' time. Plugins doing small ancillary downloads should
+        ' set Weight = 1 explicitly.
+        Public Sub New()
+            Weight = 10.0
+        End Sub
+
         Public Property Url As String
         Public Property DestinationRelativePath As String
         Public Property ExtractArchive As Boolean = False
+        Public Property StripTopLevelDirectory As Boolean = False
     End Class
 
     ''' <summary>
@@ -216,6 +327,24 @@ Namespace GSM.Plugin
         ''' building their picture of what's in use.
         ''' </summary>
         Public Property IsPort As Boolean = False
+
+        ''' <summary>
+        ''' For FieldType=ManagedFilePicker: the RelativePath of the
+        ''' ManagedDirectory whose contents populate the dropdown.
+        ''' Must match one of the entries returned by the plugin's
+        ''' IManagedDirectoriesProvider.GetManagedDirectories — the
+        ''' edit form looks up by RelativePath equality (case
+        ''' insensitive). Ignored for any other FieldType.
+        '''
+        ''' Example: a Factorio SaveFile field sets this to "saves"
+        ''' so the dropdown lists every .zip in the install's saves/
+        ''' directory. The user can still type a name that doesn't
+        ''' exist in the dropdown — the combo is DropDown style, not
+        ''' DropDownList — because save files can be uploaded out-of-
+        ''' band (manual SCP, future ManagedFilesPanel upload before
+        ''' the form refreshes its dropdown, etc.).
+        ''' </summary>
+        Public Property ManagedDirectoryRef As String
     End Class
 
     ' ============================================================
@@ -284,6 +413,18 @@ Namespace GSM.Plugin
         Public Property MaxCrashCount As Integer = 5
         Public Property CrashWindowMinutes As Integer = 60
         Public Property CustomFields As Dictionary(Of String, String)
+
+        ''' <summary>
+        ''' OS platform of the node this instance lives on. The
+        ''' Manager populates this from the node's /api/version
+        ''' response before invoking plugin methods so plugins can
+        ''' return platform-specific paths (e.g. Windows vs Linux
+        ''' executable names) directly. NodePlatform.Unknown means
+        ''' the node is too old to surface the field — plugins should
+        ''' fall back to platform-agnostic best-effort behaviour
+        ''' (e.g. emit candidates for both platforms).
+        ''' </summary>
+        Public Property Platform As NodePlatform
     End Class
 
     ''' <summary>
@@ -298,6 +439,14 @@ Namespace GSM.Plugin
         Public Property InstallMethod As InstallMethod
         Public Property NodeId As String
         Public Property CustomFields As Dictionary(Of String, String)
+
+        ''' <summary>
+        ''' OS platform of the node this installation lives on. See
+        ''' InstanceConfig.Platform for full rationale; the same
+        ''' Manager-side resolution applies before GetInstallSteps /
+        ''' GetUpdateSteps invocations.
+        ''' </summary>
+        Public Property Platform As NodePlatform
     End Class
 
     ' ============================================================
@@ -863,6 +1012,47 @@ Namespace GSM.Plugin
         Function GetLatestVersionAsync(
             config As InstallationConfig,
             cancellation As CancellationToken) As Task(Of String)
+
+        ''' <summary>
+        ''' Read the currently-installed version off the node's
+        ''' filesystem in the same format GetLatestVersionAsync
+        ''' returns. Format consistency is critical: the Manager
+        ''' compares the two strings by inequality to detect
+        ''' "out of date", so a plugin that returns "2.0.76" from
+        ''' GetLatestVersionAsync MUST return a comparable string
+        ''' ("2.0.76", not "installed 2026-05-08") from this method.
+        '''
+        ''' Plugins typically read a version-bearing file inside the
+        ''' install directory — Factorio reads data/base/info.json,
+        ''' a Minecraft plugin would read version.json, etc. The
+        ''' INodeClient parameter exposes the node's file ops API
+        ''' (DownloadFileAsync) so the plugin can pull files without
+        ''' having direct filesystem access; allowedRoots /
+        ''' allowedExtensions on those calls scope the access to
+        ''' just what's needed.
+        '''
+        ''' Called by the Manager:
+        '''   - At install/update completion to stamp
+        '''     InstalledVersion with a value that compares cleanly
+        '''     against future GetLatestVersionAsync results.
+        '''   - On VersionCheckService poll cycles to opportunistically
+        '''     re-read — catches drift and upgrades legacy rows that
+        '''     pre-date this method.
+        '''
+        ''' Called only for non-SteamCmd installs. SteamCmd installs
+        ''' have their version tracked via the appmanifest ACF
+        ''' buildid and don't go through this code path even if the
+        ''' plugin implements IVersionAwarePlugin.
+        '''
+        ''' Should return Nothing on any failure (file missing,
+        ''' parse failure, network error talking to the node) so
+        ''' the caller falls back to a synthetic provenance stamp
+        ''' rather than recording a meaningless value.
+        ''' </summary>
+        Function GetInstalledVersionAsync(
+            config As InstallationConfig,
+            client As GSM.Node.Api.INodeClient,
+            cancellation As CancellationToken) As Task(Of String)
     End Interface
 
     ''' <summary>
@@ -1084,6 +1274,396 @@ Namespace GSM.Plugin
         ''' which the manager treats as "all defaults".
         ''' </summary>
         Function GetLaunchOptions(config As InstanceConfig) As LaunchOptions
+    End Interface
+
+    ' ============================================================
+    '  IManagedDirectoriesProvider — opt-in file management capability
+    '
+    '  Phase 4c-1: lets a plugin declare which subdirectories of an
+    '  installation are exposed for end-user file management (saves,
+    '  config dumps, mods, screenshots, etc.). Manager-side code
+    '  uses this list to populate the per-instance file management
+    '  UI; the node-side /api/instances/{id}/files/* endpoints
+    '  validate that incoming requests target one of these
+    '  whitelisted roots before touching disk.
+    '
+    '  Plugins that don't implement this interface have no managed
+    '  directories — the manager hides file-management UI for
+    '  instances of that game and rejects file ops requests before
+    '  ever calling the node. New plugins opt every directory in
+    '  explicitly; nothing is exposed by default.
+    '
+    '  Per-directory permission flags let a plugin distinguish
+    '  read-only diagnostic dirs (Read alone) from writable saves
+    '  (Read|Write|Delete). The node enforces the manager's
+    '  declared permissions request-by-request — it does not
+    '  cache them across calls.
+    '
+    '  Token "{InstanceId}" in RelativePath is reserved for future
+    '  multi-instance-per-installation games (see Phase 4c plan,
+    '  D2). The manager substitutes the live instance id before
+    '  sending the path to the node. Today's plugins return static
+    '  paths because MaxInstancesPerInstallation = 1 is the norm.
+    ' ============================================================
+
+    ''' <summary>
+    ''' Permission flags for ManagedDirectory entries. Combine
+    ''' with Or to grant multiple permissions on one directory.
+    ''' Read covers both listing the directory and downloading
+    ''' files from it; Write covers creating or overwriting
+    ''' files; Delete covers removing files. None effectively
+    ''' hides the directory — the manager skips it when building
+    ''' UI.
+    ''' </summary>
+    <Flags()>
+    Public Enum DirPermissions
+        None = 0
+        Read = 1
+        Write = 2
+        Delete = 4
+    End Enum
+
+    ''' <summary>
+    ''' One whitelisted directory under an installation root that
+    ''' end users can browse and manage via the file ops endpoints.
+    ''' Returned by IManagedDirectoriesProvider.GetManagedDirectories.
+    ''' </summary>
+    Public Class ManagedDirectory
+        ''' <summary>
+        ''' Path relative to the installation root. Forward or
+        ''' backward slashes accepted; the manager normalises to
+        ''' the node's native separator before sending. Examples:
+        ''' "saves", "config", "mods". The token "{InstanceId}"
+        ''' anywhere in the path is substituted by the manager
+        ''' for the live instance id at request time — reserved
+        ''' for future games that share an installation across
+        ''' multiple instances and need per-instance subdirs.
+        ''' </summary>
+        Public Property RelativePath As String
+
+        ''' <summary>
+        ''' Friendly label for UI tabs and headings. e.g.
+        ''' "Saves", "Server Config", "Installed Mods".
+        ''' </summary>
+        Public Property DisplayName As String
+
+        ''' <summary>
+        ''' Permissions granted on this directory. Defaults to
+        ''' Read so a plugin that returns a bare-minimum entry
+        ''' (RelativePath + DisplayName) gets a safe read-only
+        ''' view rather than accidentally writable storage.
+        ''' </summary>
+        Public Property Permissions As DirPermissions = DirPermissions.Read
+
+        ''' <summary>
+        ''' Optional file extension allowlist (each entry leading
+        ''' with "."). When non-empty, the node and manager reject
+        ''' any download/upload/delete on a file whose extension
+        ''' isn't in this list. Listings filter to matching
+        ''' extensions only. Leave Nothing/empty to allow any
+        ''' extension. Comparison is case-insensitive.
+        ''' </summary>
+        Public Property AllowedExtensions As List(Of String)
+    End Class
+
+    ''' <summary>
+    ''' Opt-in interface plugins implement to expose a set of
+    ''' directories under each instance's installation that can be
+    ''' managed (listed, downloaded, uploaded, deleted) through
+    ''' the Manager UI. Plugins that don't implement this
+    ''' interface have no managed directories — file management
+    ''' UI is suppressed for instances of that game.
+    ''' </summary>
+    Public Interface IManagedDirectoriesProvider
+        ''' <summary>
+        ''' Returns the list of directories the user can manage
+        ''' for an instance. Called every time the manager
+        ''' initiates a file op, so implementations should be
+        ''' cheap (no I/O, no blocking work). May return an empty
+        ''' list to temporarily hide all file management — the
+        ''' manager treats that the same as "no provider".
+        ''' </summary>
+        Function GetManagedDirectories(config As InstanceConfig) _
+            As IReadOnlyList(Of ManagedDirectory)
+    End Interface
+
+    ' ============================================================
+    '  IFileGenerationProvider — opt-in file-producing operations
+    '
+    '  Phase 4c-3 (generic). Lets a plugin expose schema-driven
+    '  one-off operations that produce a file under one of the
+    '  plugin's managed directories. The canonical case is map
+    '  generation (Factorio's `factorio.exe --create`), but the
+    '  contract knows nothing about maps, presets, or seeds — the
+    '  plugin owns the entire question of "what does the user need
+    '  to fill in" via a ConfigFieldDescriptor schema, and the
+    '  manager just renders the schema with SchemaFormBuilder.
+    '
+    '  The same shape works for any plugin-defined file-producing
+    '  operation: "generate map", "generate ARK INI from template",
+    '  "create blank world", "convert save format", etc. A future
+    '  plugin that wants "edit a 30-field server-settings.json then
+    '  run a regeneration step" returns a 30-field schema and a
+    '  builder that writes a WriteFileStep for the JSON.
+    '
+    '  The Manager UI offers a button (label plugin-defined,
+    '  default "Generate New...") on the ManagedFilesPanel whose
+    '  RelativePath equals the plugin's GetTargetDirectoryRef.
+    '  Clicking opens a sibling tab containing the rendered form;
+    '  on Generate the panel collects values, calls
+    '  BuildGenerationSteps, ships the resulting bundle to the
+    '  node via the existing /generate-map endpoint (named for
+    '  history; the node-side machinery is fully generic).
+    '
+    '  Plugins that don't implement this interface get no
+    '  Generate button on any ManagedFilesPanel.
+    ' ============================================================
+
+    ''' <summary>
+    ''' Bundle returned by IFileGenerationProvider.BuildGenerationSteps:
+    ''' the step list the node executes plus the relative path of
+    ''' the file the steps are expected to produce. The expected-
+    ''' output path lets the node verify the file actually appeared
+    ''' on disk after the steps complete (an engine that exits 0
+    ''' but produces no output is detected as a failure).
+    ''' </summary>
+    Public Class GenerationStepBundle
+        ''' <summary>
+        ''' Steps the node runs sequentially. Currently must be
+        ''' WriteFileStep or RunProcessStep instances — other
+        ''' types are rejected by the node before execution.
+        ''' </summary>
+        Public Property Steps As List(Of InstallStep)
+
+        ''' <summary>
+        ''' Relative path of the file the steps are expected to
+        ''' produce, e.g. "saves/my-world.zip". The node verifies
+        ''' this exists on disk after the steps run; absence is
+        ''' a failure even if every step exited 0. Leave Nothing
+        ''' or empty to skip output verification (some operations
+        ''' don't have a single canonical output file — though the
+        ''' "file generation" framing implies they usually do).
+        ''' </summary>
+        Public Property ExpectedOutputRelativePath As String
+
+        ''' <summary>
+        ''' Hard timeout for the whole step sequence in seconds.
+        ''' 0 falls back to the node's default (300s). Per-
+        ''' RunProcessStep TimeoutMs is honoured independently.
+        ''' </summary>
+        Public Property TimeoutSeconds As Integer = 0
+    End Class
+
+    ''' <summary>
+    ''' Opt-in interface plugins implement to expose a schema-
+    ''' driven file-producing operation in the Manager UI. The
+    ''' contract is deliberately game-agnostic: the plugin
+    ''' declares which managed directory the operation targets,
+    ''' supplies a schema describing what to ask the user, and
+    ''' converts the filled-in values into a step list. The
+    ''' Manager renders the schema with the same SchemaFormBuilder
+    ''' it uses for instance configuration — no game-specific
+    ''' UI code lives on the manager side.
+    ''' </summary>
+    Public Interface IFileGenerationProvider
+        ''' <summary>
+        ''' RelativePath of the ManagedDirectory this operation
+        ''' produces files under. The Manager shows the Generate
+        ''' button only on the matching ManagedFilesPanel —
+        ''' suppressed elsewhere even if the same plugin
+        ''' implements both this interface and
+        ''' IManagedDirectoriesProvider with multiple entries.
+        '''
+        ''' Must match one of the plugin's ManagedDirectory
+        ''' RelativePath values; the manager looks up by
+        ''' case-insensitive equality.
+        ''' </summary>
+        Function GetTargetDirectoryRef() As String
+
+        ''' <summary>
+        ''' Optional label for the button. Returning Nothing or
+        ''' empty falls back to "Generate New...". Use this to
+        ''' say "New Map...", "New World...", or "Create from
+        ''' Template..." as appropriate to the plugin's domain.
+        ''' </summary>
+        Function GetButtonLabel() As String
+
+        ''' <summary>
+        ''' Optional title for the generated tab and the form
+        ''' header inside it. Returning Nothing or empty falls
+        ''' back to "Generate File". Same domain-specific
+        ''' labelling as GetButtonLabel.
+        ''' </summary>
+        Function GetTabTitle() As String
+
+        ''' <summary>
+        ''' Schema for the form rendered in the generation tab.
+        ''' Plugins return whatever fields the user needs to fill
+        ''' in: a preset enum, a numeric seed, a save name, a
+        ''' batch of nested config values, etc. ManagedFilePicker
+        ''' fields work too if the operation needs to pick from
+        ''' an existing file.
+        '''
+        ''' Implementations should be cheap — invoked once when
+        ''' the tab opens. May vary returned schema by
+        ''' instanceConfig if the operation's field set is
+        ''' instance-dependent (rarely needed; most plugins
+        ''' return a static list).
+        ''' </summary>
+        Function GetGenerationSchema(instanceConfig As InstanceConfig) _
+            As IReadOnlyList(Of ConfigFieldDescriptor)
+
+        ''' <summary>
+        ''' Build the step bundle from the form values the user
+        ''' submitted. Keys in `values` match the schema's field
+        ''' Keys; values are the strings produced by the form's
+        ''' ValueExtractor (enum dropdowns produce the displayed
+        ''' string, integer fields the numeric value as string,
+        ''' booleans "true"/"false", etc.).
+        '''
+        ''' Plugin owns all interpretation — naming, validation,
+        ''' default-filling, derivation of the output filename.
+        ''' Throwing here is acceptable on bad input; the panel
+        ''' surfaces the exception message to the user. Returning
+        ''' a bundle with no steps causes the panel to bail with
+        ''' "plugin produced no steps" (treated the same as a
+        ''' silently-empty step list, the more common bug shape).
+        ''' </summary>
+        Function BuildGenerationSteps(values As Dictionary(Of String, String),
+                                       instanceConfig As InstanceConfig) _
+            As GenerationStepBundle
+    End Interface
+
+    ' ============================================================
+    '  IInstanceFileEditorProvider — opt-in structured file editing
+    '
+    '  Phase 4c-4. Lets a plugin expose a known config file as a
+    '  structured form rather than raw text. The canonical case is
+    '  Factorio's server-settings.json (server name, visibility,
+    '  auth, autosave intervals, etc.) but the contract works for
+    '  any single-file configuration whose fields the plugin can
+    '  describe via ConfigFieldDescriptor.
+    '
+    '  The Manager renders one tab per editor on the InstancePanel
+    '  (between Configuration and the managed-files tabs). The tab
+    '  hosts a SchemaFormBuilder-rendered form plus Save/Reload
+    '  buttons. Plugin owns:
+    '    - Which fields the form has (GetInstanceFileEditors → schema)
+    '    - How file text maps to form values (ReadFileToValues)
+    '    - How form values + existing file text become new file
+    '      text (WriteValuesToFile) — the existing text is passed
+    '      back so plugin can preserve unknown fields the user
+    '      added by hand outside the schema
+    '
+    '  File access: the Manager reads/writes via the existing
+    '  /api/instances/{id}/files endpoints, deriving allowedRoots
+    '  from the editor's RelativePath (parent dir, or the filename
+    '  itself for files at the install root). Plugins don't need
+    '  to declare the file as a managed directory.
+    '
+    '  Missing-file behaviour: if the file doesn't exist on the
+    '  node, the Manager calls ReadFileToValues with empty text;
+    '  the schema falls back to DefaultValue per field. On Save,
+    '  WriteValuesToFile is called with empty existingText and
+    '  must produce a valid full file (plugin builds from scratch).
+    ' ============================================================
+
+    ''' <summary>
+    ''' One file editor entry returned by
+    ''' IInstanceFileEditorProvider.GetInstanceFileEditors.
+    ''' Plain data DTO so the plugin/manager boundary stays on
+    ''' DTOs only — schema parsing/serialisation logic lives
+    ''' behind ReadFileToValues/WriteValuesToFile on the interface.
+    ''' </summary>
+    Public Class InstanceFileEditor
+        ''' <summary>
+        ''' Stable plugin-defined identifier passed back to
+        ''' Read/WriteValuesToFile so a plugin with multiple
+        ''' editors can dispatch on it. Single-editor plugins can
+        ''' use any constant value.
+        ''' </summary>
+        Public Property Key As String
+
+        ''' <summary>
+        ''' Tab title shown on InstancePanel. Should be a short
+        ''' user-facing label like "Server Settings" or
+        ''' "World Configuration".
+        ''' </summary>
+        Public Property TabTitle As String
+
+        ''' <summary>
+        ''' File path relative to the install root, e.g.
+        ''' "server-settings.json" or "config/world.json". Forward
+        ''' or backward slashes both accepted; Manager normalises
+        ''' before sending to the node. The token "{InstanceId}"
+        ''' is substituted by the Manager for future multi-instance-
+        ''' per-installation games.
+        ''' </summary>
+        Public Property RelativePath As String
+
+        ''' <summary>
+        ''' Schema rendered by SchemaFormBuilder. Same
+        ''' ConfigFieldDescriptor list shape used by Edit Instance
+        ''' and IFileGenerationProvider.GetGenerationSchema.
+        ''' </summary>
+        Public Property Schema As IReadOnlyList(Of ConfigFieldDescriptor)
+    End Class
+
+    ''' <summary>
+    ''' Opt-in interface plugins implement to surface a structured
+    ''' editor for a known config file. Plugins that don't
+    ''' implement this interface simply have no editor tabs;
+    ''' users edit those files (if any) by hand.
+    ''' </summary>
+    Public Interface IInstanceFileEditorProvider
+        ''' <summary>
+        ''' Returns the list of editors for this instance.
+        ''' Implementations should be cheap — invoked once when
+        ''' the InstancePanel builds its tabs. May vary the
+        ''' returned RelativePath by instanceConfig.CustomFields
+        ''' if the file location is configurable per instance
+        ''' (Factorio's ServerSettings field is the canonical
+        ''' example). Returning an empty list is equivalent to
+        ''' not implementing the interface.
+        ''' </summary>
+        Function GetInstanceFileEditors(config As InstanceConfig) _
+            As IReadOnlyList(Of InstanceFileEditor)
+
+        ''' <summary>
+        ''' Convert the on-disk file text into a flat values
+        ''' dictionary the schema form can render. Keys must
+        ''' match the schema's ConfigFieldDescriptor.Key values;
+        ''' missing entries fall back to the schema's DefaultValue.
+        '''
+        ''' fileText may be empty/null when the file doesn't exist
+        ''' yet — implementations should handle that by returning
+        ''' an empty (or partially-populated) dictionary rather
+        ''' than throwing. The schema's defaults take over for
+        ''' missing keys.
+        '''
+        ''' editorKey identifies which editor when the plugin
+        ''' returns multiple from GetInstanceFileEditors.
+        ''' </summary>
+        Function ReadFileToValues(editorKey As String,
+                                   fileText As String) As Dictionary(Of String, String)
+
+        ''' <summary>
+        ''' Build the new file text from the user's edited values.
+        ''' existingText is the verbatim file content that was last
+        ''' read — implementations should parse it, update only
+        ''' the schema-managed keys, and re-serialise. Unknown
+        ''' top-level fields the user added by hand outside the
+        ''' schema MUST round-trip unchanged.
+        '''
+        ''' existingText is empty/null when the file didn't exist
+        ''' yet; implementations build a fresh file in that case.
+        ''' Throwing here is acceptable on bad input; the panel
+        ''' surfaces the exception message to the user without
+        ''' uploading.
+        ''' </summary>
+        Function WriteValuesToFile(editorKey As String,
+                                    values As Dictionary(Of String, String),
+                                    existingText As String) As String
     End Interface
 
 End Namespace

@@ -136,6 +136,15 @@ Namespace GSM.Node
             ' working directory.
             resp.ServersDirectory = config.ServersDirectory
 
+            ' Tell the manager what OS we are so plugins can pick
+            ' platform-appropriate paths/binaries from the start
+            ' instead of relying on path-shape sniffing or candidate
+            ' probing. Mirrored on /api/version too — GetNodeStatus
+            ' is called by /api/status which is the path most
+            ' frequently polled by NodePanel, so populating it here
+            ' avoids forcing a second round trip.
+            resp.Platform = ResolveNodePlatform()
+
             ' Metrics — best-effort, platform-dependent
             Try
                 Dim proc = Process.GetCurrentProcess()
@@ -146,6 +155,23 @@ Namespace GSM.Node
             End Try
 
             Return resp
+        End Function
+
+        ''' <summary>
+        ''' Resolves the host OS to a NodePlatform value. Public
+        ''' Shared so the /api/version endpoint module (which
+        ''' doesn't have a ProcessManager instance) can call it
+        ''' alongside GetNodeStatus's use here — single source of
+        ''' truth for the mapping between OperatingSystem.Is* and
+        ''' the wire enum. Returns Unknown for any platform not
+        ''' explicitly listed (macOS, FreeBSD, etc.) so older
+        ''' versions of the manager that don't recognise newer
+        ''' values still parse without error.
+        ''' </summary>
+        Public Shared Function ResolveNodePlatform() As NodePlatform
+            If OperatingSystem.IsWindows() Then Return NodePlatform.Windows
+            If OperatingSystem.IsLinux() Then Return NodePlatform.Linux
+            Return NodePlatform.Unknown
         End Function
 
         ' ============================================================
@@ -296,6 +322,30 @@ Namespace GSM.Node
                             "Initiating graceful stop of {Id} (PID {Pid}, CaptureStdout={CapStd})",
                             request.InstanceId, managed.Pid, managed.CaptureStdout)
                         gracefulSignalSent = SendCtrlCToProcess(managed.Process)
+                    ElseIf OperatingSystem.IsLinux() Then
+                        ' Linux equivalent of CTRL_C_EVENT for UE4: SIGTERM.
+                        ' UE4 dedicated servers on Linux install a
+                        ' signal handler in LaunchUnix.cpp that maps
+                        ' SIGTERM/SIGINT to RequestEngineExit, which
+                        ' is the same graceful-shutdown entry point
+                        ' the Windows CTRL_C_EVENT handler routes to.
+                        ' Most Linux servers behave similarly:
+                        ' Factorio handles SIGTERM as save-and-quit,
+                        ' Source-engine servers do too.
+                        '
+                        ' Process.Kill() in .NET 8 sends SIGKILL on
+                        ' Linux, which is not what we want here —
+                        ' that's the force-kill fallback below. We
+                        ' shell out to /bin/kill instead so we get
+                        ' SIGTERM with no native interop required
+                        ' (libc.kill via P/Invoke is the obvious
+                        ' alternative, but pulling that in just for
+                        ' a graceful stop signal isn't worth it when
+                        ' /bin/kill is universally present).
+                        _logger.LogInformation(
+                            "Initiating graceful stop of {Id} (PID {Pid}) via SIGTERM",
+                            request.InstanceId, managed.Pid)
+                        gracefulSignalSent = SendSigTermToProcess(managed.Process)
                     End If
 
                     ' Fallback: close stdin — some servers (Factorio
@@ -936,6 +986,62 @@ Namespace GSM.Node
             End Try
         End Function
 
+        ''' <summary>
+        ''' Linux graceful-shutdown signal: SIGTERM via /bin/kill.
+        ''' Returns True iff the kill command itself succeeded — the
+        ''' caller still has to wait for the process to actually
+        ''' react and exit.
+        '''
+        ''' Why /bin/kill instead of Process.Kill: .NET 8's
+        ''' Process.Kill on Linux sends SIGKILL, which is the
+        ''' nuclear option, not the polite one. There's no
+        ''' Process.Signal API to send SIGTERM specifically. P/Invoke
+        ''' to libc.kill works but pulls in platform-specific
+        ''' marshalling for one signal we'd ever send. The /bin/kill
+        ''' command exists on every Linux system back to the dawn of
+        ''' time and ProcessStartInfo can drive it cleanly.
+        '''
+        ''' Targets the process directly, not the process group.
+        ''' UE4 dedicated servers run as a single process — internal
+        ''' threading, no forked children we'd need to reach by group
+        ''' signal. If a future Linux-only plugin spawns a wrapper
+        ''' shell that forks the actual binary, we may need to switch
+        ''' to `kill -- -&lt;pgid&gt;` (negative target = process group),
+        ''' but for current games SIGTERM-the-pid is the correct dose.
+        ''' </summary>
+        Private Function SendSigTermToProcess(proc As Process) As Boolean
+            Try
+                Dim psi As New ProcessStartInfo("kill", proc.Id.ToString())
+                psi.UseShellExecute = False
+                psi.CreateNoWindow = True
+                psi.RedirectStandardOutput = True
+                psi.RedirectStandardError = True
+                Using p = Process.Start(psi)
+                    If Not p.WaitForExit(5000) Then
+                        Try : p.Kill() : Catch : End Try
+                        _logger.LogWarning("kill command timed out for PID {Pid}", proc.Id)
+                        Return False
+                    End If
+                    If p.ExitCode <> 0 Then
+                        Dim stderr As String = ""
+                        Try
+                            stderr = p.StandardError.ReadToEnd().Trim()
+                        Catch
+                        End Try
+                        _logger.LogWarning(
+                            "kill exited {Code} for PID {Pid}: {Err}",
+                            p.ExitCode, proc.Id, stderr)
+                        Return False
+                    End If
+                    _logger.LogInformation("Sent SIGTERM to PID {Pid}", proc.Id)
+                    Return True
+                End Using
+            Catch ex As Exception
+                _logger.LogWarning(ex, "SIGTERM via /bin/kill failed for PID {Pid}", proc.Id)
+                Return False
+            End Try
+        End Function
+
         ' ============================================================
         '  Log file tailing
         ' ============================================================
@@ -1050,28 +1156,79 @@ Namespace GSM.Node
                 ' see clears this flag; everything before it is discarded
                 ' instead of emitted as a truncated "line".
                 Dim skipLeadingPartial As Boolean = False
+                ' SHA-256 hex of the file's first FingerprintBytes bytes,
+                ' used to detect file replacement across instance restarts.
+                ' Lazily computed on first open and after a truncation
+                ' reset; reused for every persistence write during the
+                ' same file's lifetime. Nothing while the file is shorter
+                ' than the fingerprint window — see TryComputeFingerprint.
+                Dim currentFingerprint As String = Nothing
 
                 While Not token.IsCancellationRequested
                     Try
                         Using fs As New FileStream(path, FileMode.Open, FileAccess.Read,
                                                     FileShare.ReadWrite Or FileShare.Delete)
-                            ' First open: decide start position from file size
+                            ' First open: try to resume from a saved cursor.
+                            ' Resume is allowed only when the current file's
+                            ' first-bytes fingerprint matches the saved one
+                            ' AND the file is at least as long as the saved
+                            ' position. This is what tells "Factorio re-opened
+                            ' the same file and appended" (resume; no replay)
+                            ' from "LO archived the old log and started a new
+                            ' one" (don't resume; the saved byte offset means
+                            ' nothing in unrelated content). When resume
+                            ' isn't safe, fall back to the existing first-open
+                            ' heuristic (read from 0 for small files, backfill
+                            ' last 512KB for large ones).
                             If position < 0 Then
-                                If fs.Length <= FirstOpenThresholdBytes Then
-                                    position = 0
+                                currentFingerprint = TryComputeFingerprint(fs)
+                                Dim saved = _database.GetTailerPosition(instanceId, path)
+                                Dim canResume = saved IsNot Nothing AndAlso
+                                                currentFingerprint IsNot Nothing AndAlso
+                                                String.Equals(saved.Fingerprint,
+                                                              currentFingerprint,
+                                                              StringComparison.Ordinal) AndAlso
+                                                fs.Length >= saved.BytePosition
+
+                                If canResume Then
+                                    position = saved.BytePosition
+                                    skipLeadingPartial = False
+                                    _logger.LogInformation(
+                                        "Resuming tailer for {Id} at byte {Pos} ({Path})",
+                                        instanceId, position, path)
                                 Else
-                                    position = Math.Max(0L, fs.Length - BackfillBytes)
-                                    skipLeadingPartial = position > 0
+                                    If fs.Length <= FirstOpenThresholdBytes Then
+                                        position = 0
+                                    Else
+                                        position = Math.Max(0L, fs.Length - BackfillBytes)
+                                        skipLeadingPartial = position > 0
+                                    End If
                                 End If
                             End If
 
-                            ' Handle truncation/rotation
+                            ' Handle truncation/rotation. Reset the cached
+                            ' fingerprint along with position — the hash we
+                            ' had belongs to the now-discarded content; the
+                            ' next save will recompute against whatever's
+                            ' there now.
                             If fs.Length < position Then
                                 position = 0
                                 skipLeadingPartial = False
+                                currentFingerprint = Nothing
                             End If
 
                             If fs.Length > position Then
+                                ' Compute the fingerprint now if we don't yet
+                                ' have one (file was below the window on first
+                                ' open, or we just reset on truncation). Has
+                                ' to happen BEFORE the StreamReader takes
+                                ' ownership of fs — StreamReader's End Using
+                                ' closes the underlying stream, so a post-read
+                                ' fingerprint call hit ObjectDisposedException.
+                                If currentFingerprint Is Nothing Then
+                                    currentFingerprint = TryComputeFingerprint(fs)
+                                End If
+
                                 fs.Seek(position, SeekOrigin.Begin)
                                 Dim endLength = fs.Length
                                 Using reader As New StreamReader(fs)
@@ -1095,6 +1252,21 @@ Namespace GSM.Node
                                     End While
                                 End Using
                                 position = endLength
+
+                                ' Persist the new cursor so the next instance
+                                ' (re)start can resume here instead of replaying
+                                ' history. Skipped silently when we still don't
+                                ' have a fingerprint — file is below the window;
+                                ' next iteration will retry once it grows.
+                                If currentFingerprint IsNot Nothing Then
+                                    Try
+                                        _database.SaveTailerPosition(
+                                            instanceId, path, position, currentFingerprint)
+                                    Catch ex As Exception
+                                        _logger.LogDebug(ex,
+                                            "Failed to save tailer position for {Path}", path)
+                                    End Try
+                                End If
                             End If
                         End Using
                     Catch ioEx As IOException
@@ -1121,6 +1293,48 @@ Namespace GSM.Node
             })
             _eventStore.ProcessLine(instanceId, ts, text)
         End Sub
+
+        ' ============================================================
+        '  Tailer fingerprint helper
+        '
+        '  Returns SHA-256 hex of the file's first FingerprintBytes
+        '  bytes, or Nothing if the file is shorter than that. Used
+        '  by the tailer to discriminate "same file extended with
+        '  more content" (resume from saved position) from "different
+        '  file at the same path" (start over).
+        '
+        '  Why bail on too-small files: if we hashed only the bytes
+        '  available, the fingerprint would change as the file grew
+        '  toward FingerprintBytes, defeating the comparison's purpose.
+        '  And re-reading a sub-256-byte file on restart costs nothing
+        '  worth optimising — the persistence is for the case where
+        '  Factorio's --console-log already has hours of [JOIN]/[CHAT]
+        '  history we don't want to re-process.
+        ' ============================================================
+
+        Private Const FingerprintBytes As Integer = 256
+
+        Private Shared Function TryComputeFingerprint(fs As FileStream) As String
+            If fs Is Nothing OrElse fs.Length < FingerprintBytes Then Return Nothing
+            Dim originalPos = fs.Position
+            Try
+                fs.Seek(0, SeekOrigin.Begin)
+                Dim buffer(FingerprintBytes - 1) As Byte
+                Dim totalRead As Integer = 0
+                While totalRead < FingerprintBytes
+                    Dim n = fs.Read(buffer, totalRead, FingerprintBytes - totalRead)
+                    If n <= 0 Then Exit While
+                    totalRead += n
+                End While
+                If totalRead < FingerprintBytes Then Return Nothing
+                Using sha = System.Security.Cryptography.SHA256.Create()
+                    Dim hash = sha.ComputeHash(buffer)
+                    Return Convert.ToHexString(hash)
+                End Using
+            Finally
+                fs.Seek(originalPos, SeekOrigin.Begin)
+            End Try
+        End Function
 
         ' ============================================================
         '  Crash handling

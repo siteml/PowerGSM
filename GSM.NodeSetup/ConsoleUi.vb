@@ -26,6 +26,12 @@ Public Module ConsoleUi
         _configPath = configPath
         DetectColorSupport()
 
+        ' On Linux, the sibling GSM.Node binary may have arrived without
+        ' +x (typical of files SCP'd from a Windows publish). Fix it up
+        ' once at startup; this is a no-op on Windows and on already-
+        ' executable binaries.
+        ServiceManager.EnsureNodeExecutable()
+
         PrintBanner()
 
         Dim cfg = NodeSetupConfig.LoadOrCreate(configPath)
@@ -78,9 +84,10 @@ Public Module ConsoleUi
         Console.WriteLine("  2) View current configuration")
         Console.WriteLine("  3) Edit configuration")
         Console.WriteLine("  4) Generate a new authentication token")
-        Console.WriteLine("  5) Install as system service")
-        Console.WriteLine("  6) Uninstall system service")
-        Console.WriteLine("  7) Show service status")
+        Console.WriteLine("  5) Set up service user (Linux: create user, chown directories)")
+        Console.WriteLine("  6) Install as system service")
+        Console.WriteLine("  7) Uninstall system service")
+        Console.WriteLine("  8) Show service status")
         Console.WriteLine("  Q) Quit")
         Console.WriteLine()
 
@@ -97,15 +104,17 @@ Public Module ConsoleUi
             Case "4"
                 RegenerateToken(cfg)
             Case "5"
-                InstallServiceFlow()
+                SetupServiceUserFlow()
             Case "6"
-                UninstallServiceFlow()
+                InstallServiceFlow()
             Case "7"
+                UninstallServiceFlow()
+            Case "8"
                 ShowServiceStatus()
             Case "q", "quit", "exit"
                 Return True
             Case Else
-                WriteLineColored("Unknown choice. Try 1-7 or Q.", ConsoleColor.Yellow)
+                WriteLineColored("Unknown choice. Try 1-8 or Q.", ConsoleColor.Yellow)
         End Select
 
         Return False
@@ -425,13 +434,9 @@ Public Module ConsoleUi
     Private Sub InstallSystemdInteractive()
         Console.WriteLine("Detected platform: Linux (systemd)")
         Console.WriteLine()
-        Console.WriteLine("This tool will write a systemd unit file to the current directory.")
-        Console.WriteLine("Installing it requires root, so the actual install commands are")
-        Console.WriteLine("printed at the end for you to run yourself.")
-        Console.WriteLine()
 
-        Dim defaultUser = Environment.UserName
-        Dim runAsUser = PromptWithDefault("Run service as user", defaultUser, Nothing)
+        Dim runAsUser = PromptAndPrepareServiceUser()
+        If runAsUser Is Nothing Then Return
 
         Dim unitPath As String
         Try
@@ -444,8 +449,266 @@ Public Module ConsoleUi
         Console.WriteLine()
         WriteLineColored("Unit file written: " & unitPath, ConsoleColor.Green)
         Console.WriteLine()
+
+        ' If we're already root we can do the entire install directly
+        ' rather than making the operator copy and paste three commands.
+        ' Otherwise, fall back to printing the instructions — we don't
+        ' want to assume sudo is configured for non-interactive use.
+        If ConfigHelpers.RunningElevated() Then
+            Dim go = PromptYesNo(
+                "Running as root. Install, enable, and (re)start the service now?",
+                defaultYes:=True)
+            If go Then
+                Console.WriteLine("Installing...")
+                Dim result = ServiceManager.InstallSystemdServiceAsRoot(unitPath)
+                PrintServiceResult(result)
+                If result.Success Then
+                    Console.WriteLine()
+                    Console.WriteLine("Status and logs:")
+                    Console.WriteLine("  systemctl status gsmnode")
+                    Console.WriteLine("  journalctl -u gsmnode -f")
+                End If
+                Return
+            End If
+            ' User declined the auto-install — print the instructions for
+            ' manual completion below.
+            Console.WriteLine()
+        Else
+            Console.WriteLine("Installing the unit requires root, so the install commands are")
+            Console.WriteLine("printed below for you to run yourself. (Re-run this tool with sudo")
+            Console.WriteLine("to have it perform the install automatically.)")
+            Console.WriteLine()
+        End If
+
         Console.WriteLine(ServiceManager.GetSystemdInstallInstructions(unitPath))
     End Sub
+
+    ''' <summary>
+    ''' Top-level menu option for setting up the service account
+    ''' WITHOUT installing systemd. Useful when the operator wants to
+    ''' run the node manually for testing (foreground over SSH, etc.)
+    ''' but still wants the dedicated user and the right ownership on
+    ''' the install / data / servers directories.
+    '''
+    ''' Reuses PromptAndPrepareServiceUser so the experience is
+    ''' identical to the one inside Install-as-service. After success,
+    ''' prints the exact `sudo -u` invocation so the operator can
+    ''' launch the node directly without touching systemd.
+    ''' </summary>
+    Private Sub SetupServiceUserFlow()
+        Console.WriteLine()
+        PrintHeader("Set Up Service User")
+        Console.WriteLine()
+
+        If ConfigHelpers.RunningOnWindows() Then
+            WriteLineColored("This option configures a Linux service account and isn't applicable on Windows.",
+                             ConsoleColor.Yellow)
+            Console.WriteLine("On Windows the service runs under the LocalSystem account by default;")
+            Console.WriteLine("use the Install-as-service option to register it.")
+            PressAnyKey()
+            Return
+        End If
+
+        Dim user = PromptAndPrepareServiceUser()
+        If user Is Nothing Then
+            PressAnyKey()
+            Return
+        End If
+
+        Console.WriteLine()
+        WriteLineColored("Service account ready.", ConsoleColor.Green)
+        Console.WriteLine()
+        Console.WriteLine("To run the node manually as this user (foreground, easy to Ctrl+C):")
+        Console.WriteLine()
+        WriteLineColored("  sudo -u " & user & " " & ServiceManager.GetNodeExecutablePath(),
+                         ConsoleColor.Cyan)
+        Console.WriteLine()
+        Console.WriteLine("To open a shell as the user (handy for poking around the install dir):")
+        Console.WriteLine()
+        WriteLineColored("  sudo -u " & user & " bash",
+                         ConsoleColor.Cyan)
+        Console.WriteLine()
+        Console.WriteLine("To run in the background and capture stdout/stderr to a file:")
+        Console.WriteLine()
+        WriteLineColored("  sudo -u " & user & " nohup " & ServiceManager.GetNodeExecutablePath() & " > /tmp/gsmnode.log 2>&1 &",
+                         ConsoleColor.Cyan)
+        Console.WriteLine()
+        Console.WriteLine("When you're ready for unattended operation, use option 6 (Install as")
+        Console.WriteLine("system service) to register the systemd unit with the same User= setting.")
+        PressAnyKey()
+    End Sub
+
+    ''' <summary>
+    ''' Prompts for the service-account username (defaulting to
+    ''' 'powergsm' under root, the current user otherwise), and — if
+    ''' running as root — ensures the account exists (offering useradd)
+    ''' and that the install / data / servers directories are owned by
+    ''' it (offering mkdir -p + chown -R).
+    '''
+    ''' Returns the chosen username on success, or Nothing if the
+    ''' operator declined a required step (e.g. "don't create the
+    ''' user"). Both the standalone Set-Up-Service-User flow and
+    ''' Install-as-service share this so the experience is identical
+    ''' across entry points.
+    '''
+    ''' Non-root callers skip the create/chown steps with a brief
+    ''' note — those operations require root to begin with, and the
+    ''' operator presumably already has whatever ownership they need
+    ''' since they're running unprivileged.
+    ''' </summary>
+    Private Function PromptAndPrepareServiceUser() As String
+        ' Service-account recommendation.
+        '
+        ' The node doesn't need root for any of its operations
+        ' (port 8765 is unprivileged, SteamCMD doesn't need it,
+        ' and game servers run as the same user as the parent
+        ' process). Several game servers — notably UE4-based ones
+        ' like Last Oasis, ARK, Squad — actively REFUSE to run as
+        ' root and will exit with a clear "Refusing to run with
+        ' root privileges" error. So the right default is a
+        ' dedicated 'powergsm' system user.
+        '
+        ' If the operator launched this tool unprivileged, they
+        ' presumably ARE the user the service should run as, so we
+        ' default to Environment.UserName in that case. Either way
+        ' the operator can override the default at the prompt.
+        Dim runningAsRoot = ConfigHelpers.RunningElevated()
+        Dim defaultUser As String
+        If runningAsRoot Then
+            defaultUser = "powergsm"
+            Console.WriteLine("Recommendation: do not run the node as root. Game servers like")
+            Console.WriteLine("Last Oasis (and other UE4 titles) refuse to start under root, and")
+            Console.WriteLine("the node itself doesn't need elevated privileges for any of its")
+            Console.WriteLine("work. A dedicated 'powergsm' system user is the suggested default.")
+            Console.WriteLine()
+        Else
+            defaultUser = Environment.UserName
+            Console.WriteLine("Not running as root — user creation and chown will be skipped. The")
+            Console.WriteLine("current user will be used as the service account. Re-run with sudo")
+            Console.WriteLine("if you want this tool to provision a separate account for you.")
+            Console.WriteLine()
+        End If
+
+        Dim runAsUser = PromptWithDefault("Run service as user", defaultUser, Nothing)
+
+        ' Without root we can't create users or chown anything; just
+        ' return the chosen name. The caller decides what to do with it.
+        If Not runningAsRoot Then
+            Return runAsUser
+        End If
+
+        ' Check the user exists; if not, offer to create.
+        If Not ServiceManager.CheckLinuxUserExists(runAsUser) Then
+            Console.WriteLine()
+            WriteLineColored($"User '{runAsUser}' does not exist on this system.",
+                             ConsoleColor.Yellow)
+            Dim createIt = PromptYesNo($"Create user '{runAsUser}' now?", defaultYes:=True)
+            If Not createIt Then
+                WriteLineColored("Aborting — the user must exist before proceeding.",
+                                 ConsoleColor.Yellow)
+                Return Nothing
+            End If
+            Dim createResult = ServiceManager.CreateLinuxSystemUser(runAsUser)
+            If Not createResult.Success Then
+                WriteLineColored("Failed to create user: " & createResult.Message,
+                                 ConsoleColor.Red)
+                If Not String.IsNullOrWhiteSpace(createResult.Output) Then
+                    Console.WriteLine(createResult.Output)
+                End If
+                Return Nothing
+            End If
+            WriteLineColored("  " & createResult.Message, ConsoleColor.Green)
+        Else
+            Console.WriteLine()
+            Console.WriteLine($"User '{runAsUser}' already exists. Skipping useradd.")
+        End If
+
+        ' Chown the directories the node will read and write so it
+        ' can do its job after dropping root. Three candidates:
+        '   - install dir (where GSM.Node lives, typically /opt/PowerGSM)
+        '   - DataDirectory (SteamCMD cache, gsm.db, etc.)
+        '   - ServersDirectory (game-server installs)
+        ' These often nest — a fresh install puts data and servers
+        ' under the install dir — so we dedupe descendant paths
+        ' before chowning to avoid redundant work.
+        Dim cfg = NodeSetupConfig.LoadOrCreate(_configPath)
+        Dim chownPaths As New List(Of String) From {
+            AppContext.BaseDirectory.TrimEnd("/"c, "\"c)
+        }
+        If Not String.IsNullOrWhiteSpace(cfg.Node.DataDirectory) Then
+            chownPaths.Add(cfg.Node.DataDirectory)
+        End If
+        If Not String.IsNullOrWhiteSpace(cfg.Node.ServersDirectory) Then
+            chownPaths.Add(cfg.Node.ServersDirectory)
+        End If
+        Dim deduped = DedupeAncestors(chownPaths)
+
+        Console.WriteLine()
+        Console.WriteLine($"The following paths will be created (if missing) and chowned to {runAsUser}:{runAsUser}:")
+        For Each p In deduped
+            Console.WriteLine("  " & p)
+        Next
+        Console.WriteLine()
+        Dim doChown = PromptYesNo("Apply ownership now?", defaultYes:=True)
+        If doChown Then
+            Dim allOk = True
+            For Each p In deduped
+                Dim r = ServiceManager.PrepareDirAndChown(p, runAsUser)
+                If r.Success Then
+                    WriteLineColored("  " & r.Message, ConsoleColor.Green)
+                Else
+                    WriteLineColored("  " & r.Message, ConsoleColor.Red)
+                    allOk = False
+                End If
+            Next
+            If Not allOk Then
+                Console.WriteLine()
+                WriteLineColored("Some chown operations failed; the service may not be able to read/write its directories.",
+                                 ConsoleColor.Yellow)
+                Dim cont = PromptYesNo("Continue anyway?", defaultYes:=False)
+                If Not cont Then Return Nothing
+            End If
+        End If
+
+        Return runAsUser
+    End Function
+
+    ''' <summary>
+    ''' Removes paths from the list that are descendants of another path
+    ''' in the same list — e.g. if the input contains /opt/PowerGSM and
+    ''' /opt/PowerGSM/servers, only /opt/PowerGSM is kept because chown -R
+    ''' on the parent already covers the child. Empty/null entries are
+    ''' dropped. Comparison uses Path.GetFullPath to canonicalize paths
+    ''' so /opt/PowerGSM/ and /opt/PowerGSM compare equal.
+    ''' </summary>
+    Private Function DedupeAncestors(paths As List(Of String)) As List(Of String)
+        Dim normalized As New List(Of String)
+        For Each raw In paths
+            If String.IsNullOrWhiteSpace(raw) Then Continue For
+            Dim full As String
+            Try
+                full = Path.GetFullPath(raw).TrimEnd(Path.DirectorySeparatorChar)
+            Catch
+                ' Path can't be canonicalized (e.g. invalid char); use as-is.
+                full = raw.Trim().TrimEnd("/"c, "\"c)
+            End Try
+            If Not normalized.Contains(full) Then normalized.Add(full)
+        Next
+
+        Dim result As New List(Of String)
+        For Each p In normalized
+            Dim isDescendant = False
+            For Each other In normalized
+                If p Is other Then Continue For
+                If p.StartsWith(other & "/") OrElse p.StartsWith(other & "\") Then
+                    isDescendant = True
+                    Exit For
+                End If
+            Next
+            If Not isDescendant Then result.Add(p)
+        Next
+        Return result
+    End Function
 
     Private Sub UninstallServiceFlow()
         Console.WriteLine()

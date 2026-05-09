@@ -83,6 +83,26 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="8.0.0" />
     <PackageReference Include="Microsoft.Win32.Registry" Version="5.0.0" />
+
+    <!--
+      Phase 5d — Discord bot integration. DSharpPlus 4.x is the
+      established stable line: single package, mature gateway/REST
+      surface, well-documented, .NET 8 supported. The 5.x line was
+      still mid-rollout when this dependency was added, with split
+      sub-packages still settling; we'll revisit when 5.x is the
+      obvious choice for new projects. Bumping within the 4.x line
+      is safe (semver-respecting); jumping to 5.x will be a planned
+      migration.
+    -->
+    <PackageReference Include="DSharpPlus" Version="4.5.0" />
+    <!--
+      Phase 5d-4 — slash command framework on top of DSharpPlus.
+      Same 4.5.0 floor as the core package so the two move together.
+      Version drift between DSharpPlus and DSharpPlus.SlashCommands
+      causes hard-to-diagnose runtime failures in the extension's
+      Ready-event hook.
+    -->
+    <PackageReference Include="DSharpPlus.SlashCommands" Version="4.5.0" />
   </ItemGroup>
 
 </Project>

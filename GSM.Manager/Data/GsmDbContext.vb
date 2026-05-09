@@ -379,6 +379,224 @@ Namespace GSM.Manager.Data
     End Class
 
     ' ============================================================
+    '  Discord bot integration — Phase 5d
+    '
+    '  Two tables back the bot plugin: a single-row config holding
+    '  the bot's encrypted token (DPAPI, same shape as Steam
+    '  credentials) and a panels table where each row describes
+    '  one persistent control-panel message in a Discord channel.
+    '
+    '  The bot identity is intentionally global to one PowerGSM
+    '  installation — a single Discord application/token reused
+    '  across every guild the operator invites the bot into.
+    '  Per-guild settings (channels, panels, role mappings, etc.)
+    '  travel on the panel rows themselves; their GuildId column
+    '  is the discriminator. This matches how Discord bot
+    '  applications actually work (one token, many guilds) and
+    '  avoids forcing the operator to register a separate bot per
+    '  guild.
+    '
+    '  ConfigId is fixed at "default" for v1. Keeping it a column
+    '  rather than hard-coding a key means a future "multiple bot
+    '  identities" feature (one token per environment, say) can
+    '  add rows without a schema change.
+    ' ============================================================
+
+    ''' <summary>
+    ''' Discord bot configuration — single-row per identity.
+    ''' Holds the encrypted bot token used to log in to Discord
+    ''' and the enabled flag controlling whether the bot connects
+    ''' on Manager startup.
+    ''' </summary>
+    Public Class DiscordBotConfigEntity
+        ''' <summary>
+        ''' Stable identifier for this bot identity. v1 uses the
+        ''' literal "default" — there's exactly one row. The
+        ''' column lets us add additional identities later
+        ''' without a schema change.
+        ''' </summary>
+        Public Property ConfigId As String
+
+        ''' <summary>
+        ''' Friendly name shown in the configuration UI ("PowerGSM
+        ''' Bot", etc.). Doesn't need to match the bot's Discord
+        ''' username — purely cosmetic for the operator.
+        ''' </summary>
+        Public Property DisplayName As String
+
+        ''' <summary>
+        ''' DPAPI-encrypted bot token. Encrypted via
+        ''' CredentialService.ProtectString; only decryptable on
+        ''' the same Windows account that wrote it. Empty (zero-
+        ''' length array) when no token is yet configured — the
+        ''' bot won't attempt to connect in that state.
+        ''' </summary>
+        Public Property EncryptedToken As Byte()
+
+        ''' <summary>
+        ''' Master on/off. When False, the bot won't connect even
+        ''' if a token is stored — useful for temporarily silencing
+        ''' the bot without losing its token. When True with no
+        ''' token, the plugin logs a warning at startup and stays
+        ''' disconnected.
+        ''' </summary>
+        Public Property Enabled As Boolean = True
+
+        Public Property CreatedUtc As DateTime
+        Public Property UpdatedUtc As DateTime
+    End Class
+
+    ''' <summary>
+    ''' One persistent control panel — a rich-embed message the
+    ''' bot maintains in a Discord channel showing instance state
+    ''' and offering a Manage button (the button stub ships in
+    ''' 5d-1; the management ephemeral flow ships in 5d-2).
+    '''
+    ''' MessageId is null until the bot has successfully posted
+    ''' the panel for the first time. On subsequent Manager
+    ''' restarts the bot edits the existing message in place —
+    ''' preserving message permalinks — rather than re-posting.
+    ''' If the message has been manually deleted from Discord
+    ''' (channel purge, operator removed it, etc.), the bot
+    ''' detects the 404 on edit and re-posts, refreshing
+    ''' MessageId here.
+    '''
+    ''' ScopeKind values (string for forward compat — not bound
+    ''' to RuleScope on purpose; rule scopes are evaluation
+    ''' targets, panel scopes are display filters):
+    '''   "AllInstances"  → ScopeTargetId is ignored
+    '''   "Game"          → ScopeTargetId is a GameId
+    '''   "Installation"  → ScopeTargetId is an InstallationId
+    '''   "InstanceSet"   → ScopeTargetId is an InstanceSetTag value
+    ''' </summary>
+    Public Class DiscordPanelEntity
+        Public Property PanelId As String
+        Public Property GuildId As String
+        Public Property ChannelId As String
+
+        ''' <summary>
+        ''' Message ID populated after the first successful post.
+        ''' Nullable so a freshly-saved panel reads as "needs
+        ''' posting" until the bot's next refresh cycle.
+        ''' </summary>
+        Public Property MessageId As String
+
+        Public Property DisplayName As String
+        Public Property ScopeKind As String
+        Public Property ScopeTargetId As String
+
+        ''' <summary>
+        ''' Per-panel polling interval (seconds) for time-relative
+        ''' fields like player count and "next restart" countdowns
+        ''' — things that drift without firing NotificationEmitter
+        ''' events. Default 60 keeps Discord rate limits comfortable
+        ''' across multiple panels while still feeling alive. Event-
+        ''' driven refreshes (instance start/stop/crash) trigger
+        ''' independently and are coalesced to at most one edit per
+        ''' panel per 5s by the plugin runtime.
+        ''' </summary>
+        Public Property RefreshIntervalSeconds As Integer = 60
+
+        ''' <summary>
+        ''' Per-row layout as a JSON-serialised list of element
+        ''' descriptors (Phase 5d-5 item 3). NULL means "use the
+        ''' hardcoded default layout" — byte-identical to the v1
+        ''' rendering, so existing rows that predate this column
+        ''' read correctly without backfill. Shape:
+        '''   { "elements": [ { "type": "StateEmoji" }, ... ] }
+        ''' Element classes are defined alongside the renderer in
+        ''' DiscordBotPlugin.vb; serialisation goes through
+        ''' PanelLayoutSerializer (a polymorphic JSON layer over
+        ''' the otherwise-flat element classes).
+        ''' </summary>
+        Public Property LayoutJson As String
+
+        ''' <summary>
+        ''' Whole-panel grouping discriminator (Phase 5d-5 item 3).
+        ''' Stored as a short string for the same reason as
+        ''' ScopeKind: avoids EF int-enum coupling and keeps
+        ''' migrations straightforward when new kinds are added.
+        ''' Values: "None", "ByNode", "ByGame", "ByNodeThenGame".
+        ''' Defaults to "None" so existing rows read as flat.
+        ''' Independent of LayoutJson: a flat panel can have a
+        ''' custom row layout, and a default-layout panel can be
+        ''' grouped — the two decisions are orthogonal.
+        ''' </summary>
+        Public Property GroupingKind As String = "None"
+
+        Public Property CreatedUtc As DateTime
+        Public Property UpdatedUtc As DateTime
+    End Class
+
+    ''' <summary>
+    ''' Per-guild role-to-permission mapping (Phase 5d-3). Drives
+    ''' the bot's command-permission resolution: when a user
+    ''' clicks an action button on a panel, the bot walks the
+    ''' user's role list, intersects with this table for the
+    ''' originating guild, and returns the highest permission tier
+    ''' found. Roles not in this table contribute nothing — the
+    ''' Everyone tier is the implicit default for unmapped roles,
+    ''' so this table only stores elevations.
+    '''
+    ''' Replaces the hardcoded "PowerGSM Operator" role name from
+    ''' 5d-2's TestOperatorRoleName Const, which couldn't express
+    ''' multi-tier permissions or differ between guilds. Multi-
+    ''' guild operators (one bot, several Discord servers) can
+    ''' now grant elevations on a per-guild basis without their
+    ''' role names colliding.
+    '''
+    ''' Composite PK on (GuildId, PanelId, RoleId): at most one
+    ''' mapping row per role per (guild, panel). Permission is
+    ''' stored as the integer value of GSM.Notification.CommandPermission
+    ''' so the natural ordering (Everyone=0, ServerOperator=1,
+    ''' Administrator=2) is usable directly for the "highest tier
+    ''' found" lookup without enum-name parsing per interaction.
+    ''' RoleName is a display snapshot — used by the configuration
+    ''' UI to render role names without a fresh Discord query;
+    ''' the actual permission match uses RoleId only, since role
+    ''' names can be changed in Discord without our knowledge.
+    '''
+    ''' PanelId scope discriminator (Phase 5d-5 item 4):
+    '''   • Empty string "" = guild-default mapping (the v1
+    '''     behaviour; applies to every panel in the guild that
+    '''     doesn't override).
+    '''   • Non-empty = panel-scoped override (matches DiscordPanelEntity.PanelId).
+    ''' Empty-string sentinel rather than NULL because SQLite's
+    ''' composite PK semantics treat NULL ≠ NULL, which would let
+    ''' multiple guild-default rows for the same role coexist —
+    ''' breaking the "at most one mapping per role per scope"
+    ''' invariant. Sentinel keeps SQLite enforcing uniqueness
+    ''' correctly at the cost of one If(value, "") in the
+    ''' resolver and load paths.
+    ''' </summary>
+    Public Class DiscordRoleMappingEntity
+        Public Property GuildId As String
+
+        ''' <summary>
+        ''' Empty string for the guild-default mapping; a panel ID
+        ''' for a panel-scoped override. See the class summary for
+        ''' the empty-string-sentinel rationale.
+        ''' </summary>
+        Public Property PanelId As String = ""
+
+        Public Property RoleId As String
+        Public Property RoleName As String
+
+        ''' <summary>
+        ''' CommandPermission as an Integer. 1 = ServerOperator,
+        ''' 2 = Administrator. Everyone (0) is never stored — it's
+        ''' the implicit default for unmapped roles, and the UI
+        ''' filters it out of the dropdown for the same reason.
+        ''' Stored as Integer rather than the enum's string name
+        ''' so the natural ordering survives without parsing.
+        ''' </summary>
+        Public Property Permission As Integer
+
+        Public Property CreatedUtc As DateTime
+        Public Property UpdatedUtc As DateTime
+    End Class
+
+    ' ============================================================
     '  Session history — Round B of cross-instance entity tracking
     '
     '  Three tables work together to answer questions like
@@ -536,6 +754,9 @@ Namespace GSM.Manager.Data
         Public Property RuleExecutions As DbSet(Of RuleExecutionEntity)
         Public Property VisibilityProfiles As DbSet(Of VisibilityProfileEntity)
         Public Property NotificationDestinations As DbSet(Of NotificationDestinationEntity)
+        Public Property DiscordBotConfigs As DbSet(Of DiscordBotConfigEntity)
+        Public Property DiscordPanels As DbSet(Of DiscordPanelEntity)
+        Public Property DiscordRoleMappings As DbSet(Of DiscordRoleMappingEntity)
         Public Property ChatMessages As DbSet(Of ChatMessageEntity)
         Public Property PlayerSessions As DbSet(Of PlayerSessionEntity)
         Public Property SessionHosts As DbSet(Of SessionHostEntity)
@@ -553,6 +774,9 @@ Namespace GSM.Manager.Data
             modelBuilder.ApplyConfiguration(New RuleExecutionEntityConfig())
             modelBuilder.ApplyConfiguration(New VisibilityProfileEntityConfig())
             modelBuilder.ApplyConfiguration(New NotificationDestinationEntityConfig())
+            modelBuilder.ApplyConfiguration(New DiscordBotConfigEntityConfig())
+            modelBuilder.ApplyConfiguration(New DiscordPanelEntityConfig())
+            modelBuilder.ApplyConfiguration(New DiscordRoleMappingEntityConfig())
             modelBuilder.ApplyConfiguration(New ChatMessageEntityConfig())
             modelBuilder.ApplyConfiguration(New PlayerSessionEntityConfig())
             modelBuilder.ApplyConfiguration(New SessionHostEntityConfig())
@@ -700,6 +924,95 @@ Namespace GSM.Manager.Data
             builder.Property(Function(e) e.DisplayName).IsRequired().HasMaxLength(100)
             builder.Property(Function(e) e.TransportKind).IsRequired().HasMaxLength(40)
             builder.HasIndex(Function(e) e.Enabled)
+        End Sub
+    End Class
+
+    Public Class DiscordBotConfigEntityConfig
+        Implements IEntityTypeConfiguration(Of DiscordBotConfigEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of DiscordBotConfigEntity)) Implements IEntityTypeConfiguration(Of DiscordBotConfigEntity).Configure
+            builder.HasKey(Function(e) e.ConfigId)
+            ' ConfigId is a stable string ("default" today; future
+            ' multi-identity feature would add other values). 50
+            ' chars matches the discriminator-shape of similar
+            ' columns elsewhere in the schema.
+            builder.Property(Function(e) e.ConfigId).HasMaxLength(50)
+            builder.Property(Function(e) e.DisplayName).IsRequired().HasMaxLength(100)
+        End Sub
+    End Class
+
+    Public Class DiscordPanelEntityConfig
+        Implements IEntityTypeConfiguration(Of DiscordPanelEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of DiscordPanelEntity)) Implements IEntityTypeConfiguration(Of DiscordPanelEntity).Configure
+            builder.HasKey(Function(e) e.PanelId)
+            builder.Property(Function(e) e.PanelId).HasMaxLength(50)
+            ' Discord snowflake IDs are 64-bit integers serialised
+            ' as decimal strings — currently 18-19 digits, with
+            ' headroom to about 20. 50 chars is generous future-
+            ' proofing without bloating the row.
+            builder.Property(Function(e) e.GuildId).IsRequired().HasMaxLength(50)
+            builder.Property(Function(e) e.ChannelId).IsRequired().HasMaxLength(50)
+            builder.Property(Function(e) e.MessageId).HasMaxLength(50)
+            builder.Property(Function(e) e.DisplayName).IsRequired().HasMaxLength(100)
+            ' ScopeKind is one of "AllInstances", "Game",
+            ' "Installation", "InstanceSet" — short discriminator
+            ' string. 40 chars matches NotificationDestination's
+            ' TransportKind cap.
+            builder.Property(Function(e) e.ScopeKind).IsRequired().HasMaxLength(40)
+            ' ScopeTargetId carries either a GameId, InstallationId,
+            ' or an InstanceSetTag value depending on ScopeKind. The
+            ' largest of those (InstanceSetTag, free-form user
+            ' label) is capped at 100 elsewhere; the column here
+            ' tolerates a bit more in case of future scope kinds.
+            builder.Property(Function(e) e.ScopeTargetId).HasMaxLength(200)
+            ' GroupingKind is a short discriminator; same shape as
+            ' ScopeKind. "None" / "ByNode" / "ByGame" /
+            ' "ByNodeThenGame". 40 chars matches the convention.
+            builder.Property(Function(e) e.GroupingKind).IsRequired().HasMaxLength(40)
+            ' LayoutJson is intentionally uncapped TEXT — it's a
+            ' structured JSON document whose size grows with the
+            ' element catalogue. Nullable: NULL = use the default
+            ' layout in the renderer.
+            builder.Property(Function(e) e.LayoutJson)
+            ' Index on GuildId so the bot's "list panels in this
+            ' guild" lookup (used during interaction routing,
+            ' once 5d-2 ships) doesn't full-scan.
+            builder.HasIndex(Function(e) e.GuildId)
+        End Sub
+    End Class
+
+    Public Class DiscordRoleMappingEntityConfig
+        Implements IEntityTypeConfiguration(Of DiscordRoleMappingEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of DiscordRoleMappingEntity)) Implements IEntityTypeConfiguration(Of DiscordRoleMappingEntity).Configure
+            ' Composite primary key on (GuildId, PanelId, RoleId).
+            ' PanelId is empty string "" for guild-default rows
+            ' (Phase 5d-5 item 4 added it; rows that pre-existed
+            ' the migration default to ""). Discord snowflakes are
+            ' globally unique in practice, but the composite key
+            ' formalises the "at most one mapping per role per
+            ' (guild, scope)" invariant and gives EF a natural
+            ' upsert target without a surrogate ID column. EF Core
+            ' generates an index that prefixes on GuildId from
+            ' this PK definition, which makes the "list mappings
+            ' for this guild" lookup (the dominant access pattern —
+            ' both at startup-cache load time and when the
+            ' configuration UI switches guilds) index-covered
+            ' without an explicit secondary index.
+            builder.HasKey(Function(e) New With {e.GuildId, e.PanelId, e.RoleId})
+            builder.Property(Function(e) e.GuildId).IsRequired().HasMaxLength(50)
+            ' PanelId NOT NULL with empty-string default — see
+            ' DiscordRoleMappingEntity class summary for the
+            ' sentinel rationale. 64 chars matches the panel-ID
+            ' shape used elsewhere (8-char hex-ish strings today,
+            ' headroom for future formats).
+            builder.Property(Function(e) e.PanelId).IsRequired().HasMaxLength(64).HasDefaultValue("")
+            builder.Property(Function(e) e.RoleId).IsRequired().HasMaxLength(50)
+            ' RoleName is a display snapshot — the matching path
+            ' never reads it. 100 chars matches Discord's role
+            ' name length limit.
+            builder.Property(Function(e) e.RoleName).IsRequired().HasMaxLength(100)
         End Sub
     End Class
 

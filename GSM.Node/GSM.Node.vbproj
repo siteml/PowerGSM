@@ -45,11 +45,23 @@
     <None Update="nodesettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <!--
+      install-service.bat / uninstall-service.bat are Windows-only.
+      Skip them entirely when publishing for a non-Windows RID — they
+      pollute the Linux deployment otherwise. The conditional metadata
+      only fires at publish time; the regular Build still copies the
+      files to bin\ on Windows so dev workflows aren't affected.
+      (GSM.NodeSetup is the actual install path for both platforms
+      now; the .bat files are kept around for any operator who still
+      scripts against the old filenames.)
+    -->
     <None Update="install-service.bat">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory Condition="'$(RuntimeIdentifier)' != '' And !$(RuntimeIdentifier.StartsWith('win'))">Never</CopyToPublishDirectory>
     </None>
     <None Update="uninstall-service.bat">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory Condition="'$(RuntimeIdentifier)' != '' And !$(RuntimeIdentifier.StartsWith('win'))">Never</CopyToPublishDirectory>
     </None>
   </ItemGroup>
 
@@ -82,12 +94,19 @@
 
        The helper is hardcoded to win-x64 because:
          * It's Windows-only (P/Invokes kernel32 console APIs).
-         * We always want it present in the publish output, even
-           if the user is producing a non-Windows publish, since
-           there's no harm in shipping an unused Windows binary.
          * The runtime caller (ProcessManager.TrySendConsoleCtrlC)
            is gated behind OperatingSystem.IsWindows() so it only
            runs on Windows hosts anyway.
+
+       The Publish-side targets below are gated on the RID:
+       skipped when RuntimeIdentifier is set and doesn't start
+       with 'win', so a `dotnet publish -r linux-x64` produces a
+       clean Linux deployment without a stray Windows .exe.
+       Mirrors the same pattern used for install-service.bat /
+       uninstall-service.bat above. When RID is unset (legacy
+       framework-dependent publish, no platform commitment) the
+       helper is still included on the Windows-bias assumption —
+       parallel to the .bat files' behaviour.
 
        EnableWindowsTargeting=true is set on the inner MSBuild call
        (and on direct CLI builds via PowerGSM's CI workflow) so this
@@ -136,13 +155,15 @@
     see ~200 runtime DLLs sitting where the framework-dependent
     output is supposed to be.
   -->
-  <Target Name="PublishCtrlCSender" BeforeTargets="Publish">
+  <Target Name="PublishCtrlCSender" BeforeTargets="Publish"
+          Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
     <MSBuild Projects="..\GSM.CtrlCSender\GSM.CtrlCSender.vbproj"
              Targets="Publish"
              Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=true;PublishSingleFile=true;EnableWindowsTargeting=true;PublishDir=$(MSBuildThisFileDirectory)..\GSM.CtrlCSender\bin\$(Configuration)\win-x64\selfcontained\" />
   </Target>
 
-  <Target Name="CopyCtrlCSenderToPublish" AfterTargets="Publish">
+  <Target Name="CopyCtrlCSenderToPublish" AfterTargets="Publish"
+          Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
     <Copy SourceFiles="..\GSM.CtrlCSender\bin\$(Configuration)\win-x64\selfcontained\GSM.CtrlCSender.exe"
           DestinationFolder="$(PublishDir)"
           SkipUnchangedFiles="true" />

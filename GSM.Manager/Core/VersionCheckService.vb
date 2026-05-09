@@ -106,6 +106,7 @@ Namespace GSM.Manager.Core
         Private ReadOnly _pluginRegistry As PluginRegistry
         Private ReadOnly _installationManager As InstallationManager
         Private ReadOnly _automationEngine As AutomationEngine
+        Private ReadOnly _clientFactory As NodeHttpClientFactory
         Private ReadOnly _logger As ILogger(Of VersionCheckService)
 
         Private _cts As CancellationTokenSource
@@ -134,11 +135,13 @@ Namespace GSM.Manager.Core
                        pluginRegistry As PluginRegistry,
                        installationManager As InstallationManager,
                        automationEngine As AutomationEngine,
+                       clientFactory As NodeHttpClientFactory,
                        logger As ILogger(Of VersionCheckService))
             _serviceProvider = serviceProvider
             _pluginRegistry = pluginRegistry
             _installationManager = installationManager
             _automationEngine = automationEngine
+            _clientFactory = clientFactory
             _logger = logger
         End Sub
 
@@ -320,6 +323,49 @@ Namespace GSM.Manager.Core
                             installConfig.InstallMethod = ParseInstallMethodSafe(install.InstallMethod)
                             latestVersion = Await versionAware.GetLatestVersionAsync(
                                 installConfig, cancellation)
+
+                            ' Opportunistically refresh InstalledVersion
+                            ' from disk via the plugin's reader. Catches
+                            ' two situations the install-time stamp can't:
+                            '   - Legacy rows pre-dating IVersionAwarePlugin.
+                            '     GetInstalledVersionAsync still carry the
+                            '     synthetic "download (timestamp)" stamp
+                            '     and would never compare equal to a real
+                            '     upstream version like "2.0.76". The
+                            '     first poll after this code ships
+                            '     upgrades them in place.
+                            '   - Drift after manual file changes (someone
+                            '     ssh'd in and replaced the binaries
+                            '     out-of-band). The next poll picks up
+                            '     the new on-disk version automatically.
+                            ' All best-effort — a failure here doesn't
+                            ' bubble up; we still have a usable latestVersion
+                            ' for the mismatch decision below.
+                            Try
+                                Dim nodeEntity = db.Nodes.Find(install.NodeId)
+                                If nodeEntity IsNot Nothing Then
+                                    Dim nodeClient = _clientFactory.GetClient(
+                                        nodeEntity.NodeId, nodeEntity.HostAddress,
+                                        nodeEntity.Port, nodeEntity.AuthToken)
+                                    Dim freshInstalled = Await versionAware.GetInstalledVersionAsync(
+                                        installConfig, nodeClient, cancellation)
+                                    If Not String.IsNullOrEmpty(freshInstalled) AndAlso
+                                       Not String.Equals(freshInstalled,
+                                                          install.InstalledVersion,
+                                                          StringComparison.Ordinal) Then
+                                        _logger.LogInformation(
+                                            "VersionCheck: refreshed InstalledVersion for {Id} from {Old} to {New}",
+                                            installationId,
+                                            If(install.InstalledVersion, "(none)"),
+                                            freshInstalled)
+                                        install.InstalledVersion = freshInstalled
+                                    End If
+                                End If
+                            Catch ex As Exception
+                                _logger.LogDebug(ex,
+                                    "VersionCheck: InstalledVersion refresh failed for {Id} (continuing with existing stamp)",
+                                    installationId)
+                            End Try
                         Catch ex As Exception
                             _logger.LogWarning(ex,
                                 "VersionCheck: plugin path threw for {Id}", installationId)

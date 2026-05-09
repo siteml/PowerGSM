@@ -158,7 +158,28 @@ Namespace GSM.Node.Endpoints
                         If DateTime.TryParse(sinceStr, Nothing,
                                               Globalization.DateTimeStyles.RoundtripKind,
                                               parsed) Then
-                            sinceUtc = parsed.ToUniversalTime()
+                            ' Treat Unspecified as Utc rather than calling
+                            ' ToUniversalTime(). The parameter is named "since"
+                            ' against a column named timestamp_utc; an
+                            ' offset-less ISO string here means "this is the
+                            ' UTC value, the sender just didn't put a Z on it."
+                            ' ToUniversalTime() would interpret Unspecified as
+                            ' Local and shift by the node's offset — silently
+                            ' filtering out chats whose actual UTC times are
+                            ' between the cursor and (cursor + offset). The
+                            ' manager's SeedChatCursor was hitting this path
+                            ' after every manager restart because EF Core's
+                            ' SQLite provider drops DateTimeKind on read-back.
+                            ' Even with that fixed at the source, a stricter
+                            ' contract here is cheap defense in depth.
+                            Select Case parsed.Kind
+                                Case DateTimeKind.Utc
+                                    sinceUtc = parsed
+                                Case DateTimeKind.Local
+                                    sinceUtc = parsed.ToUniversalTime()
+                                Case Else
+                                    sinceUtc = DateTime.SpecifyKind(parsed, DateTimeKind.Utc)
+                            End Select
                         End If
                     End If
                     Return Results.Ok(eventStore.GetChatHistory(instanceId, sinceUtc, limit))

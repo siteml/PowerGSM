@@ -2,6 +2,7 @@ Imports System
 Imports System.Collections.Concurrent
 Imports System.Collections.Generic
 Imports System.IO
+Imports System.Net
 Imports System.Net.Http
 Imports System.Net.Http.Json
 Imports System.Threading
@@ -351,6 +352,241 @@ Namespace GSM.Manager.Core
             End Try
         End Function
 
+        ' ---- File operations (Phase 4c-1) ----
+
+        Public Async Function ListFilesAsync(instanceId As String,
+                                              installPath As String,
+                                              path As String,
+                                              allowedRoots As IReadOnlyList(Of String),
+                                              allowedExtensions As IReadOnlyList(Of String),
+                                              cancellation As CancellationToken) As Task(Of IReadOnlyList(Of FileEntry)) Implements INodeClient.ListFilesAsync
+            Try
+                Dim qs = BuildFilesQueryString(installPath, path, allowedRoots, allowedExtensions)
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/files?{qs}"
+                Dim result = Await _httpClient.GetFromJsonAsync(Of List(Of FileEntry))(url, cancellation)
+                Return If(result, New List(Of FileEntry)())
+            Catch ex As Exception
+                Throw WrapException("ListFiles", ex)
+            End Try
+        End Function
+
+        Public Async Function DownloadFileAsync(instanceId As String,
+                                                 installPath As String,
+                                                 path As String,
+                                                 allowedRoots As IReadOnlyList(Of String),
+                                                 allowedExtensions As IReadOnlyList(Of String),
+                                                 destination As Stream,
+                                                 cancellation As CancellationToken) As Task Implements INodeClient.DownloadFileAsync
+            Try
+                Dim qs = BuildFilesQueryString(installPath, path, allowedRoots, allowedExtensions)
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/files/download?{qs}"
+
+                ' ResponseHeadersRead returns once headers arrive; the
+                ' body stream that follows is bounded only by the
+                ' caller's cancellation token, NOT by the shared
+                ' HttpClient.Timeout. Important for big saves where
+                ' the whole transfer takes longer than the 30s default.
+                Using requestMsg As New HttpRequestMessage(HttpMethod.Get, url)
+                    Using response = Await _httpClient.SendAsync(requestMsg,
+                            HttpCompletionOption.ResponseHeadersRead, cancellation)
+                        response.EnsureSuccessStatusCode()
+                        Using stream = Await response.Content.ReadAsStreamAsync(cancellation)
+                            Await stream.CopyToAsync(destination, cancellation)
+                        End Using
+                    End Using
+                End Using
+            Catch ex As Exception
+                Throw WrapException("DownloadFile", ex)
+            End Try
+        End Function
+
+        Public Async Function UploadFileAsync(instanceId As String,
+                                               installPath As String,
+                                               path As String,
+                                               allowedRoots As IReadOnlyList(Of String),
+                                               allowedExtensions As IReadOnlyList(Of String),
+                                               source As Stream,
+                                               overwrite As Boolean,
+                                               cancellation As CancellationToken) As Task(Of FileEntry) Implements INodeClient.UploadFileAsync
+            ' The shared _httpClient has Timeout = 30s, which applies
+            ' to the WHOLE send operation including the request body.
+            ' A 100MB save over a slow link would trip it. Use a
+            ' one-shot client with InfiniteTimeSpan so the body send
+            ' is bounded only by the caller's cancellation token.
+            ' The cost is one extra TCP/TLS handshake per upload —
+            ' negligible compared to file-transfer time at the sizes
+            ' that motivated this design.
+            Using uploadClient As New HttpClient()
+                uploadClient.BaseAddress = _httpClient.BaseAddress
+                uploadClient.Timeout = System.Threading.Timeout.InfiniteTimeSpan
+                Dim authHeader = _httpClient.DefaultRequestHeaders.Authorization
+                If authHeader IsNot Nothing Then
+                    uploadClient.DefaultRequestHeaders.Authorization = authHeader
+                End If
+
+                Try
+                    Dim qs = BuildFilesQueryString(installPath, path, allowedRoots, allowedExtensions)
+                    Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/files/upload?{qs}&overwrite={If(overwrite, "true", "false")}"
+
+                    Using content As New StreamContent(source)
+                        content.Headers.ContentType =
+                            New System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream")
+                        Using resp = Await uploadClient.PostAsync(url, content, cancellation)
+                            resp.EnsureSuccessStatusCode()
+                            Return Await resp.Content.ReadFromJsonAsync(Of FileEntry)(cancellationToken:=cancellation)
+                        End Using
+                    End Using
+                Catch ex As Exception
+                    Throw WrapException("UploadFile", ex)
+                End Try
+            End Using
+        End Function
+
+        Public Async Function DeleteFileAsync(instanceId As String,
+                                               installPath As String,
+                                               path As String,
+                                               allowedRoots As IReadOnlyList(Of String),
+                                               allowedExtensions As IReadOnlyList(Of String),
+                                               cancellation As CancellationToken) As Task(Of Boolean) Implements INodeClient.DeleteFileAsync
+            Try
+                Dim qs = BuildFilesQueryString(installPath, path, allowedRoots, allowedExtensions)
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/files?{qs}"
+                Using resp = Await _httpClient.DeleteAsync(url, cancellation)
+                    resp.EnsureSuccessStatusCode()
+                    ' Endpoint returns { deleted: true } when it removed
+                    ' the file or { deleted: false, reason: ... } when
+                    ' the file was already gone. Surface the boolean
+                    ' for the caller; reason is informational only.
+                    Dim body = Await resp.Content.ReadFromJsonAsync(Of DeleteFileResult)(cancellationToken:=cancellation)
+                    Return body IsNot Nothing AndAlso body.deleted
+                End Using
+            Catch ex As Exception
+                Throw WrapException("DeleteFile", ex)
+            End Try
+        End Function
+
+        Public Async Function RenameFileAsync(instanceId As String,
+                                               installPath As String,
+                                               path As String,
+                                               newPath As String,
+                                               allowedRoots As IReadOnlyList(Of String),
+                                               allowedExtensions As IReadOnlyList(Of String),
+                                               overwrite As Boolean,
+                                               cancellation As CancellationToken) As Task(Of FileEntry) Implements INodeClient.RenameFileAsync
+            Try
+                ' Standard query-string fragment + the rename-specific
+                ' newPath / overwrite knobs. Server validates both
+                ' source and destination against allowedRoots and
+                ' allowedExtensions; the wrapper does no validation
+                ' of its own — same trust model as the other file ops.
+                Dim qs = BuildFilesQueryString(installPath, path, allowedRoots, allowedExtensions)
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/files/rename?{qs}" &
+                          $"&newPath={Uri.EscapeDataString(If(newPath, ""))}" &
+                          $"&overwrite={If(overwrite, "true", "false")}"
+
+                ' POST with empty body — all parameters travel in the
+                ' query string. Shared _httpClient is fine (no body to
+                ' bound the timeout against, unlike upload).
+                Using req As New HttpRequestMessage(HttpMethod.Post, url)
+                    Using resp = Await _httpClient.SendAsync(req, cancellation)
+                        resp.EnsureSuccessStatusCode()
+                        Return Await resp.Content.ReadFromJsonAsync(Of FileEntry)(cancellationToken:=cancellation)
+                    End Using
+                End Using
+            Catch ex As Exception
+                Throw WrapException("RenameFile", ex)
+            End Try
+        End Function
+
+        Public Async Function CopyFileAsync(instanceId As String,
+                                             installPath As String,
+                                             path As String,
+                                             newPath As String,
+                                             allowedRoots As IReadOnlyList(Of String),
+                                             allowedExtensions As IReadOnlyList(Of String),
+                                             overwrite As Boolean,
+                                             cancellation As CancellationToken) As Task(Of FileEntry) Implements INodeClient.CopyFileAsync
+            Try
+                ' Identical wire shape to rename: query-string
+                ' params, no body, returns FileEntry of the new file.
+                ' The shared _httpClient's 30s timeout is fine here
+                ' too — no body to upload, and even a 100MB local
+                ' File.Copy completes in well under a second on any
+                ' modern disk.
+                Dim qs = BuildFilesQueryString(installPath, path, allowedRoots, allowedExtensions)
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/files/copy?{qs}" &
+                          $"&newPath={Uri.EscapeDataString(If(newPath, ""))}" &
+                          $"&overwrite={If(overwrite, "true", "false")}"
+
+                Using req As New HttpRequestMessage(HttpMethod.Post, url)
+                    Using resp = Await _httpClient.SendAsync(req, cancellation)
+                        resp.EnsureSuccessStatusCode()
+                        Return Await resp.Content.ReadFromJsonAsync(Of FileEntry)(cancellationToken:=cancellation)
+                    End Using
+                End Using
+            Catch ex As Exception
+                Throw WrapException("CopyFile", ex)
+            End Try
+        End Function
+
+        Public Async Function GenerateMapAsync(instanceId As String,
+                                                 request As GenerateMapRequest,
+                                                 cancellation As CancellationToken) As Task(Of GenerateMapResponse) Implements INodeClient.GenerateMapAsync
+            ' Map gen can run for minutes on large worlds. The
+            ' shared _httpClient.Timeout is 30s, which would chop
+            ' the call off long before Factorio finishes a Ribbon
+            ' World preset. Use the same one-shot pattern we use
+            ' for upload: a fresh HttpClient with InfiniteTimeSpan,
+            ' bounded only by the caller's CancellationToken.
+            Dim oneShot As HttpClient = Nothing
+            Try
+                oneShot = New HttpClient() With {
+                    .BaseAddress = _httpClient.BaseAddress,
+                    .Timeout = Timeout.InfiniteTimeSpan
+                }
+                If _httpClient.DefaultRequestHeaders.Authorization IsNot Nothing Then
+                    oneShot.DefaultRequestHeaders.Authorization =
+                        _httpClient.DefaultRequestHeaders.Authorization
+                End If
+
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/generate-map"
+                Using resp = Await oneShot.PostAsJsonAsync(url, request, cancellation)
+                    resp.EnsureSuccessStatusCode()
+                    Return Await resp.Content.ReadFromJsonAsync(Of GenerateMapResponse)(
+                        cancellationToken:=cancellation)
+                End Using
+            Catch ex As Exception
+                Throw WrapException("GenerateMap", ex)
+            Finally
+                oneShot?.Dispose()
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Build the query-string fragment shared by all four file
+        ''' operations. Each value is URL-encoded; the manager-supplied
+        ''' arrays are joined with the separators the node expects
+        ''' (";" for roots, "," for extensions). allowedExtensions is
+        ''' omitted entirely when empty so the node falls back to
+        ''' "any extension" rather than "empty allowlist".
+        ''' </summary>
+        Private Function BuildFilesQueryString(installPath As String,
+                                                path As String,
+                                                allowedRoots As IReadOnlyList(Of String),
+                                                allowedExtensions As IReadOnlyList(Of String)) As String
+            Dim parts As New List(Of String) From {
+                "installPath=" & Uri.EscapeDataString(If(installPath, "")),
+                "path=" & Uri.EscapeDataString(If(path, "")),
+                "allowedRoots=" & Uri.EscapeDataString(
+                    If(allowedRoots Is Nothing, "", String.Join(";"c, allowedRoots)))
+            }
+            If allowedExtensions IsNot Nothing AndAlso allowedExtensions.Count > 0 Then
+                parts.Add("allowedExtensions=" & Uri.EscapeDataString(
+                    String.Join(","c, allowedExtensions)))
+            End If
+            Return String.Join("&"c, parts)
+        End Function
+
         ' ---- Interactive prompts ----
 
         Public Async Function RespondToPromptAsync(response As PromptResponse,
@@ -378,7 +614,31 @@ Namespace GSM.Manager.Core
         ' ---- Helpers ----
 
         Private Function WrapException(operation As String, ex As Exception) As Exception
-            If TypeOf ex Is HttpRequestException Then
+            ' HttpRequestException covers TWO different failure
+            ' modes that callers want to disambiguate:
+            '   - Request never reached the server (DNS failure,
+            '     connection refused, network unreachable). The
+            '     exception's StatusCode is Nothing.
+            '   - Server returned a non-success HTTP status (404,
+            '     409, 500). EnsureSuccessStatusCode /
+            '     GetFromJsonAsync raise this one with StatusCode
+            '     populated.
+            '
+            ' UI-side handlers (InstanceFileEditorPanel's
+            ' "missing file is fine, render defaults" path,
+            ' UploadFile's overwrite=false 409 disambiguation,
+            ' etc.) need the latter category exposed as
+            ' NodeApiException carrying the status code. Treating
+            ' both as NodeConnectionException — as we did before —
+            ' makes 404 look like "the node is offline" and bypasses
+            ' those graceful-handling paths.
+            Dim httpEx = TryCast(ex, HttpRequestException)
+            If httpEx IsNot Nothing Then
+                If httpEx.StatusCode.HasValue Then
+                    Return New NodeApiException(
+                        $"API error during {operation}: HTTP {CInt(httpEx.StatusCode.Value)} ({httpEx.StatusCode.Value})",
+                        httpEx, httpEx.StatusCode)
+                End If
                 Return New NodeConnectionException(
                     $"Connection failed during {operation}: {ex.Message}", ex)
             End If
@@ -396,6 +656,20 @@ Namespace GSM.Manager.Core
         Public Property text As String
         Public Property isError As Boolean
         Public Property seq As Long
+    End Class
+
+    ''' <summary>
+    ''' Deserialization shape for the DELETE /files endpoint's
+    ''' response body. The endpoint always returns 200 — the
+    ''' boolean disambiguates "actually deleted" from "file was
+    ''' already gone" (idempotent path), and reason is a free-form
+    ''' message used only when deleted=False. Field names are
+    ''' lowercase to match the anonymous-object shape the node
+    ''' returns.
+    ''' </summary>
+    Friend Class DeleteFileResult
+        Public Property deleted As Boolean
+        Public Property reason As String
     End Class
 
     ' ============================================================
@@ -443,8 +717,22 @@ Namespace GSM.Manager.Core
     Public Class NodeApiException
         Inherits Exception
 
-        Public Sub New(message As String, Optional inner As Exception = Nothing)
+        ''' <summary>
+        ''' HTTP status code from the server response, when the
+        ''' exception originated from a non-success status (404,
+        ''' 409, 500, ...). Nothing when the exception came from a
+        ''' non-HTTP source (e.g. JSON deserialization failure on
+        ''' an otherwise-successful response). Lets callers branch
+        ''' precisely — e.g. InstanceFileEditorPanel's IsNotFound
+        ''' check, UploadFile's overwrite=false Conflict handling.
+        ''' </summary>
+        Public ReadOnly Property StatusCode As HttpStatusCode?
+
+        Public Sub New(message As String,
+                       Optional inner As Exception = Nothing,
+                       Optional statusCode As HttpStatusCode? = Nothing)
             MyBase.New(message, inner)
+            Me.StatusCode = statusCode
         End Sub
     End Class
 
@@ -458,5 +746,50 @@ Namespace GSM.Manager.Core
             MyBase.New(message, inner)
         End Sub
     End Class
+
+    ' ============================================================
+    '  NodePlatformResolver
+    '
+    '  Single-line wrapper over INodeClient.GetApiVersionAsync
+    '  whose only job is hiding the boilerplate of "call the
+    '  version endpoint, swallow failures, return Unknown when
+    '  anything goes wrong". Used by InstanceManager,
+    '  InstallationManager, and FileGenerationPanel before they
+    '  invoke plugin methods so plugins can pick platform-specific
+    '  paths (executable names, archive types, etc.) directly
+    '  from InstanceConfig.Platform / InstallationConfig.Platform.
+    '
+    '  Cache-friendly: NodeHttpClient already caches the
+    '  NodeVersionResponse in-memory after the first successful
+    '  /api/version call, so subsequent invocations of this
+    '  resolver against the same client are essentially free.
+    '  No additional cache layer is needed here.
+    '
+    '  Returns NodePlatform.Unknown on any failure mode — network
+    '  error, missing field on an old node, deserialization
+    '  trouble. Plugins are expected to treat Unknown as "fall
+    '  back to legacy best-effort behaviour" rather than aborting,
+    '  which keeps cross-version manager/node combinations working.
+    ' ============================================================
+
+    ''' <summary>
+    ''' Helper for callers that need the node's OS platform before
+    ''' invoking plugin methods. Wraps INodeClient.GetApiVersionAsync
+    ''' with try/catch so the call site doesn't have to repeat the
+    ''' boilerplate. See the comment block above for full rationale.
+    ''' </summary>
+    Public Module NodePlatformResolver
+        Public Async Function ResolveAsync(client As INodeClient,
+                                            cancellation As CancellationToken) As Task(Of NodePlatform)
+            If client Is Nothing Then Return NodePlatform.Unknown
+            Try
+                Dim ver = Await client.GetApiVersionAsync(False, cancellation)
+                If ver Is Nothing Then Return NodePlatform.Unknown
+                Return ver.Platform
+            Catch
+                Return NodePlatform.Unknown
+            End Try
+        End Function
+    End Module
 
 End Namespace

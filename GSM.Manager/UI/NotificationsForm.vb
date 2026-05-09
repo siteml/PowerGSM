@@ -33,7 +33,13 @@ Namespace GSM.Manager.UI
         Private _destList As ListView
         Private _detailsPanel As Panel
         Private _nameTextBox As TextBox
+        Private _transportCombo As ComboBox
         Private _webhookTextBox As TextBox
+        Private _webhookLabel As Label
+        Private _guildLabel As Label
+        Private _guildCombo As ComboBox
+        Private _channelLabel As Label
+        Private _channelCombo As ComboBox
         Private _enabledCheckBox As CheckBox
         Private _installCheckList As CheckedListBox
         Private _instanceSelectorsContainer As Panel
@@ -51,6 +57,12 @@ Namespace GSM.Manager.UI
         Private _destinations As New List(Of DestinationEdit)
         Private _selectedDestination As DestinationEdit
         Private _allInstallations As New List(Of InstallationEntity)
+        ' Live bot's known guilds + channels, populated in
+        ' LoadDataAsync if the bot is connected. Empty list is
+        ' valid — the form falls back to a placeholder "connect
+        ' the bot first" entry in that case (matches
+        ' DiscordPanelEditorForm's pattern).
+        Private _botGuilds As IReadOnlyList(Of GuildInfo) = New List(Of GuildInfo)
         Private _suppressEvents As Boolean = False
 
         Public Sub New()
@@ -78,7 +90,8 @@ Namespace GSM.Manager.UI
                 .MultiSelect = False,
                 .CheckBoxes = False
             }
-            _destList.Columns.Add("Destination", 240)
+            _destList.Columns.Add("Destination", 200)
+            _destList.Columns.Add("Transport", 70)
             AddHandler _destList.SelectedIndexChanged, AddressOf OnDestinationSelected
 
             Dim leftButtonRow As New Panel() With {.Dock = DockStyle.Bottom, .Height = 40}
@@ -127,11 +140,72 @@ Namespace GSM.Manager.UI
             _detailsPanel.Controls.Add(_nameTextBox)
             y += 32
 
-            AddFieldLabel("Webhook URL:", y)
-            _webhookTextBox = New TextBox() With {.Location = New Point(150, y), .Size = New Size(440, 24)}
+            ' Transport selector — Webhook (HTTP POST) vs Bot
+            ' (DSharpPlus client send). Stored in DestinationEdit
+            ' as the canonical TransportKind string written to the
+            ' DB on save ("DiscordWebhook" or "DiscordBot").
+            AddFieldLabel("Transport:", y)
+            _transportCombo = New ComboBox() With {
+                .Location = New Point(150, y), .Size = New Size(220, 24),
+                .DropDownStyle = ComboBoxStyle.DropDownList
+            }
+            _transportCombo.Items.Add(New TransportItem("DiscordWebhook", "Discord Webhook"))
+            _transportCombo.Items.Add(New TransportItem("DiscordBot", "Discord Bot"))
+            AddHandler _transportCombo.SelectedIndexChanged, AddressOf OnTransportChanged
+            _detailsPanel.Controls.Add(_transportCombo)
+            y += 32
+
+            ' Reserve two rows for transport-specific config so the
+            ' subsequent content sits at a stable y regardless of
+            ' which transport is selected:
+            '   row 1: Webhook URL (when DiscordWebhook)
+            '          OR Guild dropdown (when DiscordBot)
+            '   row 2: empty (when DiscordWebhook)
+            '          OR Channel dropdown (when DiscordBot)
+            ' OnTransportChanged toggles visibility on the relevant
+            ' set; the hidden controls keep their layout slots so
+            ' the form doesn't reflow on transport change.
+            Dim transportRowY = y
+
+            ' Webhook URL field — same position as Guild combo;
+            ' visibility toggled by OnTransportChanged.
+            _webhookLabel = New Label() With {
+                .Text = "Webhook URL:", .AutoSize = True,
+                .Location = New Point(20, transportRowY + 4)
+            }
+            _detailsPanel.Controls.Add(_webhookLabel)
+            _webhookTextBox = New TextBox() With {.Location = New Point(150, transportRowY), .Size = New Size(440, 24)}
             AddHandler _webhookTextBox.TextChanged, AddressOf OnWebhookChanged
             _detailsPanel.Controls.Add(_webhookTextBox)
-            y += 32
+
+            ' Guild combo at the same y as Webhook URL.
+            _guildLabel = New Label() With {
+                .Text = "Guild:", .AutoSize = True,
+                .Location = New Point(20, transportRowY + 4)
+            }
+            _detailsPanel.Controls.Add(_guildLabel)
+            _guildCombo = New ComboBox() With {
+                .Location = New Point(150, transportRowY), .Size = New Size(440, 24),
+                .DropDownStyle = ComboBoxStyle.DropDownList
+            }
+            AddHandler _guildCombo.SelectedIndexChanged, AddressOf OnGuildChangedNotif
+            _detailsPanel.Controls.Add(_guildCombo)
+
+            ' Channel combo on the second reserved row.
+            _channelLabel = New Label() With {
+                .Text = "Channel:", .AutoSize = True,
+                .Location = New Point(20, transportRowY + 32 + 4)
+            }
+            _detailsPanel.Controls.Add(_channelLabel)
+            _channelCombo = New ComboBox() With {
+                .Location = New Point(150, transportRowY + 32), .Size = New Size(440, 24),
+                .DropDownStyle = ComboBoxStyle.DropDownList
+            }
+            AddHandler _channelCombo.SelectedIndexChanged, AddressOf OnChannelChangedNotif
+            _detailsPanel.Controls.Add(_channelCombo)
+
+            ' Skip past the two reserved rows.
+            y += 64
 
             _enabledCheckBox = New CheckBox() With {
                 .Text = "Enabled", .AutoSize = True,
@@ -276,6 +350,22 @@ Namespace GSM.Manager.UI
 
         Private Async Sub LoadDataAsync()
             Try
+                ' Pull live guild list from the bot plugin if it's
+                ' connected — used to populate the Guild dropdown
+                ' for DiscordBot-transport destinations. If the
+                ' plugin is missing or disconnected, fall back to
+                ' an empty list and the dropdown shows a "(connect
+                ' the bot first)" placeholder.
+                Try
+                    Dim botPlugin = ManagerProgram.Services.GetService(Of DiscordBotPlugin)()
+                    If botPlugin IsNot Nothing AndAlso botPlugin.IsConnected Then
+                        _botGuilds = botPlugin.GetGuildsAndChannels()
+                    End If
+                Catch
+                    ' Bot plugin DI failure is non-fatal here —
+                    ' webhook destinations still work.
+                End Try
+
                 Using scope = ManagerProgram.Services.CreateScope()
                     Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
 
@@ -287,11 +377,11 @@ Namespace GSM.Manager.UI
                         Include(Function(i) i.Instances).
                         ToListAsync()
 
-                    ' Load destinations into edit model
-                    Dim destEntities = Await db.NotificationDestinations.
-                        Where(Function(d) d.TransportKind = "DiscordWebhook").
-                        ToListAsync()
-
+                    ' Load destinations across BOTH transports.
+                    ' The form is the single config surface for
+                    ' all event-driven dispatch regardless of
+                    ' transport.
+                    Dim destEntities = Await db.NotificationDestinations.ToListAsync()
                     _destinations = destEntities.Select(AddressOf DestinationEdit.FromEntity).ToList()
 
                     ' Populate profile dropdown
@@ -368,12 +458,24 @@ Namespace GSM.Manager.UI
             _destList.Items.Clear()
             For Each d In _destinations
                 Dim item As New ListViewItem(d.DisplayName)
+                item.SubItems.Add(TransportLabelFor(d.TransportKind))
                 item.Tag = d
                 If Not d.Enabled Then item.ForeColor = Color.Gray
                 _destList.Items.Add(item)
             Next
             _suppressEvents = False
         End Sub
+
+        ''' <summary>
+        ''' Friendly transport label for the destination list and
+        ''' edit-model display. Matches the dropdown text in the
+        ''' details panel.
+        ''' </summary>
+        Private Shared Function TransportLabelFor(kind As String) As String
+            If String.Equals(kind, "DiscordBot", StringComparison.OrdinalIgnoreCase) Then Return "Bot"
+            ' Default — includes legacy unset / DiscordWebhook.
+            Return "Webhook"
+        End Function
 
         Private Sub OnDestinationSelected(sender As Object, e As EventArgs)
             If _suppressEvents Then Return
@@ -394,7 +496,27 @@ Namespace GSM.Manager.UI
                 End If
 
                 _nameTextBox.Text = If(_selectedDestination.DisplayName, "")
+
+                ' Transport — select the matching item, then swap
+                ' UI visibility for that transport. SelectedIndex
+                ' assignment doesn't fire when setting to the
+                ' current value, so call ApplyTransportVisibility
+                ' explicitly.
+                Dim transportIdx = 0
+                For i = 0 To _transportCombo.Items.Count - 1
+                    Dim t = TryCast(_transportCombo.Items(i), TransportItem)
+                    If t IsNot Nothing AndAlso String.Equals(t.Kind, _selectedDestination.TransportKind,
+                                                              StringComparison.OrdinalIgnoreCase) Then
+                        transportIdx = i
+                        Exit For
+                    End If
+                Next
+                _transportCombo.SelectedIndex = transportIdx
+                ApplyTransportVisibility()
+
                 _webhookTextBox.Text = If(_selectedDestination.WebhookUrl, "")
+                PopulateGuildAndChannelCombos(_selectedDestination.GuildId, _selectedDestination.ChannelId)
+
                 _enabledCheckBox.Checked = _selectedDestination.Enabled
 
                 ' Installations
@@ -435,6 +557,10 @@ Namespace GSM.Manager.UI
                 _selectedDestination = Nothing
                 _nameTextBox.Text = ""
                 _webhookTextBox.Text = ""
+                If _transportCombo.Items.Count > 0 Then _transportCombo.SelectedIndex = 0
+                ApplyTransportVisibility()
+                _guildCombo.Items.Clear()
+                _channelCombo.Items.Clear()
                 _enabledCheckBox.Checked = False
                 For i = 0 To _installCheckList.Items.Count - 1
                     _installCheckList.SetItemChecked(i, False)
@@ -447,6 +573,104 @@ Namespace GSM.Manager.UI
             Finally
                 _suppressEvents = False
             End Try
+        End Sub
+
+        ' ---- Transport, guild, channel UI swap ----
+
+        ''' <summary>
+        ''' Show/hide the transport-specific config controls based
+        ''' on the current _transportCombo selection. Idempotent
+        ''' — safe to call from both LoadDetailsFromSelection and
+        ''' the OnTransportChanged handler.
+        ''' </summary>
+        Private Sub ApplyTransportVisibility()
+            Dim isBot = IsBotTransportSelected()
+            _webhookLabel.Visible = Not isBot
+            _webhookTextBox.Visible = Not isBot
+            _guildLabel.Visible = isBot
+            _guildCombo.Visible = isBot
+            _channelLabel.Visible = isBot
+            _channelCombo.Visible = isBot
+        End Sub
+
+        Private Function IsBotTransportSelected() As Boolean
+            Dim t = TryCast(_transportCombo.SelectedItem, TransportItem)
+            Return t IsNot Nothing AndAlso
+                   String.Equals(t.Kind, "DiscordBot", StringComparison.OrdinalIgnoreCase)
+        End Function
+
+        ''' <summary>
+        ''' Populate the Guild dropdown from the cached _botGuilds
+        ''' list, then trigger the channel-list refresh and try to
+        ''' select the previously-saved guild + channel IDs. If
+        ''' the bot isn't connected (empty _botGuilds), shows a
+        ''' single "(connect the bot first)" placeholder.
+        ''' </summary>
+        Private Sub PopulateGuildAndChannelCombos(selectedGuildId As String,
+                                                    selectedChannelId As String)
+            _guildCombo.Items.Clear()
+            _channelCombo.Items.Clear()
+
+            If _botGuilds Is Nothing OrElse _botGuilds.Count = 0 Then
+                _guildCombo.Items.Add(New IdItemNotif("", "(connect the bot first)"))
+                _guildCombo.SelectedIndex = 0
+                _guildCombo.Enabled = False
+                _channelCombo.Items.Add(New IdItemNotif("", "(connect the bot first)"))
+                _channelCombo.SelectedIndex = 0
+                _channelCombo.Enabled = False
+                Return
+            End If
+
+            Dim selIdx = 0
+            For i = 0 To _botGuilds.Count - 1
+                Dim g = _botGuilds(i)
+                _guildCombo.Items.Add(New IdItemNotif(g.GuildId, g.Name))
+                If Not String.IsNullOrEmpty(selectedGuildId) AndAlso
+                   String.Equals(g.GuildId, selectedGuildId, StringComparison.Ordinal) Then
+                    selIdx = i
+                End If
+            Next
+            _guildCombo.Enabled = True
+            _guildCombo.SelectedIndex = selIdx
+            ' SelectedIndexChanged doesn't fire on assigning the
+            ' current value; force the channel-combo refresh.
+            RefreshChannelComboForSelectedGuild()
+
+            If Not String.IsNullOrEmpty(selectedChannelId) Then
+                For i = 0 To _channelCombo.Items.Count - 1
+                    Dim c = TryCast(_channelCombo.Items(i), IdItemNotif)
+                    If c IsNot Nothing AndAlso
+                       String.Equals(c.Id, selectedChannelId, StringComparison.Ordinal) Then
+                        _channelCombo.SelectedIndex = i
+                        Exit For
+                    End If
+                Next
+            End If
+        End Sub
+
+        Private Sub RefreshChannelComboForSelectedGuild()
+            _channelCombo.Items.Clear()
+            Dim sel = TryCast(_guildCombo.SelectedItem, IdItemNotif)
+            If sel Is Nothing OrElse String.IsNullOrEmpty(sel.Id) Then
+                _channelCombo.Items.Add(New IdItemNotif("", "(no guild selected)"))
+                _channelCombo.SelectedIndex = 0
+                _channelCombo.Enabled = False
+                Return
+            End If
+
+            Dim guild = _botGuilds.FirstOrDefault(Function(g) g.GuildId = sel.Id)
+            If guild Is Nothing OrElse guild.Channels Is Nothing OrElse guild.Channels.Count = 0 Then
+                _channelCombo.Items.Add(New IdItemNotif("", "(no postable channels)"))
+                _channelCombo.SelectedIndex = 0
+                _channelCombo.Enabled = False
+                Return
+            End If
+
+            For Each ch In guild.Channels
+                _channelCombo.Items.Add(New IdItemNotif(ch.ChannelId, "#" & ch.Name))
+            Next
+            _channelCombo.SelectedIndex = 0
+            _channelCombo.Enabled = True
         End Sub
 
         ' ---- Instance selectors: per-installation scrolling listbox ----
@@ -522,6 +746,86 @@ Namespace GSM.Manager.UI
             _selectedDestination.WebhookUrl = _webhookTextBox.Text
         End Sub
 
+        Private Sub OnTransportChanged(sender As Object, e As EventArgs)
+            ' Visibility swap is unconditional (UI in sync with the
+            ' selector), but mutating the edit model only happens
+            ' if a destination is actually selected and we're not
+            ' in the middle of LoadDetailsFromSelection.
+            ApplyTransportVisibility()
+            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
+            Dim t = TryCast(_transportCombo.SelectedItem, TransportItem)
+            If t IsNot Nothing Then
+                _selectedDestination.TransportKind = t.Kind
+                ' Update the list view's Transport column for this row.
+                For Each item As ListViewItem In _destList.Items
+                    If item.Tag Is _selectedDestination Then
+                        ' SubItems(0) is the row text itself; the
+                        ' Transport column is SubItems(1).
+                        If item.SubItems.Count >= 2 Then
+                            item.SubItems(1).Text = TransportLabelFor(t.Kind)
+                        End If
+                        Exit For
+                    End If
+                Next
+                ' If the user picks Bot but the bot isn't connected,
+                ' the Guild dropdown will show the placeholder; no
+                ' need for an additional warning here — Save will
+                ' surface the missing GuildId/ChannelId.
+                If IsBotTransportSelected() Then
+                    If _guildCombo.Items.Count = 0 Then
+                        PopulateGuildAndChannelCombos(_selectedDestination.GuildId,
+                                                      _selectedDestination.ChannelId)
+                    End If
+                    ' Sync the currently-displayed combo selections
+                    ' back to the edit model. Without this, a user
+                    ' who switches transport to Bot and accepts the
+                    ' default guild/channel — without re-clicking
+                    ' them — leaves the model with empty IDs (the
+                    ' SelectedIndex assignments inside
+                    ' PopulateGuildAndChannelCombos run under
+                    ' _suppressEvents, so the change handlers never
+                    ' fire). Save validation then rejects what the
+                    ' form visibly shows as a fully-populated
+                    ' destination. Treating the displayed defaults
+                    ' as implicit consent fixes that.
+                    Dim guildSel = TryCast(_guildCombo.SelectedItem, IdItemNotif)
+                    If guildSel IsNot Nothing Then
+                        _selectedDestination.GuildId = guildSel.Id
+                    End If
+                    Dim channelSel = TryCast(_channelCombo.SelectedItem, IdItemNotif)
+                    If channelSel IsNot Nothing Then
+                        _selectedDestination.ChannelId = channelSel.Id
+                    End If
+                End If
+            End If
+        End Sub
+
+        Private Sub OnGuildChangedNotif(sender As Object, e As EventArgs)
+            ' Channel list always rebuilds on guild change so the
+            ' user sees only postable channels in the new guild.
+            ' (Visible regardless of _suppressEvents — the user's
+            ' UI must stay consistent with their selection.)
+            RefreshChannelComboForSelectedGuild()
+            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
+            Dim sel = TryCast(_guildCombo.SelectedItem, IdItemNotif)
+            _selectedDestination.GuildId = If(sel IsNot Nothing, sel.Id, "")
+            ' Sync the channel selection that
+            ' RefreshChannelComboForSelectedGuild just defaulted to
+            ' (first item in the new guild). SelectedIndex = 0 inside
+            ' that helper silently picks the first channel without
+            ' firing OnChannelChangedNotif, so without this sync the
+            ' model would carry an empty ChannelId despite the form
+            ' visibly showing one. Same fix pattern as OnTransportChanged.
+            Dim channelSel = TryCast(_channelCombo.SelectedItem, IdItemNotif)
+            _selectedDestination.ChannelId = If(channelSel IsNot Nothing, channelSel.Id, "")
+        End Sub
+
+        Private Sub OnChannelChangedNotif(sender As Object, e As EventArgs)
+            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
+            Dim sel = TryCast(_channelCombo.SelectedItem, IdItemNotif)
+            _selectedDestination.ChannelId = If(sel IsNot Nothing, sel.Id, "")
+        End Sub
+
         Private Sub OnEnabledCheckBoxChanged(sender As Object, e As EventArgs)
             If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
             _selectedDestination.Enabled = _enabledCheckBox.Checked
@@ -579,7 +883,8 @@ Namespace GSM.Manager.UI
                 .DestinationId = Guid.NewGuid().ToString("N"),
                 .DisplayName = "New Destination",
                 .Enabled = True,
-                .VisibilityProfileId = "public"
+                .VisibilityProfileId = "public",
+                .TransportKind = "DiscordWebhook"
             }
             _destinations.Add(d)
             RefreshDestinationList()
@@ -608,24 +913,50 @@ Namespace GSM.Manager.UI
 
         Private Async Sub OnTestClicked(sender As Object, e As EventArgs)
             If _selectedDestination Is Nothing Then Return
-            If String.IsNullOrWhiteSpace(_selectedDestination.WebhookUrl) Then
-                MessageBox.Show("Enter a webhook URL first.", "Test",
-                                MessageBoxButtons.OK, MessageBoxIcon.Information)
-                Return
-            End If
+
             _testButton.Enabled = False
             _testButton.Text = "Sending..."
             Try
-                Dim plugin = ManagerProgram.Services.GetService(Of DiscordWebhookPlugin)()
-                If plugin Is Nothing Then
-                    MessageBox.Show("Discord plugin not registered.", "Test",
-                                    MessageBoxButtons.OK, MessageBoxIcon.Error)
-                    Return
+                Dim err As String = Nothing
+                If String.Equals(_selectedDestination.TransportKind, "DiscordBot",
+                                  StringComparison.OrdinalIgnoreCase) Then
+                    ' Bot transport — needs guild + channel.
+                    If String.IsNullOrWhiteSpace(_selectedDestination.GuildId) OrElse
+                       String.IsNullOrWhiteSpace(_selectedDestination.ChannelId) Then
+                        MessageBox.Show("Pick a guild and channel first.", "Test",
+                                        MessageBoxButtons.OK, MessageBoxIcon.Information)
+                        Return
+                    End If
+                    Dim botPlugin = ManagerProgram.Services.GetService(Of DiscordBotPlugin)()
+                    If botPlugin Is Nothing Then
+                        MessageBox.Show("Discord bot plugin not registered.", "Test",
+                                        MessageBoxButtons.OK, MessageBoxIcon.Error)
+                        Return
+                    End If
+                    err = Await botPlugin.SendDestinationTestAsync(
+                        _selectedDestination.GuildId,
+                        _selectedDestination.ChannelId,
+                        _selectedDestination.DisplayName,
+                        CancellationToken.None)
+                Else
+                    ' Webhook transport — needs URL.
+                    If String.IsNullOrWhiteSpace(_selectedDestination.WebhookUrl) Then
+                        MessageBox.Show("Enter a webhook URL first.", "Test",
+                                        MessageBoxButtons.OK, MessageBoxIcon.Information)
+                        Return
+                    End If
+                    Dim plugin = ManagerProgram.Services.GetService(Of DiscordWebhookPlugin)()
+                    If plugin Is Nothing Then
+                        MessageBox.Show("Discord webhook plugin not registered.", "Test",
+                                        MessageBoxButtons.OK, MessageBoxIcon.Error)
+                        Return
+                    End If
+                    err = Await plugin.SendTestAsync(
+                        _selectedDestination.WebhookUrl,
+                        _selectedDestination.DisplayName,
+                        CancellationToken.None)
                 End If
-                Dim err = Await plugin.SendTestAsync(
-                    _selectedDestination.WebhookUrl,
-                    _selectedDestination.DisplayName,
-                    CancellationToken.None)
+
                 If String.IsNullOrEmpty(err) Then
                     MessageBox.Show("Test message sent successfully.", "Test",
                                     MessageBoxButtons.OK, MessageBoxIcon.Information)
@@ -687,13 +1018,33 @@ Namespace GSM.Manager.UI
         ' ---- Save ----
 
         Private Async Sub OnSaveClicked(sender As Object, e As EventArgs)
+            ' Validation — every bot-transport destination needs a
+            ' resolvable guild + channel before save. Webhook URLs
+            ' are validated implicitly (the Test button surfaces
+            ' bad URLs; an empty URL just means "won't dispatch"
+            ' which is acceptable).
+            For Each d In _destinations
+                If String.Equals(d.TransportKind, "DiscordBot",
+                                  StringComparison.OrdinalIgnoreCase) Then
+                    If String.IsNullOrWhiteSpace(d.GuildId) OrElse
+                       String.IsNullOrWhiteSpace(d.ChannelId) Then
+                        MessageBox.Show(
+                            $"Bot destination '{d.DisplayName}' is missing a guild or channel.",
+                            "Save blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                        Return
+                    End If
+                End If
+            Next
+
             _saveButton.Enabled = False
             Try
                 Using scope = ManagerProgram.Services.CreateScope()
                     Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
 
+                    ' Load the FULL set of existing destination IDs
+                    ' (across both transports) so deletions sweep
+                    ' rows the user removed regardless of transport.
                     Dim existingIds = Await db.NotificationDestinations.
-                        Where(Function(d) d.TransportKind = "DiscordWebhook").
                         Select(Function(d) d.DestinationId).ToListAsync()
 
                     Dim editIds = _destinations.Select(Function(d) d.DestinationId).ToHashSet()
@@ -712,15 +1063,38 @@ Namespace GSM.Manager.UI
                         If ent Is Nothing Then
                             ent = New NotificationDestinationEntity() With {
                                 .DestinationId = d.DestinationId,
-                                .TransportKind = "DiscordWebhook",
                                 .CreatedUtc = DateTime.UtcNow
                             }
                             db.NotificationDestinations.Add(ent)
                         End If
                         ent.DisplayName = d.DisplayName
                         ent.Enabled = d.Enabled
-                        ent.TransportConfigJson = JsonSerializer.Serialize(
-                            New Dictionary(Of String, String) From {{"WebhookUrl", If(d.WebhookUrl, "")}})
+                        ' Persist the edited transport — may have
+                        ' changed since load (user toggled the
+                        ' Transport dropdown).
+                        ent.TransportKind = If(d.TransportKind, "DiscordWebhook")
+
+                        ' Build TransportConfigJson per transport.
+                        ' Webhook: {"WebhookUrl":"…"}
+                        ' Bot:     {"GuildId":"…","ChannelId":"…"}
+                        ' Other transport-irrelevant fields are
+                        ' dropped on transport switch — no point
+                        ' carrying a stale URL on a bot row, and
+                        ' the Cache loaders ignore unknown keys.
+                        If String.Equals(ent.TransportKind, "DiscordBot",
+                                          StringComparison.OrdinalIgnoreCase) Then
+                            ent.TransportConfigJson = JsonSerializer.Serialize(
+                                New Dictionary(Of String, String) From {
+                                    {"GuildId", If(d.GuildId, "")},
+                                    {"ChannelId", If(d.ChannelId, "")}
+                                })
+                        Else
+                            ent.TransportConfigJson = JsonSerializer.Serialize(
+                                New Dictionary(Of String, String) From {
+                                    {"WebhookUrl", If(d.WebhookUrl, "")}
+                                })
+                        End If
+
                         ent.EnabledEventTypesJson = JsonSerializer.Serialize(
                             d.EnabledEventTypes.Select(Function(x) x.ToString()).ToList())
                         ent.InstallationFilterJson = JsonSerializer.Serialize(d.InstallationFilter.ToList())
@@ -740,9 +1114,13 @@ Namespace GSM.Manager.UI
                     Await db.SaveChangesAsync()
                 End Using
 
-                ' Reload the live plugin cache.
-                Dim plugin = ManagerProgram.Services.GetService(Of DiscordWebhookPlugin)()
-                If plugin IsNot Nothing Then Await plugin.RefreshConfigAsync()
+                ' Reload BOTH plugin caches — destinations may have
+                ' been added/removed/transport-switched, and each
+                ' plugin only owns its own TransportKind subset.
+                Dim webhookPlugin = ManagerProgram.Services.GetService(Of DiscordWebhookPlugin)()
+                If webhookPlugin IsNot Nothing Then Await webhookPlugin.RefreshConfigAsync()
+                Dim botPlugin = ManagerProgram.Services.GetService(Of DiscordBotPlugin)()
+                If botPlugin IsNot Nothing Then Await botPlugin.RefreshDestinationsConfigAsync()
 
                 Me.DialogResult = DialogResult.OK
                 Me.Close()
@@ -760,7 +1138,18 @@ Namespace GSM.Manager.UI
             Public Property DestinationId As String
             Public Property DisplayName As String
             Public Property Enabled As Boolean
+            ''' <summary>
+            ''' Canonical TransportKind string — "DiscordWebhook" or
+            ''' "DiscordBot". Defaults to DiscordWebhook for new
+            ''' destinations and for legacy rows whose entity
+            ''' didn't carry the value.
+            ''' </summary>
+            Public Property TransportKind As String = "DiscordWebhook"
             Public Property WebhookUrl As String
+            ''' <summary>Bot transport: target Discord guild ID.</summary>
+            Public Property GuildId As String
+            ''' <summary>Bot transport: target Discord channel ID.</summary>
+            Public Property ChannelId As String
             Public Property VisibilityProfileId As String
             Public Property EnabledEventTypes As New HashSet(Of NotificationEventType)
             Public Property InstallationFilter As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
@@ -772,16 +1161,28 @@ Namespace GSM.Manager.UI
                     .DestinationId = e.DestinationId,
                     .DisplayName = e.DisplayName,
                     .Enabled = e.Enabled,
-                    .VisibilityProfileId = e.VisibilityProfileId
+                    .VisibilityProfileId = e.VisibilityProfileId,
+                    .TransportKind = If(String.IsNullOrEmpty(e.TransportKind), "DiscordWebhook", e.TransportKind)
                 }
-                ' Webhook URL
+                ' Parse TransportConfigJson per transport. Tolerant
+                ' of unexpected shapes — missing keys leave the
+                ' relevant field empty and let the form's
+                ' validation surface them on save.
                 If Not String.IsNullOrEmpty(e.TransportConfigJson) Then
                     Try
                         Dim d = JsonSerializer.Deserialize(Of Dictionary(Of String, String))(e.TransportConfigJson)
                         If d IsNot Nothing Then
-                            Dim w As String = Nothing
-                            d.TryGetValue("WebhookUrl", w)
-                            edit.WebhookUrl = w
+                            Dim webhook As String = Nothing
+                            d.TryGetValue("WebhookUrl", webhook)
+                            edit.WebhookUrl = webhook
+
+                            Dim guildId As String = Nothing
+                            d.TryGetValue("GuildId", guildId)
+                            edit.GuildId = guildId
+
+                            Dim channelId As String = Nothing
+                            d.TryGetValue("ChannelId", channelId)
+                            edit.ChannelId = channelId
                         End If
                     Catch
                     End Try
@@ -874,6 +1275,42 @@ Namespace GSM.Manager.UI
             End Sub
             Public Overrides Function ToString() As String
                 Return Label
+            End Function
+        End Class
+
+        ''' <summary>
+        ''' Combo item for the Transport selector. Carries the
+        ''' canonical TransportKind string ("DiscordWebhook" /
+        ''' "DiscordBot") plus the human-friendly display label.
+        ''' </summary>
+        Private Class TransportItem
+            Public ReadOnly Kind As String
+            Public ReadOnly Label As String
+            Public Sub New(kind As String, label As String)
+                Me.Kind = kind
+                Me.Label = label
+            End Sub
+            Public Overrides Function ToString() As String
+                Return Label
+            End Function
+        End Class
+
+        ''' <summary>
+        ''' Generic ID/Display combo item used by the Guild and
+        ''' Channel dropdowns. Suffixed "Notif" because there's
+        ''' an unrelated IdItem private class in
+        ''' DiscordPanelEditorForm; same shape, separate file
+        ''' for accessibility reasons.
+        ''' </summary>
+        Private Class IdItemNotif
+            Public ReadOnly Id As String
+            Public ReadOnly Display As String
+            Public Sub New(id As String, display As String)
+                Me.Id = id
+                Me.Display = display
+            End Sub
+            Public Overrides Function ToString() As String
+                Return Display
             End Function
         End Class
 

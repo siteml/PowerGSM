@@ -811,7 +811,16 @@ Namespace GSM.Manager.Core
         End Function
 
         Public Overrides Async Function UpdateInstallation(installationId As String) As Task(Of Boolean)
-            Return Await _installationManager.UpdateAsync(installationId)
+            ' IRuleContext.UpdateInstallation is Boolean-returning by
+            ' contract — plugin-authored automation actions only need
+            ' to know whether the operation succeeded so they can
+            ' branch on it. The richer InstallationOperationResult
+            ' (with ErrorMessage) is consumed by the WinForms UI; the
+            ' details are also already logged on the manager side
+            ' before the result returns, so collapsing back to
+            ' .Success here doesn't lose any debuggability.
+            Dim result = Await _installationManager.UpdateAsync(installationId)
+            Return result.Success
         End Function
 
         Public Overrides Async Function SendNotification(destinationId As String,

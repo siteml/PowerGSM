@@ -4,6 +4,7 @@ Imports System.Reflection
 Imports Microsoft.AspNetCore.Builder
 Imports Microsoft.AspNetCore.Http
 Imports Microsoft.Extensions.Logging
+Imports GSM.Plugin
 Imports GSM.Node.Api
 Imports GSM.Node
 Imports GSM.Node.Security
@@ -48,7 +49,8 @@ Namespace GSM.Node.Endpoints
                         .protocolVersion = NodeApiContract.ProtocolVersion,
                         .contractsVersion = NodeApiContract.ContractsVersion,
                         .runtime = System.Runtime.InteropServices.
-                            RuntimeInformation.FrameworkDescription
+                            RuntimeInformation.FrameworkDescription,
+                        .platform = ProcessManager.ResolveNodePlatform()
                     })
                 End Function)
 

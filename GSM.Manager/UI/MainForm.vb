@@ -11,6 +11,7 @@ Imports GSM.Manager
 Imports GSM.Manager.Core
 Imports GSM.Manager.Data
 Imports GSM.Plugin
+Imports GSM.Node.Api
 
 ' ============================================================
 '  MainForm — primary application window
@@ -51,6 +52,51 @@ Namespace GSM.Manager.UI
         Private _nodesRoot As TreeNode
         Private _automationRoot As TreeNode
         Private _settingsRoot As TreeNode
+
+        ' ---- Tree status icons ----
+        ' ImageList shared by every TreeNode that wants a status
+        ' badge. Index 0 is a transparent blank for the root nodes
+        ' and any tag we don't recognise; indexes 1–6 map to
+        ' the StatusIcon enum below. Bitmaps are built once at
+        ' form construction and reused for the lifetime of the
+        ' window.
+        '
+        ' _statusRefreshTimer ticks on the UI thread
+        ' (System.Windows.Forms.Timer), walks the tree, resolves
+        ' each entity-bearing TreeNode's current state from the
+        ' cached sources (InstanceManager._liveStates,
+        ' _nodeFailureStates, NodeHttpClient.TryGetCachedVersion,
+        ' Installation entity fields), and updates the
+        ' ImageIndex / SelectedImageIndex when it changes. Reads
+        ' are in-memory dict lookups plus a tiny SQLite query
+        ' for the installation version comparison — cheap enough
+        ' that the 2s cadence is comfortably bounded.
+        Private _statusImageList As ImageList
+        Private _statusRefreshTimer As Timer
+        Private Const StatusRefreshIntervalMs As Integer = 2000
+
+        ''' <summary>
+        ''' Semantic colour for a status badge. Per-kind shape
+        ''' (circle / folder / server) is decided separately by
+        ''' WalkAndApplyStatusIcons; the resolvers only return a
+        ''' colour. None=0 means "no badge at all" — used for tree
+        ''' nodes that don't carry a status (the three root nodes,
+        ''' and any unknown tag shape).
+        '''
+        ''' Order matters: numeric values double as the per-family
+        ''' offset within _statusImageList. Don't reorder without
+        ''' updating BuildStatusImageList's colour array, which
+        ''' must be laid out in the same sequence.
+        ''' </summary>
+        Private Enum StatusIcon
+            None = 0
+            Green = 1
+            Yellow = 2
+            Red = 3
+            Blue = 4
+            Gray = 5
+            DarkRed = 6
+        End Enum
 
         ' ---- Current panel ----
         Private _currentPanel As UserControl
@@ -98,10 +144,24 @@ Namespace GSM.Manager.UI
                 ' Non-fatal — splitter stays at whatever default width
                 ' it got; user can still drag to resize.
             End Try
+
+            ' Start the status-icon refresh ticker. UI-thread Timer
+            ' so the Tick handler can touch TreeNode properties
+            ' directly without InvokeRequired marshalling. Initial
+            ' paint runs synchronously here so the badges are
+            ' present from the moment the form becomes visible —
+            ' otherwise there's a 2s window where the tree shows
+            ' the transparent placeholder while waiting on the
+            ' first tick.
+            _statusRefreshTimer = New Timer()
+            _statusRefreshTimer.Interval = StatusRefreshIntervalMs
+            AddHandler _statusRefreshTimer.Tick, Sub(s, ev) RefreshStatusIcons()
+            _statusRefreshTimer.Start()
+            RefreshStatusIcons()
         End Sub
 
         Private Sub InitializeComponent()
-            Me.Text = "PowerGSM — Game Server Manager"
+            Me.Text = $"PowerGSM {GetVersionStatusText()} - Game Server Manager"
             Me.Size = New Size(1200, 800)
             Me.StartPosition = FormStartPosition.CenterScreen
             Me.MinimumSize = New Size(800, 600)
@@ -135,6 +195,8 @@ Namespace GSM.Manager.UI
                 Sub(s, e) OnAutomationRules())
             Dim notificationsItem As New ToolStripMenuItem("&Notifications...", Nothing,
                 Sub(s, e) OnNotificationsClicked(s, e))
+            Dim discordBotItem As New ToolStripMenuItem("&Discord Bot...", Nothing,
+                Sub(s, e) OnDiscordBotClicked(s, e))
             Dim settingsItem As New ToolStripMenuItem("S&ettings...", Nothing,
                 Sub(s, e) OnSettings())
             toolsMenu.DropDownItems.Add(historyItem)
@@ -149,6 +211,7 @@ Namespace GSM.Manager.UI
             toolsMenu.DropDownItems.Add(New ToolStripSeparator())
             toolsMenu.DropDownItems.Add(automationItem)
             toolsMenu.DropDownItems.Add(notificationsItem)
+            toolsMenu.DropDownItems.Add(discordBotItem)
             toolsMenu.DropDownItems.Add(settingsItem)
 
             _menuStrip.Items.AddRange(New ToolStripItem() {fileMenu, nodesMenu, toolsMenu})
@@ -210,6 +273,14 @@ Namespace GSM.Manager.UI
             _treeView.ShowRootLines = True
             _treeView.Font = New Font("Segoe UI", 9.5F)
             AddHandler _treeView.NodeMouseClick, AddressOf TreeView_NodeMouseClick
+
+            ' Status badges. ImageList must be assigned before any
+            ' TreeNode's ImageIndex is set; the badge values
+            ' themselves get filled in by RefreshStatusIcons after
+            ' the tree's been populated.
+            _statusImageList = BuildStatusImageList()
+            _treeView.ImageList = _statusImageList
+
             _splitContainer.Panel1.Controls.Add(_treeView)
 
             ' ---- Content panel ----
@@ -316,6 +387,20 @@ Namespace GSM.Manager.UI
                 End Using
             Catch
                 ' Closing should never block on a persistence failure.
+            End Try
+
+            ' Stop the status-icon refresh timer. Done in a
+            ' separate Try so a persistence failure above doesn't
+            ' skip the timer cleanup, and vice versa. Both
+            ' actions are best-effort — we're closing the form
+            ' regardless.
+            Try
+                If _statusRefreshTimer IsNot Nothing Then
+                    _statusRefreshTimer.Stop()
+                    _statusRefreshTimer.Dispose()
+                    _statusRefreshTimer = Nothing
+                End If
+            Catch
             End Try
         End Sub
 
@@ -430,6 +515,13 @@ Namespace GSM.Manager.UI
             Finally
                 _treeView.EndUpdate()
             End Try
+
+            ' Apply status icons immediately rather than waiting
+            ' for the next 2s timer tick — otherwise a tree rebuild
+            ' (e.g. after Add Node, Edit Installation) shows the
+            ' transparent placeholder for up to 2 seconds before
+            ' the badges fill in.
+            RefreshStatusIcons()
         End Sub
 
         ''' <summary>
@@ -640,11 +732,45 @@ Namespace GSM.Manager.UI
                 End If
             End If
 
+            ' Capture the new installation ID exposed by the form
+            ' on a successful save so we can hand off to the
+            ' install manager after the dialog closes.
+            Dim newInstallationId As String = Nothing
             Using dlg As New NewInstallationForm(preselectedNodeId)
                 If dlg.ShowDialog(Me) = DialogResult.OK Then
                     RefreshNodeTree()
+                    newInstallationId = dlg.NewInstallationId
                 End If
             End Using
+
+            ' Cancelled or no ID surfaced (defensive, shouldn't
+            ' happen on the OK path) — tree is already refreshed,
+            ' nothing else to do.
+            If String.IsNullOrEmpty(newInstallationId) Then Return
+
+            ' Hand off to the install manager. The InstallationPanel
+            ' is the canonical UI for in-flight installs now; the
+            ' wizard's job ends with persisting the entity.
+            '   1. Surface the InstallationPanel by selecting the
+            '      new installation in the tree. The panel
+            '      subscribes to InstallationManager events on
+            '      construction, so as soon as it's mounted it'll
+            '      observe the OperationStarted event we trigger
+            '      below.
+            '   2. Fire-and-forget InstallAsync with
+            '      userInitiated:=True so the panel auto-selects
+            '      its Progress tab. Errors surface via the
+            '      panel's OperationCompleted handler.
+            Dim installMgr = ManagerProgram.Services.GetService(Of InstallationManager)()
+            If installMgr Is Nothing Then
+                SetStatus("InstallationManager not registered — install was not started")
+                Return
+            End If
+
+            SelectInstallationInTree(newInstallationId)
+            SetStatus("Installing...")
+
+            Dim _unused = StartUserInitiatedInstallAsync(installMgr, newInstallationId)
         End Sub
 
         Private Sub OnReloadPlugins()
@@ -716,6 +842,19 @@ Namespace GSM.Manager.UI
 
         Private Sub OnNotificationsClicked(sender As Object, e As EventArgs)
             Using f As New NotificationsForm()
+                f.ShowDialog(Me)
+            End Using
+        End Sub
+
+        ''' <summary>
+        ''' Opens the Discord Bot configuration form (Phase 5d-1).
+        ''' Modal so saved changes can be reflected on the Manager's
+        ''' menus without worrying about stale state in another
+        ''' open instance — the bot plugin handles its own reload
+        ''' on save.
+        ''' </summary>
+        Private Sub OnDiscordBotClicked(sender As Object, e As EventArgs)
+            Using f As New DiscordBotForm()
                 f.ShowDialog(Me)
             End Using
         End Sub
@@ -807,8 +946,19 @@ Namespace GSM.Manager.UI
                     menu.Items.Add(New ToolStripSeparator())
                     menu.Items.Add("View Logs", Nothing,
                         Sub(s, ev)
-                            Dim logForm As New LogViewerForm(entityId)
-                            logForm.Show()
+                            ' By the time this fires the right-click
+                            ' has already navigated to this instance:
+                            ' TreeView_NodeMouseClick set
+                            ' SelectedNode = e.Node before showing
+                            ' the menu, which fired AfterSelect ->
+                            ' ShowPanel(InstancePanel). So
+                            ' _currentPanel is the InstancePanel for
+                            ' this instance — just activate the logs
+                            ' tab on it.
+                            Dim panel = TryCast(_currentPanel, InstancePanel)
+                            If panel IsNot Nothing Then
+                                panel.ActivateLogsTab()
+                            End If
                         End Sub)
                     menu.Items.Add("Edit Instance", Nothing,
                         Sub(s, ev) OnEditInstance(entityId))
@@ -980,19 +1130,102 @@ Namespace GSM.Manager.UI
             End Using
         End Sub
 
-        Private Async Sub OnUpdateInstallation(installationId As String)
+        Private Sub OnUpdateInstallation(installationId As String)
             Dim confirm = MessageBox.Show(
                 "Update this installation? All instances will be stopped during the update.",
                 "Confirm Update", MessageBoxButtons.YesNo, MessageBoxIcon.Question)
             If confirm <> DialogResult.Yes Then Return
 
-            SetStatus("Updating installation...")
             Dim installMgr = ManagerProgram.Services.GetService(Of InstallationManager)()
-            If installMgr IsNot Nothing Then
-                Dim ok = Await installMgr.UpdateAsync(installationId,
-                    promptHandler:=AddressOf HandleSteamPrompt)
-                SetStatus(If(ok, "Update completed", "Update failed"))
+            If installMgr Is Nothing Then
+                SetStatus("InstallationManager not registered — update was not started")
+                Return
             End If
+
+            ' Surface the InstallationPanel so the user can watch
+            ' progress on its Progress tab. Selecting the tree node
+            ' fires AfterSelect which calls
+            ' ShowPanel(InstallationPanel(id)). The panel subscribes
+            ' to InstallationManager events on construction, so as
+            ' soon as it's mounted it'll observe the OperationStarted
+            ' event below and add its Progress tab.
+            ' userInitiated:=True tells the panel to auto-select
+            ' that tab.
+            SelectInstallationInTree(installationId)
+            SetStatus("Updating installation...")
+
+            ' Fire-and-forget. Errors surface via the panel's
+            ' OperationCompleted handler; this caller never needs
+            ' to await the result.
+            Dim _unused = StartUserInitiatedUpdateAsync(installMgr, installationId)
+        End Sub
+
+        ''' <summary>
+        ''' Awaits InstallAsync inside a try/catch so any exception
+        ''' that escapes the manager's own handling doesn't surface
+        ''' as an unobserved-task crash. Extracted to a named
+        ''' Async Function (rather than an inline lambda) because
+        ''' VB.Net infers Task(Of Object) on bare Async Function()
+        ''' lambdas, which produces "doesn't return value on all
+        ''' paths" warnings.
+        ''' </summary>
+        Private Async Function StartUserInitiatedInstallAsync(installMgr As InstallationManager,
+                                                                installationId As String) As Task
+            Try
+                Await installMgr.InstallAsync(installationId,
+                    promptHandler:=AddressOf HandleSteamPrompt,
+                    userInitiated:=True)
+            Catch
+                ' Errors surface via the InstallationPanel's
+                ' OperationCompleted handler.
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Sister of StartUserInitiatedInstallAsync for the Update
+        ''' path — same fire-and-forget pattern, same error-routing
+        ''' rationale.
+        ''' </summary>
+        Private Async Function StartUserInitiatedUpdateAsync(installMgr As InstallationManager,
+                                                               installationId As String) As Task
+            Try
+                Await installMgr.UpdateAsync(installationId,
+                    promptHandler:=AddressOf HandleSteamPrompt,
+                    userInitiated:=True)
+            Catch
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Find the tree node for the given installation ID and
+        ''' select it, expanding any collapsed ancestor nodes so
+        ''' the selected node is actually visible. Triggers
+        ''' AfterSelect, which calls
+        ''' ShowPanel(InstallationPanel(id)) — the side effect
+        ''' callers actually want.
+        '''
+        ''' No-op if the node isn't found (tree out of sync, or
+        ''' wrong ID); callers shouldn't depend on visible
+        ''' confirmation that selection happened, just on the
+        ''' best-effort surface.
+        ''' </summary>
+        Private Sub SelectInstallationInTree(installationId As String)
+            Dim tag = $"installation:{installationId}"
+            Dim node = FindNodeByTag(_treeView.Nodes, tag)
+            If node Is Nothing Then Return
+
+            Dim parent = node.Parent
+            While parent IsNot Nothing
+                If Not parent.IsExpanded Then parent.Expand()
+                parent = parent.Parent
+            End While
+
+            ' SelectedNode = same-node is a no-op (no AfterSelect
+            ' fires), which is what we want for the case where the
+            ' user already had this installation selected before
+            ' clicking Update — the panel is already mounted and
+            ' subscribed, no need to rebuild it.
+            _treeView.SelectedNode = node
         End Sub
 
         Private Function HandleSteamPrompt(promptType As GSM.Node.Api.PromptType,
@@ -1170,6 +1403,419 @@ Namespace GSM.Manager.UI
 
             RefreshNodeTree()
             SetStatus("Instance deleted")
+        End Sub
+
+        ' ============================================================
+        '  Status icons — ImageList factory + state resolvers + refresh
+        ' ============================================================
+
+        ''' <summary>
+        ''' Build a 16×16 ImageList of status badges for the tree.
+        ''' Layout:
+        '''
+        '''   slot 0     : transparent blank (StatusIcon.None)
+        '''   slots 1–6  : circles  — used by instances
+        '''   slots 7–12 : folders  — used by installations
+        '''   slots 13–18: servers  — used by nodes
+        '''
+        ''' Within each family slots run in StatusIcon enum order
+        ''' (Green, Yellow, Red, Blue, Gray, DarkRed). The
+        ''' family-base offset and resolved colour combine to a
+        ''' slot index in WalkAndApplyStatusIcons:
+        '''   instance:     0 + colour =  1..6
+        '''   installation: 6 + colour =  7..12
+        '''   node:        12 + colour = 13..18
+        ''' All bitmaps are drawn programmatically with GDI+, so
+        ''' there are no external assets to ship.
+        ''' </summary>
+        Private Function BuildStatusImageList() As ImageList
+            Dim list As New ImageList()
+            list.ImageSize = New Size(16, 16)
+            list.ColorDepth = ColorDepth.Depth32Bit
+
+            ' StatusIcon.None — transparent blank for tree nodes
+            ' that don't carry a status (root nodes, unknown tag
+            ' shapes). Setting ImageIndex on one of these gives a
+            ' correctly-sized empty slot rather than "no icon"
+            ' which would make sibling nodes' text shift left.
+            list.Images.Add(MakeTransparentBitmap())
+
+            ' Colours, in StatusIcon enum order. ARGB tuples
+            ' chosen for readability against both light and dark
+            ' TreeView backgrounds. The same six colours are reused
+            ' across all three families so every "green" badge
+            ' looks the same hue regardless of shape.
+            Dim colors As Color() = New Color() {
+                Color.FromArgb(60, 180, 75),    ' Green
+                Color.FromArgb(245, 195, 0),    ' Yellow
+                Color.FromArgb(220, 50, 50),    ' Red
+                Color.FromArgb(60, 130, 220),   ' Blue
+                Color.FromArgb(170, 170, 170),  ' Gray
+                Color.FromArgb(140, 30, 30)     ' DarkRed
+            }
+
+            ' Family 1 — circles, used for instances. Discord-
+            ' style status dots; instances are the leaf-level
+            ' "thing currently doing something" so the simplest
+            ' shape is best.
+            For Each c In colors
+                list.Images.Add(MakeStatusCircle(c))
+            Next
+
+            ' Family 2 — folders, used for installations. The
+            ' folder shape mirrors the conceptual model: an
+            ' installation is a directory on the node containing
+            ' game-server files.
+            For Each c In colors
+                list.Images.Add(MakeStatusFolder(c))
+            Next
+
+            ' Family 3 — servers, used for nodes. A stacked-rack
+            ' silhouette reads as "machine" at 16×16 better than
+            ' anything more decorated would.
+            For Each c In colors
+                list.Images.Add(MakeStatusServer(c))
+            Next
+
+            Return list
+        End Function
+
+        ''' <summary>
+        ''' 16×16 ARGB bitmap with all-transparent pixels. Used
+        ''' for the StatusIcon.None slot so root nodes and
+        ''' unrecognised tags get an invisible-but-correctly-sized
+        ''' placeholder.
+        ''' </summary>
+        Private Function MakeTransparentBitmap() As Bitmap
+            ' Default Bitmap(w, h) constructor is Format32bppArgb
+            ' on .NET 8, which is what we want — the alpha channel
+            ' is required for the rest of the tree to show through
+            ' the slot.
+            Return New Bitmap(16, 16)
+        End Function
+
+        ''' <summary>
+        ''' 16×16 ARGB bitmap with a filled circle in the supplied
+        ''' colour, outlined in a thin darker shade for crisp edges
+        ''' against the tree background. Slightly inset (Rectangle
+        ''' 2,2,11,11) so the circle has clear pixels around it on
+        ''' all sides. AntiAlias is on — essential for circles to
+        ''' avoid jagged edges at this size.
+        ''' </summary>
+        Private Function MakeStatusCircle(fillColor As Color) As Bitmap
+            Dim bmp As New Bitmap(16, 16)
+            Using g = Graphics.FromImage(bmp)
+                g.SmoothingMode = Drawing2D.SmoothingMode.AntiAlias
+                Dim rect As New Rectangle(2, 2, 11, 11)
+                Using brush As New SolidBrush(fillColor)
+                    g.FillEllipse(brush, rect)
+                End Using
+                Using pen As New Pen(ControlPaint.Dark(fillColor), 1.0F)
+                    g.DrawEllipse(pen, rect)
+                End Using
+            End Using
+            Return bmp
+        End Function
+
+        ''' <summary>
+        ''' 16×16 ARGB bitmap of a classic folder silhouette in
+        ''' the supplied colour: a small tab on the upper-left
+        ''' attached to a wider body below. Drawn as a single
+        ''' closed polygon path so the tab/body junction has no
+        ''' visible internal seam — fill and outline both trace
+        ''' the same combined silhouette.
+        '''
+        ''' AntiAlias is OFF here: the path is all axis-aligned
+        ''' edges, and AA on integer-pixel rectangles produces
+        ''' fuzzy half-pixel edges at this size. The crisper
+        ''' look matches the Windows tree style.
+        ''' </summary>
+        Private Function MakeStatusFolder(fillColor As Color) As Bitmap
+            Dim bmp As New Bitmap(16, 16)
+            Using g = Graphics.FromImage(bmp)
+                g.SmoothingMode = Drawing2D.SmoothingMode.None
+                Using path As New Drawing2D.GraphicsPath()
+                    ' Polygon vertices, traced clockwise from the
+                    ' lower-left of the body. Tab spans x=2..6,
+                    ' y=3..5; body spans x=1..14, y=5..13. The
+                    ' shared edge at y=5 has no separate stroke
+                    ' because both shapes are part of one path.
+                    path.AddLines(New Point() {
+                        New Point(1, 5),
+                        New Point(2, 5),
+                        New Point(2, 3),
+                        New Point(7, 3),
+                        New Point(7, 5),
+                        New Point(14, 5),
+                        New Point(14, 13),
+                        New Point(1, 13)
+                    })
+                    path.CloseFigure()
+                    Using brush As New SolidBrush(fillColor)
+                        g.FillPath(brush, path)
+                    End Using
+                    Using pen As New Pen(ControlPaint.Dark(fillColor), 1.0F)
+                        g.DrawPath(pen, path)
+                    End Using
+                End Using
+            End Using
+            Return bmp
+        End Function
+
+        ''' <summary>
+        ''' 16×16 ARGB bitmap of a stacked-rack server silhouette
+        ''' in the supplied colour: two thin horizontal "1U" boxes
+        ''' separated by a small gap, each with a tiny LED dot on
+        ''' the right side. Reads as "a machine" at icon size
+        ''' without committing to specific platform iconography.
+        '''
+        ''' AntiAlias OFF for the same reason as the folder —
+        ''' axis-aligned rectangles look crispest without it. The
+        ''' LED dots are drawn in light-grey (not pure white) so
+        ''' they remain visible on the green/yellow chassis colours
+        ''' but don't blow out against the gray-chassis variant.
+        ''' </summary>
+        Private Function MakeStatusServer(fillColor As Color) As Bitmap
+            Dim bmp As New Bitmap(16, 16)
+            Using g = Graphics.FromImage(bmp)
+                g.SmoothingMode = Drawing2D.SmoothingMode.None
+                Dim topUnit As New Rectangle(2, 3, 12, 4)
+                Dim bottomUnit As New Rectangle(2, 9, 12, 4)
+                Using brush As New SolidBrush(fillColor)
+                    g.FillRectangle(brush, topUnit)
+                    g.FillRectangle(brush, bottomUnit)
+                End Using
+                Using pen As New Pen(ControlPaint.Dark(fillColor), 1.0F)
+                    g.DrawRectangle(pen, topUnit)
+                    g.DrawRectangle(pen, bottomUnit)
+                End Using
+                ' LED "power" indicators on each rack unit. Light
+                ' grey rather than pure white so they stay legible
+                ' on the gray chassis variant.
+                Using ledBrush As New SolidBrush(Color.FromArgb(235, 235, 235))
+                    g.FillRectangle(ledBrush, 11, 4, 2, 2)
+                    g.FillRectangle(ledBrush, 11, 10, 2, 2)
+                End Using
+            End Using
+            Return bmp
+        End Function
+
+        ''' <summary>
+        ''' Resolve the current StatusIcon for a node by NodeId.
+        ''' Three signals, all checked without a network round
+        ''' trip:
+        '''
+        '''   1. InstanceManager.IsNodeKnownUnreachable — entry
+        '''      in the connection-failure dedup dict; means a
+        '''      recent poll failed and hasn't been cleared by a
+        '''      subsequent success. Maps to Red.
+        '''
+        '''   2. NodeHttpClient.TryGetCachedVersion — populated
+        '''      after the first successful /api/version call.
+        '''      If non-null we've reached this node at some point;
+        '''      combined with #1 = false this is the "reachable"
+        '''      signal. Compare its ProtocolVersion against the
+        '''      manager's compiled-in constant: equal = Green,
+        '''      mismatch = Yellow.
+        '''
+        '''   3. No failure entry AND no cached version =
+        '''      never probed. Map to Gray.
+        ''' </summary>
+        Private Function ResolveNodeIcon(nodeId As String) As StatusIcon
+            If String.IsNullOrEmpty(nodeId) Then Return StatusIcon.None
+
+            Dim instMgr = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If instMgr IsNot Nothing AndAlso instMgr.IsNodeKnownUnreachable(nodeId) Then
+                Return StatusIcon.Red
+            End If
+
+            Dim factory = ManagerProgram.Services.GetService(Of NodeHttpClientFactory)()
+            If factory Is Nothing Then Return StatusIcon.Gray
+
+            Dim version As NodeVersionResponse = Nothing
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim nodeEntity = db.Nodes.Find(nodeId)
+                    If nodeEntity Is Nothing Then Return StatusIcon.Gray
+                    Dim client = TryCast(factory.GetClient(
+                        nodeEntity.NodeId, nodeEntity.HostAddress,
+                        nodeEntity.Port, nodeEntity.AuthToken), NodeHttpClient)
+                    If client Is Nothing Then Return StatusIcon.Gray
+                    version = client.TryGetCachedVersion()
+                End Using
+            Catch
+                Return StatusIcon.Gray
+            End Try
+
+            If version Is Nothing Then Return StatusIcon.Gray
+
+            ' Old nodes that pre-date Phase 5f-1 will leave
+            ' ProtocolVersion at zero on the response — don't
+            ' flag those as a mismatch since the manager talks to
+            ' them fine on the legacy shape, treat as Green.
+            If version.ProtocolVersion > 0 AndAlso
+               version.ProtocolVersion <> NodeApiContract.ProtocolVersion Then
+                Return StatusIcon.Yellow
+            End If
+
+            Return StatusIcon.Green
+        End Function
+
+        ''' <summary>
+        ''' Resolve the current StatusIcon for an instance.
+        ''' Reads InstanceManager.GetLiveState which is a pure
+        ''' in-memory dict lookup populated by the 3s background
+        ''' poll loop. Nothing means the manager has never observed
+        ''' a state for this instance — typically because the
+        ''' hosting node is unreachable, in which case the parent
+        ''' node's badge will show that.
+        ''' </summary>
+        Private Function ResolveInstanceIcon(instanceId As String) As StatusIcon
+            If String.IsNullOrEmpty(instanceId) Then Return StatusIcon.None
+
+            Dim instMgr = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If instMgr Is Nothing Then Return StatusIcon.Gray
+
+            Dim live = instMgr.GetLiveState(instanceId)
+            If live Is Nothing Then Return StatusIcon.Gray
+
+            Select Case live.CurrentState
+                Case InstanceState.Running
+                    Return StatusIcon.Green
+                Case InstanceState.Starting, InstanceState.Stopping
+                    Return StatusIcon.Blue
+                Case InstanceState.Crashed
+                    Return StatusIcon.Red
+                Case InstanceState.CrashLoopHalted
+                    Return StatusIcon.DarkRed
+                Case InstanceState.Stopped
+                    Return StatusIcon.Gray
+                Case Else
+                    Return StatusIcon.Gray
+            End Select
+        End Function
+
+        ''' <summary>
+        ''' Resolve the current StatusIcon for an installation.
+        ''' Order of checks matters:
+        '''
+        '''   1. InstallationManager.IsActive — currently in the
+        '''      install or update polling phase. Blue ("working")
+        '''      regardless of whether a stamped version exists
+        '''      yet, since the in-flight signal is more relevant
+        '''      to the user than yesterday's stamp.
+        '''
+        '''   2. InstalledVersion empty — not installed yet.
+        '''      Gray.
+        '''
+        '''   3. LatestKnownVersion empty — we have no upstream
+        '''      comparison to make. Gray rather than Green; we
+        '''      don't know whether an update is available.
+        '''
+        '''   4. Versions equal — up to date. Green.
+        '''
+        '''   5. Versions differ — update available. Yellow.
+        '''
+        ''' Per-tick DB hit is acceptable: ~10 installations max
+        ''' in practice, SQLite local Find() on a primary key,
+        ''' microseconds each.
+        ''' </summary>
+        Private Function ResolveInstallationIcon(installationId As String) As StatusIcon
+            If String.IsNullOrEmpty(installationId) Then Return StatusIcon.None
+
+            Dim installMgr = ManagerProgram.Services.GetService(Of InstallationManager)()
+            If installMgr IsNot Nothing AndAlso installMgr.IsActive(installationId) Then
+                Return StatusIcon.Blue
+            End If
+
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim entity = db.Installations.Find(installationId)
+                    If entity Is Nothing Then Return StatusIcon.Gray
+                    If String.IsNullOrEmpty(entity.InstalledVersion) Then
+                        Return StatusIcon.Gray
+                    End If
+                    If String.IsNullOrEmpty(entity.LatestKnownVersion) Then
+                        Return StatusIcon.Gray
+                    End If
+                    If String.Equals(entity.InstalledVersion,
+                                       entity.LatestKnownVersion,
+                                       StringComparison.Ordinal) Then
+                        Return StatusIcon.Green
+                    End If
+                    Return StatusIcon.Yellow
+                End Using
+            Catch
+                Return StatusIcon.Gray
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Walk the tree and update each entity-bearing
+        ''' TreeNode's ImageIndex/SelectedImageIndex from the
+        ''' current cached state. Both Index properties are
+        ''' updated together so the badge stays consistent across
+        ''' selected/unselected state.
+        '''
+        ''' Skips assignment when the value hasn't changed — the
+        ''' equality check is cheap and avoids triggering a
+        ''' TreeView repaint on every tick when no states changed.
+        ''' </summary>
+        Private Sub RefreshStatusIcons()
+            If _treeView Is Nothing OrElse _statusImageList Is Nothing Then Return
+            Try
+                WalkAndApplyStatusIcons(_treeView.Nodes)
+            Catch
+                ' Best-effort — never let an icon-refresh hiccup
+                ' break the rest of the UI.
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Per-family base offset within _statusImageList.
+        ''' Combined with the colour value (1..6 from StatusIcon)
+        ''' to compute the final slot index. Mirrors the layout
+        ''' described on BuildStatusImageList.
+        ''' </summary>
+        Private Const InstanceIconBase As Integer = 0     ' slots 1..6 — circles
+        Private Const InstallationIconBase As Integer = 6  ' slots 7..12 — folders
+        Private Const NodeIconBase As Integer = 12         ' slots 13..18 — servers
+
+        Private Sub WalkAndApplyStatusIcons(nodes As TreeNodeCollection)
+            For Each n As TreeNode In nodes
+                Dim slotIdx As Integer = 0   ' default to StatusIcon.None — transparent blank
+                If n.Tag IsNot Nothing Then
+                    Dim parts = n.Tag.ToString().Split(":"c, 2)
+                    If parts.Length = 2 Then
+                        Dim color As StatusIcon = StatusIcon.None
+                        Dim baseOffset As Integer = -1
+                        Select Case parts(0)
+                            Case "instance"
+                                color = ResolveInstanceIcon(parts(1))
+                                baseOffset = InstanceIconBase
+                            Case "installation"
+                                color = ResolveInstallationIcon(parts(1))
+                                baseOffset = InstallationIconBase
+                            Case "node"
+                                color = ResolveNodeIcon(parts(1))
+                                baseOffset = NodeIconBase
+                        End Select
+                        ' baseOffset stays -1 for unrecognised
+                        ' kinds (e.g. "root:nodes"); colour
+                        ' StatusIcon.None means "no badge" — either
+                        ' way we leave slotIdx at 0 so the slot
+                        ' renders as the transparent blank.
+                        If baseOffset >= 0 AndAlso color <> StatusIcon.None Then
+                            slotIdx = baseOffset + CInt(color)
+                        End If
+                    End If
+                End If
+                If n.ImageIndex <> slotIdx Then n.ImageIndex = slotIdx
+                If n.SelectedImageIndex <> slotIdx Then n.SelectedImageIndex = slotIdx
+                If n.Nodes.Count > 0 Then WalkAndApplyStatusIcons(n.Nodes)
+            Next
         End Sub
 
     End Class

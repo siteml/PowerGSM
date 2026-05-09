@@ -155,23 +155,52 @@ Public Class NodeSection
     Public Property NodeId As String = ""
     Public Property ListenPort As Integer = 8765
     Public Property AuthToken As String = NodeSetupConfig.PlaceholderToken
-    Public Property DataDirectory As String = "./data"
+    ''' <summary>
+    ''' Default data directory — absolute path next to the executable.
+    ''' Computed at construction time rather than as the literal string
+    ''' "./data" because relative paths bite operators when the node runs
+    ''' as a service: systemd's working directory is not the install
+    ''' folder, so "./data" would resolve under /etc/systemd/system or
+    ''' wherever systemctl was invoked from. The node's runtime layer
+    ''' rebases relative paths against AppContext.BaseDirectory as a
+    ''' fallback, but writing the absolute path into the config from
+    ''' day one means there's nothing magic happening at runtime and
+    ''' the operator can read the JSON file and know exactly where data
+    ''' lives without inspecting code.
+    ''' </summary>
+    Public Property DataDirectory As String = DefaultDataDirectory()
     ''' <summary>
     ''' Default parent directory for new game-server installations.
     ''' Mirrors NodeConfiguration.ServersDirectory in GSM.Node — the
     ''' two MUST stay in sync because builder.Configuration.Bind binds
     ''' the JSON file directly into the runtime class.
     '''
-    ''' Default "./servers" resolves to a folder next to the node
-    ''' executable at runtime (NodeConfiguration.EnsureDefaults
-    ''' rebases relative paths against AppContext.BaseDirectory).
+    ''' See DataDirectory's comment for why this is absolute by default.
     ''' Operators routinely override this when game files belong on
     ''' a separate volume from the node binary.
     ''' </summary>
-    Public Property ServersDirectory As String = "./servers"
+    Public Property ServersDirectory As String = DefaultServersDirectory()
     Public Property MaxConcurrentInstalls As Integer = 2
     Public Property LogRetentionDays As Integer = 30
     Public Property MetricsIntervalSeconds As Integer = 5
+
+    ''' <summary>
+    ''' Absolute path to the default data directory — a sibling "data"
+    ''' folder next to the executable. Used as the property initializer
+    ''' default and exposed for the wizard so prompts and validation
+    ''' agree on what the default looks like.
+    ''' </summary>
+    Public Shared Function DefaultDataDirectory() As String
+        Return Path.Combine(AppContext.BaseDirectory, "data")
+    End Function
+
+    ''' <summary>
+    ''' Absolute path to the default servers directory — sibling "servers"
+    ''' folder next to the executable. See DefaultDataDirectory.
+    ''' </summary>
+    Public Shared Function DefaultServersDirectory() As String
+        Return Path.Combine(AppContext.BaseDirectory, "servers")
+    End Function
 End Class
 
 Public Class SecuritySection

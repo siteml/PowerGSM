@@ -101,6 +101,42 @@ Public Class LastOasisPlugin
         End If
 
         steps.Add(steamStep)
+
+        ' Steamworks identity hint — Linux-only.
+        '
+        ' AppID 920720 is the *dedicated-server tool* on Steam;
+        ' AppID 903950 is the *Last Oasis game* itself. The server
+        ' binary needs to authenticate as the game (903950) so
+        ' Steamworks calls (presence, EOS auth, telemetry) align
+        ' with the game's app identity rather than the server
+        ' tool's. Steam's SDK reads steam_appid.txt from the
+        ' process working directory at SteamAPI_Init time —
+        ' PowerGSM spawns instances with WorkingDirectory set to
+        ' the install root, so writing the file there is what
+        ' Steamworks finds.
+        '
+        ' On Windows the server picks up the right identity
+        ' through some other mechanism (Steam client / installed-
+        ' app registry) and the file isn't required. Per LO's
+        ' Linux dedicated-server documentation, the file IS
+        ' required there — without it the server fails Steamworks
+        ' init and never registers with the backend.
+        '
+        ' Skip explicitly on Windows. Unknown platform falls
+        ' through to the write branch as a safe default — better
+        ' to drop a harmless 6-byte file on an old Windows node
+        ' than to leave a Linux node broken because we couldn't
+        ' read its platform.
+        If config.Platform <> NodePlatform.Windows Then
+            steps.Add(New WriteFileStep With {
+                .StepName = "Write steam_appid.txt",
+                .Description = "Steamworks identity (903950 = LO game; required on Linux)",
+                .RelativePath = "steam_appid.txt",
+                .Content = "903950",
+                .OverwriteExisting = True
+            })
+        End If
+
         Return steps
     End Function
 
@@ -114,13 +150,47 @@ Public Class LastOasisPlugin
     ' ============================================================
 
     Public Function GetExecutablePath(config As InstanceConfig) As IReadOnlyList(Of String) Implements IGamePlugin.GetExecutablePath
-        ' Last Oasis ships one of two exe names depending on build variant.
-        ' The Manager tries each in order and remembers the winner.
-        Const subDir As String = "Mist\Binaries\Win64"
-        Return New String() {
-            IO.Path.Combine(subDir, "MistServer-Win64-Shipping.exe"),
-            IO.Path.Combine(subDir, "MistServer.exe")
-        }
+        ' Pick the right binary set based on the node's OS, which
+        ' the manager populated on InstanceConfig.Platform from
+        ' /api/version before invoking us. Forward slashes throughout
+        ' — both Windows and Linux file APIs accept them, and they
+        ' survive the Manager (Windows) → Node (Linux) marshalling
+        ' boundary unchanged.
+        '
+        ' Windows builds: MistServer-Win64-Shipping.exe is the
+        '   shipping-config build; MistServer.exe is the development
+        '   or test-config name. The probe loop tries them in order.
+        ' Linux builds: MistServer-Linux-Shipping is the standard
+        '   UE4 Linux dedicated-server binary name (no extension).
+        '   MistServer is the dev/test alternate. Some builds also
+        '   ship a .sh launcher that sets LD_LIBRARY_PATH — included
+        '   as a last-resort fallback so the user has a path that
+        '   works even if the direct binary names don't match.
+        '
+        ' NodePlatform.Unknown (older nodes that don't surface the
+        ' field) emits the union so the manager's probe-and-remember
+        ' loop can still find the right one.
+        Select Case config.Platform
+            Case NodePlatform.Linux
+                Return New String() {
+                    "Mist/Binaries/Linux/MistServer-Linux-Shipping",
+                    "Mist/Binaries/Linux/MistServer",
+                    "MistServer.sh"
+                }
+            Case NodePlatform.Windows
+                Return New String() {
+                    "Mist/Binaries/Win64/MistServer-Win64-Shipping.exe",
+                    "Mist/Binaries/Win64/MistServer.exe"
+                }
+            Case Else
+                Return New String() {
+                    "Mist/Binaries/Win64/MistServer-Win64-Shipping.exe",
+                    "Mist/Binaries/Win64/MistServer.exe",
+                    "Mist/Binaries/Linux/MistServer-Linux-Shipping",
+                    "Mist/Binaries/Linux/MistServer",
+                    "MistServer.sh"
+                }
+        End Select
     End Function
 
     Public Function BuildLaunchArguments(config As InstanceConfig) As String Implements IGamePlugin.BuildLaunchArguments
@@ -209,7 +279,12 @@ Public Class LastOasisPlugin
 
         ' Write a per-instance log file so each instance sharing this
         ' install folder gets its own log we can tail independently.
-        Dim absLogPath = $"{config.WorkingDirectory}\Mist\Saved\Logs\{config.InstanceId}.log"
+        ' Forward slashes throughout so the path is valid on both
+        ' Windows (UE4 accepts /) and Linux (where \ is a literal
+        ' filename character, not a separator). config.WorkingDirectory
+        ' is the install root as the node sees it — already in the
+        ' node's native path style by the time it reaches us.
+        Dim absLogPath = $"{config.WorkingDirectory}/Mist/Saved/Logs/{config.InstanceId}.log"
         args.Add($"-AbsLog=""{absLogPath}""")
 
         Return String.Join(" ", args)
@@ -407,8 +482,13 @@ Public Class LastOasisPlugin
         ' Stdout is NOT listed here because it would be redundant — the
         ' file captures a superset. Node still drains stdout pipes to
         ' prevent UE4 from blocking on writes to an unread pipe.
+        '
+        ' Forward slashes in the pattern so InstanceManager's path
+        ' resolution can sit on either OS without rewriting separators.
+        ' The {InstallPath} token is replaced with the install path as
+        ' the node sees it, and {InstanceId} with the live id.
         Return New ILogSource() {
-            New FileLogSource("mistlog", "{InstallPath}\Mist\Saved\Logs\{InstanceId}.log")
+            New FileLogSource("mistlog", "{InstallPath}/Mist/Saved/Logs/{InstanceId}.log")
         }
     End Function
 

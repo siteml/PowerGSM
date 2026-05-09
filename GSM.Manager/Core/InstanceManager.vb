@@ -46,6 +46,27 @@ Namespace GSM.Manager.Core
         ' the crash notification.
         Private ReadOnly _refreshLocks As New ConcurrentDictionary(Of String, SemaphoreSlim)
 
+        ' Per-node connection-failure suppression state for log
+        ' dedup. When a node goes offline, every 3-second poll
+        ' (UI panel timer + background loop, on every instance
+        ' that node hosts) would otherwise produce a fresh
+        ' "Failed to refresh state" warning — for an operator
+        ' with a 4-instance node down, that's 8 warnings per 3s
+        ' going to disk. We log the first failure once, suppress
+        ' subsequent identical failures from any instance on the
+        ' same node, and emit a "back online" line on first
+        ' success after a downtime. A heartbeat warning every
+        ' FailureHeartbeatMinutes ensures an operator who
+        ' arrives later still sees the node's still down rather
+        ' than only seeing the original offline-event line
+        ' scrolled off the top of the log.
+        '
+        ' Keyed by NodeId so the dedup is per-node, not per-
+        ' instance — a 4-instance node going down produces ONE
+        ' warning, not four.
+        Private ReadOnly _nodeFailureStates As New ConcurrentDictionary(Of String, NodeFailureState)
+        Private Const FailureHeartbeatMinutes As Integer = 5
+
         ' Background poller — iterates every known instance every few
         ' seconds so crash/crashloop state transitions get detected
         ' regardless of which UI tab the user has focused. Previously
@@ -155,6 +176,20 @@ Namespace GSM.Manager.Core
                     Return False
                 End If
 
+                ' Resolve the node's HTTP client up front so we can
+                ' fetch its OS platform before invoking any plugin
+                ' methods. The platform answer goes onto InstanceConfig
+                ' so plugins return platform-specific paths /
+                ' executable names directly instead of emitting dual
+                ' candidates the manager has to probe. The version-
+                ' fetch is cached per-client by NodeHttpClient, so
+                ' second-and-subsequent starts against the same node
+                ' don't hit the wire.
+                Dim client = _clientFactory.GetClient(
+                    nodeEntity.NodeId, nodeEntity.HostAddress,
+                    nodeEntity.Port, nodeEntity.AuthToken)
+                Dim nodePlatform = Await NodePlatformResolver.ResolveAsync(client, CancellationToken.None)
+
                 ' Resolve plugin
                 Dim plugin = _pluginRegistry.GetPlugin(instanceEntity.GameId)
 
@@ -187,7 +222,8 @@ Namespace GSM.Manager.Core
                     .DisplayName = instanceEntity.DisplayName,
                     .InstallationId = instanceEntity.InstallationId,
                     .WorkingDirectory = installEntity.InstallPath,
-                    .CustomFields = customFields
+                    .CustomFields = customFields,
+                    .Platform = nodePlatform
                 }
 
                 ' Build launch arguments from plugin
@@ -212,7 +248,16 @@ Namespace GSM.Manager.Core
                         If pluginCandidates IsNot Nothing Then
                             For Each relPath In pluginCandidates
                                 If Not String.IsNullOrEmpty(relPath) Then
-                                    candidates.Add(IO.Path.Combine(installEntity.InstallPath, relPath))
+                                    ' JoinNodePath instead of
+                                    ' Path.Combine: the manager's
+                                    ' Path.DirectorySeparatorChar is
+                                    ' '\' (Windows), but the install
+                                    ' path lives on the NODE — which
+                                    ' may be Linux. Pass the resolved
+                                    ' nodePlatform so the join uses
+                                    ' the right separator without
+                                    ' guessing from path shape.
+                                    candidates.Add(JoinNodePath(nodePlatform, installEntity.InstallPath, relPath))
                                 End If
                             Next
                         End If
@@ -247,10 +292,6 @@ Namespace GSM.Manager.Core
                     rconPassword = customFields("RconPassword")
                 End If
 
-                Dim client = _clientFactory.GetClient(
-                    nodeEntity.NodeId, nodeEntity.HostAddress,
-                    nodeEntity.Port, nodeEntity.AuthToken)
-
                 ' Resolve file log sources the plugin declared. These
                 ' get tailed on the node and merged into the instance's
                 ' log buffer. Path patterns can contain {InstallPath}
@@ -273,8 +314,10 @@ Namespace GSM.Manager.Core
                                     .Replace("{InstallPath}", installEntity.InstallPath) _
                                     .Replace("{InstanceId}", instanceId)
                                 If Not String.IsNullOrEmpty(resolved) AndAlso
-                                   Not IO.Path.IsPathRooted(resolved) Then
-                                    resolved = IO.Path.Combine(installEntity.InstallPath, resolved)
+                                   Not IsRootedOnEitherPlatform(resolved) Then
+                                    ' Same JoinNodePath rationale as
+                                    ' the executable candidates above.
+                                    resolved = JoinNodePath(nodePlatform, installEntity.InstallPath, resolved)
                                 End If
                                 logFilePaths.Add(resolved)
                             Next
@@ -503,8 +546,24 @@ Namespace GSM.Manager.Core
                 ' time, and so any join/leave events fired during the
                 ' graceful-shutdown window still get processed against
                 ' the live tracking set instead of being dropped.
-                StopLogStream(instanceId)
+                '
+                ' Order within Finally: ClearPlayerTracking BEFORE
+                ' StopLogStream. ClearPlayerTracking flushes any
+                ' tracked players as synthetic leave events via
+                ' PersistPlayerObservation, which calls
+                ' ResolveSessionIdentity — and that resolver reads the
+                ' parser's CurrentSessionIdentity from _logParsers.
+                ' StopLogStream removes that parser entry, after which
+                ' the resolver falls back to {gameId}:{instanceId}.
+                ' For LO that fallback differs from the real
+                ' realm:tile session identity the joins were stamped
+                ' with, so flushing AFTER StopLogStream would orphan
+                ' the synthetic leaves in the History timeline. The
+                ' Factorio fallback happens to match the real format,
+                ' so this only bites LO — but cheap to get right for
+                ' both regardless.
                 ClearPlayerTracking(instanceId)
+                StopLogStream(instanceId)
             End Try
 
             Return succeeded
@@ -674,6 +733,11 @@ Namespace GSM.Manager.Core
             Try
                 Dim result = Await client.GetInstanceStatusAsync(instanceId, CancellationToken.None)
 
+                ' Successful poll — clear any prior connection-
+                ' failure state for this node and announce "back
+                ' online" if we'd previously suppressed warnings.
+                NoteNodeReachable(instanceId)
+
                 ' Compare against previous cached state to detect
                 ' transitions worth announcing.
                 Dim previous As InstanceStatusResponse = Nothing
@@ -706,9 +770,47 @@ Namespace GSM.Manager.Core
                     End If
                 End If
 
+                ' Transition INTO any terminal state — flush any
+                ' tracked players as synthetic leave events. Catches
+                ' the crash and crash-loop paths where StopInstanceAsync's
+                ' Finally (which also calls ClearPlayerTracking) wasn't
+                ' the path that took the instance down. Idempotent: a
+                ' user-initiated stop flushes via the Finally first,
+                ' and this callsite then sees an empty bucket and no-ops.
+                ' Doesn't depend on _emitter being non-null — the flush
+                ' is about persistence, not notifications.
+                If previous IsNot Nothing AndAlso result IsNot Nothing Then
+                    Dim prevState2 = previous.CurrentState
+                    Dim newState2 = result.CurrentState
+                    Dim isTerminal = (newState2 = GSM.Plugin.InstanceState.Stopped OrElse
+                                      newState2 = GSM.Plugin.InstanceState.Crashed OrElse
+                                      newState2 = GSM.Plugin.InstanceState.CrashLoopHalted)
+                    Dim wasNotTerminal = (prevState2 <> GSM.Plugin.InstanceState.Stopped AndAlso
+                                          prevState2 <> GSM.Plugin.InstanceState.Crashed AndAlso
+                                          prevState2 <> GSM.Plugin.InstanceState.CrashLoopHalted)
+                    If isTerminal AndAlso wasNotTerminal Then
+                        Try
+                            ClearPlayerTracking(instanceId)
+                        Catch ex As Exception
+                            _logger.LogDebug(ex,
+                                "ClearPlayerTracking on terminal-state transition threw for {Id}",
+                                instanceId)
+                        End Try
+                    End If
+                End If
+
                 Return result
             Catch ex As Exception
-                _logger.LogWarning(ex, "Failed to refresh state for {Id}", instanceId)
+                ' Connection-level failures get suppressed per-node
+                ' so a downed node doesn't spam this warning every
+                ' 3s on every instance it hosts; API-level failures
+                ' (HTTP 500/404/etc.) log normally since they're
+                ' usually one-offs worth seeing every time.
+                If IsConnectionFailure(ex) Then
+                    NoteNodeNetworkFailure(instanceId, ex)
+                Else
+                    _logger.LogWarning(ex, "Failed to refresh state for {Id}", instanceId)
+                End If
                 Return Nothing
             Finally
                 gate.Release()
@@ -884,6 +986,25 @@ Namespace GSM.Manager.Core
         ''' re-ingesting history that was already mirrored before
         ''' the manager restart. Returns DateTime.MinValue if no
         ''' rows exist for this instance yet.
+        '''
+        ''' UTC kind is FORCED on the returned value. EF Core's
+        ''' SQLite provider stores DateTime as TEXT and reads it
+        ''' back with Kind=Unspecified — the kind information from
+        ''' the original Utc value is dropped on the round trip.
+        ''' That kind matters downstream: NodeHttpClient serializes
+        ''' cursors via DateTime.ToString("o"), which only emits the
+        ''' "Z" suffix when Kind=Utc. An Unspecified-kind cursor
+        ''' serializes as "2026-05-03T00:03:57.0000000" (no Z), the
+        ''' node parses it with RoundtripKind and then calls
+        ''' ToUniversalTime() — which TREATS UNSPECIFIED AS LOCAL
+        ''' and shifts the time by the manager's UTC offset. For a
+        ''' user in CDT, a cursor of 00:03:57 becomes 05:03:57 on
+        ''' the node's side, and any chat persisted between those
+        ''' two times gets silently filtered out of the response.
+        ''' Tagging the cursor as Utc here propagates the right
+        ''' suffix all the way through the chain. Column is named
+        ''' TimestampUtc and is always written from DateTime.UtcNow,
+        ''' so this isn't a guess — it's restoring lost metadata.
         ''' </summary>
         Private Function SeedChatCursor(instanceId As String) As DateTime
             Try
@@ -893,7 +1014,8 @@ Namespace GSM.Manager.Core
                         Where(Function(c) c.InstanceId = instanceId).
                         Select(Function(c) CType(c.TimestampUtc, DateTime?)).
                         Max()
-                    Return If(latest.HasValue, latest.Value, DateTime.MinValue)
+                    If Not latest.HasValue Then Return DateTime.MinValue
+                    Return DateTime.SpecifyKind(latest.Value, DateTimeKind.Utc)
                 End Using
             Catch
                 Return DateTime.MinValue
@@ -1171,10 +1293,70 @@ Namespace GSM.Manager.Core
         ''' Called on instance stop. Drops all tracked players and
         ''' the empty-leave cooldown for this instance so a later
         ''' fresh start begins from a clean slate.
+        '''
+        ''' Before clearing, flushes each tracked player as a
+        ''' synthetic "leave" event into PlayerActivity so the
+        ''' History timeline shows matching leaves for the joins
+        ''' instead of dangling joins-with-no-leaves. When an
+        ''' instance stops — gracefully, by crash, or by force-kill
+        ''' — the players that were online are functionally
+        ''' disconnected; the History should reflect that.
+        '''
+        ''' Persist-only — the InstanceStopped / InstanceCrashed
+        ''' notification already covers "what happened" at the
+        ''' event level, so per-player PlayerLeft notifications on
+        ''' top of that would just be noise (and could spam Discord
+        ''' badly when a populated server stops).
+        '''
+        ''' SessionIdentity caveat: this method must be called
+        ''' BEFORE StopLogStream tears down the parser, because
+        ''' PersistPlayerObservation relies on ResolveSessionIdentity
+        ''' which reads the parser's CurrentSessionIdentity. Once
+        ''' the parser is removed from _logParsers, that resolver
+        ''' falls back to {gameId}:{instanceId}, which would
+        ''' persist the synthetic leave under a different
+        ''' SessionIdentity than the join — orphaning both in the
+        ''' History timeline. StopInstanceAsync.Finally calls
+        ''' ClearPlayerTracking before StopLogStream for this
+        ''' reason; RefreshInstanceStateAsync's terminal-state
+        ''' callsite doesn't tear down the stream at all.
         ''' </summary>
         Private Sub ClearPlayerTracking(instanceId As String)
-            Dim removed As HashSet(Of String) = Nothing
-            _activePlayers.TryRemove(instanceId, removed)
+            ' Drain the bucket atomically. Removing the entry from
+            ' _activePlayers under the same SyncLock prevents a
+            ' join arriving mid-flush from re-populating the same
+            ' bucket reference we're about to clear — a join after
+            ' this point creates a fresh bucket via GetOrAdd and
+            ' is preserved for the next stop (rare but possible if
+            ' the log stream is still feeding events during the
+            ' graceful-shutdown window).
+            Dim namesToFlush As List(Of String) = Nothing
+            Dim bucket As HashSet(Of String) = Nothing
+            If _activePlayers.TryRemove(instanceId, bucket) AndAlso
+               bucket IsNot Nothing Then
+                SyncLock bucket
+                    If bucket.Count > 0 Then
+                        namesToFlush = bucket.ToList()
+                        bucket.Clear()
+                    End If
+                End SyncLock
+            End If
+
+            If namesToFlush IsNot Nothing AndAlso namesToFlush.Count > 0 Then
+                For Each name In namesToFlush
+                    Try
+                        PersistPlayerObservation(instanceId, name, isJoin:=False)
+                    Catch ex As Exception
+                        _logger.LogDebug(ex,
+                            "Synthetic leave persist failed for {Id}/{Name}",
+                            instanceId, name)
+                    End Try
+                Next
+                _logger.LogInformation(
+                    "Flushed {Count} player(s) as synthetic leave on stop for {Id}",
+                    namesToFlush.Count, instanceId)
+            End If
+
             Dim removedTs As DateTime
             _lastEmptyLeaveAt.TryRemove(instanceId, removedTs)
 
@@ -1465,6 +1647,78 @@ Namespace GSM.Manager.Core
         End Function
 
         ''' <summary>
+        ''' Cross-platform path join for paths that target the NODE
+        ''' rather than the manager's local filesystem. Plain
+        ''' IO.Path.Combine bakes in the manager's
+        ''' Path.DirectorySeparatorChar — always '\' on the
+        ''' Windows-hosted manager — which corrupts paths bound for
+        ''' a Linux node ("/opt/factorio" + "\" + "bin/x64/factorio"
+        ''' → "/opt/factorio\bin/x64/factorio", which Linux opens
+        ''' as a literal filename containing backslashes).
+        '''
+        ''' The platform parameter is the node's authoritative OS
+        ''' answer from /api/version. NodePlatform.Unknown falls
+        ''' back to path-shape detection so older nodes that don't
+        ''' carry the field still get a reasonable answer.
+        ''' </summary>
+        Private Shared Function JoinNodePath(platform As NodePlatform,
+                                              installPath As String,
+                                              relPath As String) As String
+            If String.IsNullOrEmpty(installPath) Then Return If(relPath, "")
+            If String.IsNullOrEmpty(relPath) Then Return installPath
+
+            Dim sep As Char
+            Select Case platform
+                Case NodePlatform.Linux
+                    sep = "/"c
+                Case NodePlatform.Windows
+                    sep = "\"c
+                Case Else
+                    ' Unknown — fall back to path-shape detection
+                    ' so older nodes that don't carry the Platform
+                    ' field still get the right answer.
+                    Dim hasForward = installPath.IndexOf("/"c) >= 0
+                    Dim hasBack = installPath.IndexOf("\"c) >= 0
+                    If (hasForward AndAlso Not hasBack) OrElse installPath.StartsWith("/"c) Then
+                        sep = "/"c
+                    Else
+                        sep = "\"c
+                    End If
+            End Select
+
+            Dim normalizedRel As String
+            If sep = "/"c Then
+                normalizedRel = relPath.Replace("\"c, "/"c)
+            Else
+                normalizedRel = relPath.Replace("/"c, "\"c)
+            End If
+
+            Return installPath.TrimEnd("/"c, "\"c) & sep & normalizedRel.TrimStart("/"c, "\"c)
+        End Function
+
+        ''' <summary>
+        ''' Path.IsPathRooted respects only the manager's host OS
+        ''' rules, so a Linux-style "/opt/foo" path coming back from
+        ''' a node config is correctly recognised as rooted on a
+        ''' Windows manager (Path.IsPathRooted does treat '/' as
+        ''' rooted on Windows), but a Windows-style "C:\foo" coming
+        ''' from a Linux-hosted manager would NOT be — we don't ship
+        ''' a Linux manager today, but the symmetry costs a line and
+        ''' future-proofs the check. Returns True for any path that
+        ''' starts with '/', '\', or a drive letter followed by ':'.
+        ''' </summary>
+        Private Shared Function IsRootedOnEitherPlatform(path As String) As Boolean
+            If String.IsNullOrEmpty(path) Then Return False
+            If path(0) = "/"c OrElse path(0) = "\"c Then Return True
+            If path.Length >= 2 AndAlso path(1) = ":"c AndAlso
+               ((path(0) >= "a"c AndAlso path(0) <= "z"c) OrElse
+                (path(0) >= "A"c AndAlso path(0) <= "Z"c)) Then
+                Return True
+            End If
+            Return False
+        End Function
+
+        ''' <summary>
         ''' Reads a positive integer from a custom-fields dict, falling
         ''' back to defaultValue if missing, empty, non-numeric, or
         ''' non-positive. Used for the per-instance knobs exposed via
@@ -1519,6 +1773,169 @@ Namespace GSM.Manager.Core
                 Next
                 Return merged
             End Using
+        End Function
+
+        ''' <summary>
+        ''' True when the manager has a recent connection-failure
+        ''' record for this node (i.e. an entry in
+        ''' _nodeFailureStates that hasn't been cleared by a
+        ''' subsequent successful poll). Returns False when the
+        ''' node is currently reachable, has never been probed,
+        ''' or recovered since the last failure was logged.
+        '''
+        ''' Exposed for the MainForm tree-icon refresh — lets the
+        ''' UI render a red status badge for unreachable nodes
+        ''' without taking on its own polling responsibility. The
+        ''' background poll loop already does the work, this is
+        ''' just an authoritative readout.
+        ''' </summary>
+        Public Function IsNodeKnownUnreachable(nodeId As String) As Boolean
+            If String.IsNullOrEmpty(nodeId) Then Return False
+            Return _nodeFailureStates.ContainsKey(nodeId)
+        End Function
+
+        ' ============================================================
+        '  Connection-failure log dedup
+        ' ============================================================
+
+        ''' <summary>
+        ''' Per-node failure state used by the connection-failure
+        ''' log dedup. See _nodeFailureStates for the rationale.
+        ''' Mutable fields are touched only inside
+        ''' ConcurrentDictionary.AddOrUpdate factory closures, which
+        ''' the dictionary serialises per-key — so no SyncLock is
+        ''' needed here.
+        ''' </summary>
+        Private Class NodeFailureState
+            Public Property FirstFailureUtc As DateTime
+            Public Property LastLoggedUtc As DateTime
+            Public Property SuppressedSinceLog As Integer = 0
+        End Class
+
+        ''' <summary>
+        ''' True when an exception represents a connection-level
+        ''' failure (node unreachable, network down, request
+        ''' timeout) rather than an API-level one (HTTP 500, 404,
+        ''' deserialisation error, etc.). Connection failures are
+        ''' suppression-eligible because a downed node produces
+        ''' the same error every poll; API failures usually
+        ''' represent something an operator wants to see every
+        ''' time it happens.
+        '''
+        ''' HttpClient timeouts surface as TaskCanceledException
+        ''' (a subclass of OperationCanceledException) anywhere in
+        ''' the inner-exception chain. NodeHttpClient's
+        ''' WrapException doesn't recognise those as
+        ''' HttpRequestException, so they end up wrapped in
+        ''' NodeApiException with the cancellation in the inner.
+        ''' Walking the chain catches that case.
+        ''' </summary>
+        Private Shared Function IsConnectionFailure(ex As Exception) As Boolean
+            If ex Is Nothing Then Return False
+            If TypeOf ex Is NodeConnectionException Then Return True
+            Dim cur = ex
+            While cur IsNot Nothing
+                If TypeOf cur Is OperationCanceledException Then Return True
+                cur = cur.InnerException
+            End While
+            Return False
+        End Function
+
+        ''' <summary>
+        ''' Called from RefreshInstanceStateAsync's success path.
+        ''' If a failure state was previously recorded for this
+        ''' node, emit a "back online" line summarising the
+        ''' downtime + suppressed-warning count and clear the
+        ''' state. No-op when the node has been up all along.
+        ''' </summary>
+        Private Sub NoteNodeReachable(instanceId As String)
+            Dim nodeId = GetNodeIdForInstance(instanceId)
+            If String.IsNullOrEmpty(nodeId) Then Return
+
+            Dim removed As NodeFailureState = Nothing
+            If _nodeFailureStates.TryRemove(nodeId, removed) Then
+                Dim downtime = DateTime.UtcNow - removed.FirstFailureUtc
+                _logger.LogInformation(
+                    "Node {NodeId} reachable again (was unreachable for {Downtime}; suppressed {Count} duplicate warning(s))",
+                    nodeId, FormatDowntime(downtime), removed.SuppressedSinceLog)
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Called from RefreshInstanceStateAsync's catch when the
+        ''' caught exception is a connection-level failure. Logs
+        ''' the first failure for a node at Warning, suppresses
+        ''' subsequent failures on the same node until either a
+        ''' success arrives (NoteNodeReachable clears the state)
+        ''' or the heartbeat interval lapses, at which point a
+        ''' fresh Warning summarising the suppressed count goes
+        ''' out so the log doesn't go silent on a long outage.
+        ''' </summary>
+        Private Sub NoteNodeNetworkFailure(instanceId As String, ex As Exception)
+            Dim nodeId = GetNodeIdForInstance(instanceId)
+            If String.IsNullOrEmpty(nodeId) Then
+                ' Can't dedupe without a node key — fall back to
+                ' the original behaviour rather than swallowing.
+                _logger.LogWarning(ex, "Failed to refresh state for {Id}", instanceId)
+                Return
+            End If
+
+            Dim nowUtc = DateTime.UtcNow
+            Dim shouldLog As Boolean = False
+            Dim isFirst As Boolean = False
+            Dim suppressedAtLog As Integer = 0
+
+            _nodeFailureStates.AddOrUpdate(nodeId,
+                Function(k)
+                    shouldLog = True
+                    isFirst = True
+                    Return New NodeFailureState With {
+                        .FirstFailureUtc = nowUtc,
+                        .LastLoggedUtc = nowUtc,
+                        .SuppressedSinceLog = 0
+                    }
+                End Function,
+                Function(k, existing)
+                    Dim sinceLog = (nowUtc - existing.LastLoggedUtc).TotalMinutes
+                    If sinceLog >= FailureHeartbeatMinutes Then
+                        shouldLog = True
+                        suppressedAtLog = existing.SuppressedSinceLog
+                        existing.LastLoggedUtc = nowUtc
+                        existing.SuppressedSinceLog = 0
+                    Else
+                        existing.SuppressedSinceLog += 1
+                    End If
+                    Return existing
+                End Function)
+
+            If shouldLog Then
+                If isFirst Then
+                    _logger.LogWarning(ex,
+                        "Node {NodeId} unreachable while polling instance {Id} (further failures from this node will be suppressed for up to {Window} minute(s))",
+                        nodeId, instanceId, FailureHeartbeatMinutes)
+                Else
+                    _logger.LogWarning(ex,
+                        "Node {NodeId} still unreachable (suppressed {Count} similar warning(s) over the last ~{Window} minute(s))",
+                        nodeId, suppressedAtLog, FailureHeartbeatMinutes)
+                End If
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Format a downtime span as "Xs", "Xm", "Xh Ym", or
+        ''' "Xd" for the back-online log line. Keeps it tight
+        ''' rather than the default TimeSpan.ToString format
+        ''' which renders as "00:00:42.1234567".
+        ''' </summary>
+        Private Shared Function FormatDowntime(span As TimeSpan) As String
+            If span.TotalSeconds < 60 Then Return $"{CInt(span.TotalSeconds)}s"
+            If span.TotalMinutes < 60 Then Return $"{CInt(Math.Floor(span.TotalMinutes))}m"
+            If span.TotalHours < 24 Then
+                Dim hrs = CInt(Math.Floor(span.TotalHours))
+                Dim mins = CInt(Math.Floor(span.TotalMinutes - hrs * 60))
+                Return $"{hrs}h {mins}m"
+            End If
+            Return $"{CInt(Math.Floor(span.TotalDays))}d"
         End Function
 
     End Class

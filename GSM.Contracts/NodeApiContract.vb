@@ -1,5 +1,6 @@
 Imports System
 Imports System.Collections.Generic
+Imports System.IO
 Imports System.Threading
 Imports System.Threading.Tasks
 Imports GSM.Plugin
@@ -172,6 +173,16 @@ Namespace GSM.Node.Api
         Public Property ContractsVersion As Integer
 
         Public Property Runtime As String
+
+        ''' <summary>
+        ''' OS platform of the node, populated from RuntimeInformation
+        ''' on the node side. NodePlatform.Unknown when the node is
+        ''' older than this contract addition. Carried here on the
+        ''' /api/version response so the Manager picks it up via the
+        ''' existing NodeHttpClient version cache without an extra
+        ''' round trip.
+        ''' </summary>
+        Public Property Platform As NodePlatform
     End Class
 
     Public Class NodeStatusResponse
@@ -200,6 +211,16 @@ Namespace GSM.Node.Api
         ''' manager falls back to a generic placeholder in that case.
         ''' </summary>
         Public Property ServersDirectory As String
+
+        ''' <summary>
+        ''' OS platform of the node. Same value as the matching
+        ''' field on NodeVersionResponse — mirrored here so callers
+        ''' that already hit /api/status (NodePanel, etc.) don't
+        ''' need to issue a second request just to learn the
+        ''' platform. Stays Unknown on nodes older than this
+        ''' contract addition.
+        ''' </summary>
+        Public Property Platform As NodePlatform
     End Class
 
     ' ============================================================
@@ -370,6 +391,66 @@ Namespace GSM.Node.Api
         Public Property ErrorMessage As String
         Public Property PendingPromptType As PromptType?
         Public Property PendingPromptMessage As String
+
+        ''' <summary>
+        ''' Current SteamCMD phase, parsed from the node's tail of
+        ''' SteamCMD's own content_log.txt during a SteamCMD step.
+        ''' Free-form string lifted verbatim from the log line
+        ''' ("downloading", "verifying update", "reconfiguring",
+        ''' "committing", etc.) — we don't normalize to an enum
+        ''' because SteamCMD's phase taxonomy isn't documented and
+        ''' shifts between versions, so a permissive pass-through
+        ''' is more robust than a translation table that goes
+        ''' stale. Nothing outside SteamCMD steps and before the
+        ''' first progress line is parsed.
+        '''
+        ''' This whole field group exists because SteamCMD's stdout
+        ''' is block-buffered when redirected (libc detects no tty
+        ''' and switches off line buffering), so capturing progress
+        ''' from stdout is hopeless without ConPTY. SteamCMD's own
+        ''' logging code in content_log.txt does flush per write,
+        ''' though, so we tail that file instead. See the tailer
+        ''' implementation in InstallRunner for the wire-up.
+        ''' </summary>
+        Public Property SteamCmdPhase As String
+
+        ''' <summary>
+        ''' Bytes downloaded so far for the current SteamCMD step,
+        ''' parsed from content_log.txt. Nothing when no progress
+        ''' line has been observed yet (and outside SteamCMD steps).
+        ''' </summary>
+        Public Property BytesDownloaded As Long?
+
+        ''' <summary>
+        ''' Total bytes for the current SteamCMD step. Nothing when
+        ''' no progress line has been observed yet, or when SteamCMD
+        ''' reports 0 — some early phases (reconfiguring, validating
+        ''' against an already-installed copy) emit progress lines
+        ''' with a 0/0 byte count, which we treat as "not meaningful".
+        ''' </summary>
+        Public Property BytesTotal As Long?
+
+        ''' <summary>
+        ''' For successful SteamCMD-based installs, the build id
+        ''' the node read out of appmanifest_{appid}.acf right
+        ''' after the SteamCMD step completed. Lets the manager
+        ''' stamp InstalledVersion in the same
+        ''' "steam:{appId}@{branch} build {N}" format that
+        ''' VersionCheckService produces from app_info_print, so
+        ''' the version-comparison flips to "up to date"
+        ''' immediately after an install — without the
+        ''' fire-and-forget upgrade pass that previously left a
+        ''' synthetic "steam:{appId} (timestamp)" placeholder
+        ''' visible for the 10-20s window it took to query
+        ''' upstream.
+        '''
+        ''' Empty/null when the install was a non-SteamCMD method
+        ''' (DirectDownload, Manual), when SteamCMD failed before
+        ''' producing the ACF, or when the node is older than this
+        ''' field. Old nodes silently drop the unknown property
+        ''' on the wire so adding this is backward-compatible.
+        ''' </summary>
+        Public Property InstalledBuildId As String
     End Class
 
     Public Class SteamCredential
@@ -503,6 +584,152 @@ Namespace GSM.Node.Api
         Public Property Text As String
     End Class
 
+    ' ============================================================
+    '  File operations — wire DTOs for /api/instances/{id}/files
+    '
+    '  Phase 4c-1: file CRUD endpoints scoped to an instance's
+    '  install directory, validated against a manager-supplied
+    '  whitelist of root subdirectories (saves/, config/, mods/,
+    '  etc.) sourced from the plugin's IManagedDirectoriesProvider.
+    '
+    '  Wire shape is intentionally minimal — relative path back
+    '  to the install root, byte size, last-write timestamp.
+    '  Listings are non-recursive and return files only;
+    '  subdirectories are not traversed.
+    ' ============================================================
+
+    ''' <summary>
+    ''' One file entry returned by the listing endpoint. Returned
+    ''' as a JSON array. Also returned individually as the success
+    ''' body of the upload endpoint so the manager can refresh its
+    ''' view without re-listing.
+    ''' </summary>
+    Public Class FileEntry
+        ''' <summary>
+        ''' Path relative to the installation root, using forward
+        ''' slashes regardless of node OS. e.g. "saves/foo.zip".
+        ''' Stable wire format the manager can compare verbatim
+        ''' against the relative paths it constructed when issuing
+        ''' the request.
+        ''' </summary>
+        Public Property RelativePath As String
+
+        Public Property SizeBytes As Long
+        Public Property ModifiedUtc As DateTime
+    End Class
+
+    ' ============================================================
+    '  Map generation — wire DTOs for /api/instances/{id}/generate-map
+    '
+    '  Phase 4c-3: lets a manager-side plugin (via
+    '  IFileGenerationProvider) ship a step list to the node for
+    '  one-off file-producing operations. Distinct from the
+    '  install runner because (a) we don't want a half-failed
+    '  generation to look like a half-failed install in the
+    '  operations history, (b) the step types we need are a
+    '  strict subset (WriteFileStep + RunProcessStep — no
+    '  SteamCMD, no archive extraction), and (c) the operation
+    '  runs against an existing install and so doesn't need
+    '  credential handling or the install lifecycle states.
+    '
+    '  NAMING NOTE: "map" / "GenerateMap" in the type names and
+    '  endpoint URL is historical. The original IMapGenerationProvider
+    '  was generalised to IFileGenerationProvider to support any
+    '  schema-driven file-producing operation (not just maps), but
+    '  the wire shape didn't change so we kept the old names to
+    '  avoid a breaking change for already-deployed nodes. Read
+    '  these as "GenerateFile" — the runner doesn't care what the
+    '  steps produce.
+    '
+    '  The endpoint runs synchronously — the request blocks until
+    '  the steps complete or the timeout fires. Map generation on
+    '  Factorio's default-sized worlds takes seconds; ribbon worlds
+    '  with extreme widths can take a couple of minutes. Manager
+    '  uses a long-timeout one-shot HttpClient (same pattern as
+    '  upload) to wait for the response.
+    ' ============================================================
+
+    Public Class GenerateMapRequest
+        ''' <summary>
+        ''' Absolute path to the install directory on the node
+        ''' (e.g. "C:\GameServers\factorio"). The node executes the
+        ''' steps relative to this directory. Travels in the
+        ''' request body rather than as a query parameter for
+        ''' parity with the rest of the body-typed contract.
+        ''' </summary>
+        Public Property InstallPath As String
+
+        ''' <summary>
+        ''' Steps the node executes against the install directory.
+        ''' Built by the plugin's IMapGenerationProvider on the
+        ''' Manager side; node treats them as opaque DTOs and runs
+        ''' them sequentially. The endpoint validates that every
+        ''' step is one of the supported types (currently
+        ''' WriteFileStep, RunProcessStep) and rejects the request
+        ''' with 400 BadRequest otherwise.
+        ''' </summary>
+        Public Property Steps As List(Of InstallStep)
+
+        ''' <summary>
+        ''' Hard timeout for the entire step sequence in seconds.
+        ''' 0 or negative falls back to the node's default (300s).
+        ''' Per-RunProcessStep TimeoutMs is honoured independently;
+        ''' this caps the whole sequence so a stuck step doesn't
+        ''' tie up the connection forever.
+        ''' </summary>
+        Public Property TimeoutSeconds As Integer = 0
+
+        ''' <summary>
+        ''' Optional: relative path of the file the steps are
+        ''' expected to produce (e.g. "saves/foo.zip"). The node
+        ''' echoes it back in the response on success and uses it
+        ''' to verify the file actually appeared on disk — a
+        ''' RunProcessStep that exits 0 but produced no output is
+        ''' detected as a failure here. Leave empty to skip the
+        ''' verification step.
+        ''' </summary>
+        Public Property ExpectedOutputRelativePath As String
+    End Class
+
+    Public Class GenerateMapResponse
+        ''' <summary>
+        ''' True when every step ran to completion and (if
+        ''' specified) ExpectedOutputRelativePath exists on disk
+        ''' afterwards.
+        ''' </summary>
+        Public Property Success As Boolean
+
+        ''' <summary>
+        ''' Echoed back from the request when present and the
+        ''' file exists on disk. Lets the Manager UI verify the
+        ''' new save is where it expects without a separate
+        ''' listing call.
+        ''' </summary>
+        Public Property OutputRelativePath As String
+
+        Public Property OutputSizeBytes As Long
+
+        ''' <summary>
+        ''' Index of the step that failed, or -1 on full success.
+        ''' </summary>
+        Public Property FailedStepIndex As Integer = -1
+
+        ''' <summary>
+        ''' Human-readable error — the failing step's exception
+        ''' message, or the engine's stderr for a RunProcessStep
+        ''' that exited non-zero. Empty on success.
+        ''' </summary>
+        Public Property ErrorMessage As String
+
+        ''' <summary>
+        ''' Captured stdout from any RunProcessStep that ran.
+        ''' Useful for surfacing engine-side details (the
+        ''' "generated map XYZ tiles" line on Factorio, etc.).
+        ''' Truncated to 16KB to bound the response size.
+        ''' </summary>
+        Public Property Output As String
+    End Class
+
     ''' <summary>
     ''' Interface for communicating with a GSM Node. The manager
     ''' resolves all game-specific logic via IGamePlugin, builds
@@ -593,6 +820,145 @@ Namespace GSM.Node.Api
                                       sinceUtc As DateTime?,
                                       limit As Integer,
                                       cancellation As CancellationToken) As Task(Of IReadOnlyList(Of ChatMessage))
+
+        ' ---- File operations (Phase 4c-1) ----
+        '
+        '  Scoped to a single installation directory and validated
+        '  against a manager-supplied whitelist of root subdirectories
+        '  (sourced from the plugin's IManagedDirectoriesProvider) and
+        '  optional extension allowlist. The wrapper does no validation
+        '  of its own — every parameter is forwarded verbatim to the
+        '  node, which is the security boundary.
+        '
+        '  installPath / path / allowedRoots / allowedExtensions are
+        '  identical to the wire-level query parameters. instanceId
+        '  is included on every call for symmetry with other endpoints
+        '  and to support per-instance tokens (D2 — {InstanceId}
+        '  reservation in ManagedDirectory.RelativePath); the node
+        '  routes file ops by installPath, not by running instance
+        '  state, so calls succeed regardless of whether the instance
+        '  is currently up.
+
+        ''' <summary>
+        ''' List files in a managed subdirectory of an instance's
+        ''' installation. Non-recursive — files only, no descent into
+        ''' nested directories. When allowedExtensions is non-empty,
+        ''' the node filters the returned list by extension.
+        ''' </summary>
+        Function ListFilesAsync(instanceId As String,
+                                 installPath As String,
+                                 path As String,
+                                 allowedRoots As IReadOnlyList(Of String),
+                                 allowedExtensions As IReadOnlyList(Of String),
+                                 cancellation As CancellationToken) As Task(Of IReadOnlyList(Of FileEntry))
+
+        ''' <summary>
+        ''' Stream a single file from the node into the supplied
+        ''' destination stream. The wrapper performs CopyToAsync; the
+        ''' caller owns the stream's lifetime. For small files (config
+        ''' JSON), a MemoryStream works. For large files (100MB+ saves),
+        ''' pass a FileStream straight to disk to keep memory flat.
+        ''' </summary>
+        Function DownloadFileAsync(instanceId As String,
+                                    installPath As String,
+                                    path As String,
+                                    allowedRoots As IReadOnlyList(Of String),
+                                    allowedExtensions As IReadOnlyList(Of String),
+                                    destination As Stream,
+                                    cancellation As CancellationToken) As Task
+
+        ''' <summary>
+        ''' Upload a file by streaming the supplied source stream as
+        ''' the request body. No buffering — a FileStream over a 100MB
+        ''' save uploads without growing the manager's working set.
+        ''' Returns the FileEntry the node persisted, suitable for
+        ''' refreshing a listing without a follow-up call.
+        '''
+        ''' overwrite=False causes the node to reject when the
+        ''' destination already exists; the wrapper surfaces this as
+        ''' NodeApiException (the inner HttpRequestException carries
+        ''' StatusCode = Conflict for callers that want to disambiguate).
+        ''' </summary>
+        Function UploadFileAsync(instanceId As String,
+                                  installPath As String,
+                                  path As String,
+                                  allowedRoots As IReadOnlyList(Of String),
+                                  allowedExtensions As IReadOnlyList(Of String),
+                                  source As Stream,
+                                  overwrite As Boolean,
+                                  cancellation As CancellationToken) As Task(Of FileEntry)
+
+        ''' <summary>
+        ''' Delete a single file. Idempotent — returns False without
+        ''' raising when the file is already gone, which lets the
+        ''' UI's optimistic "delete then refresh" flow not fight a
+        ''' concurrent deletion from another manager session.
+        ''' </summary>
+        Function DeleteFileAsync(instanceId As String,
+                                  installPath As String,
+                                  path As String,
+                                  allowedRoots As IReadOnlyList(Of String),
+                                  allowedExtensions As IReadOnlyList(Of String),
+                                  cancellation As CancellationToken) As Task(Of Boolean)
+
+        ''' <summary>
+        ''' Atomically rename (or move within the install) a file.
+        ''' Both `path` and `newPath` are validated server-side
+        ''' against allowedRoots and allowedExtensions — a rename
+        ''' across managed roots is permitted as long as both
+        ''' endpoints satisfy the whitelist (UIs that constrain a
+        ''' panel to one directory simply send only that root).
+        ''' Returns the FileEntry of the renamed file under its new
+        ''' name so the caller can update its listing without a
+        ''' follow-up call. overwrite=False rejects when newPath
+        ''' already exists; the wrapper surfaces this as
+        ''' NodeApiException whose inner HttpRequestException
+        ''' carries StatusCode = Conflict for callers that want
+        ''' to disambiguate.
+        ''' </summary>
+        Function RenameFileAsync(instanceId As String,
+                                  installPath As String,
+                                  path As String,
+                                  newPath As String,
+                                  allowedRoots As IReadOnlyList(Of String),
+                                  allowedExtensions As IReadOnlyList(Of String),
+                                  overwrite As Boolean,
+                                  cancellation As CancellationToken) As Task(Of FileEntry)
+
+        ''' <summary>
+        ''' Copy a file within the install. Source is preserved;
+        ''' a new file appears under newPath. Useful for backup-
+        ''' before-modify workflows (e.g. duplicating a save before
+        ''' loading it on a server). Validation, allowedRoots, and
+        ''' allowedExtensions semantics match RenameFileAsync. The
+        ''' source and destination must differ — the node returns
+        ''' 400 BadRequest for same-path requests rather than
+        ''' silently no-op'ing, since copy-onto-self is unambiguously
+        ''' a caller bug.
+        ''' </summary>
+        Function CopyFileAsync(instanceId As String,
+                                installPath As String,
+                                path As String,
+                                newPath As String,
+                                allowedRoots As IReadOnlyList(Of String),
+                                allowedExtensions As IReadOnlyList(Of String),
+                                overwrite As Boolean,
+                                cancellation As CancellationToken) As Task(Of FileEntry)
+
+        ' ---- Map generation (Phase 4c-3) ----
+
+        ''' <summary>
+        ''' Run a plugin-supplied step list against an instance's
+        ''' install directory to produce a new map/save. Synchronous:
+        ''' the call doesn't return until every step completes or
+        ''' the timeout fires. Implementations should use a
+        ''' long-timeout HttpClient (Timeout.InfiniteTimeSpan with a
+        ''' caller-supplied CancellationToken) since map generation
+        ''' can run for minutes on large worlds.
+        ''' </summary>
+        Function GenerateMapAsync(instanceId As String,
+                                   request As GenerateMapRequest,
+                                   cancellation As CancellationToken) As Task(Of GenerateMapResponse)
 
         ' ---- Interactive prompts ----
         Function RespondToPromptAsync(response As PromptResponse, cancellation As CancellationToken) As Task(Of Boolean)

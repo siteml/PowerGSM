@@ -181,6 +181,7 @@ Namespace GSM.Node
             builder.Services.AddSingleton(Of RingBufferStore)()
             builder.Services.AddSingleton(Of RconClientManager)()
             builder.Services.AddSingleton(Of InstallRunner)()
+            builder.Services.AddSingleton(Of MapGenerationRunner)()
 
             ' ---- Security services ----
             builder.Services.AddSingleton(Of AuthFailureTracker)()
@@ -204,6 +205,8 @@ Namespace GSM.Node
             Endpoints.SystemEndpoints.Map(app)
             Endpoints.InstanceEndpoints.Map(app)
             Endpoints.InstallEndpoints.Map(app)
+            Endpoints.FileEndpoints.Map(app)
+            Endpoints.MapGenEndpoints.Map(app)
 
             ' Re-register our CTRL_C handler ONCE the host has fully
             ' started — by then ASP.NET Core's ConsoleLifetime has
@@ -366,9 +369,28 @@ Namespace GSM.Node
             ' Resolve to absolute against the binary's directory rather
             ' than the process working directory — services and shortcuts
             ' often start with a different cwd than where the exe lives,
-            ' and the user expects "./servers" to mean "next to the node
-            ' binary". Path.GetFullPath uses Environment.CurrentDirectory
-            ' which would give the wrong answer there.
+            ' and the user expects "./servers" or "./data" to mean "next
+            ' to the node binary". Path.GetFullPath uses
+            ' Environment.CurrentDirectory which would give the wrong
+            ' answer there.
+            '
+            ' GSM.NodeSetup writes absolute paths into nodesettings.json
+            ' by default (see NodeSection.DefaultDataDirectory), so this
+            ' branch is mostly a fallback for hand-written configs and
+            ' upgrades from older versions where the defaults were
+            ' relative.
+            Try
+                If Not Path.IsPathRooted(DataDirectory) Then
+                    DataDirectory = Path.GetFullPath(DataDirectory, AppContext.BaseDirectory)
+                Else
+                    DataDirectory = Path.GetFullPath(DataDirectory)
+                End If
+            Catch
+                ' If GetFullPath throws on a malformed value, leave the
+                ' raw setting untouched; NodeDatabase will fail loudly
+                ' on the bad path which is better than silently writing
+                ' the wrong location.
+            End Try
             Try
                 If Not Path.IsPathRooted(ServersDirectory) Then
                     ServersDirectory = Path.GetFullPath(ServersDirectory, AppContext.BaseDirectory)
@@ -438,6 +460,32 @@ Namespace GSM.Node
                             Success INTEGER,
                             StepCount INTEGER,
                             ErrorMessage TEXT
+                        );
+
+                        -- Per-instance, per-log-file tailer cursor. Lets the
+                        -- node skip log-history replay across instance restarts:
+                        -- Factorio appends to the same file across runs and
+                        -- without this, the tailer re-reads the entire file
+                        -- on every start, re-firing chat/join/leave events
+                        -- and producing duplicate rows in chat_messages.
+                        --
+                        -- Fingerprint is SHA-256 of the file's first 256 bytes,
+                        -- used to discriminate ''same file, more bytes appended''
+                        -- (resume from saved position) from ''file replaced at
+                        -- same path'' (e.g. LO archives the old log and starts
+                        -- a new one; resume isn't safe because the saved byte
+                        -- offset means nothing in the new content).
+                        --
+                        -- Composite primary key on (InstanceId, LogPath) since
+                        -- one instance may tail multiple files (Factorio tails
+                        -- both factorio-current.log and factorio-console.log).
+                        CREATE TABLE IF NOT EXISTS TailerPositions (
+                            InstanceId TEXT NOT NULL,
+                            LogPath TEXT NOT NULL,
+                            BytePosition INTEGER NOT NULL,
+                            Fingerprint TEXT NOT NULL,
+                            UpdatedAtUtc TEXT NOT NULL,
+                            PRIMARY KEY (InstanceId, LogPath)
                         );
 
                         CREATE INDEX IF NOT EXISTS IX_CrashEvents_Instance
@@ -567,6 +615,82 @@ Namespace GSM.Node
             End Using
         End Sub
 
+        ' ============================================================
+        '  Tailer position persistence
+        '
+        '  See the comment on the TailerPositions table in
+        '  EnsureCreated for the why. The shape here is deliberately
+        '  small — two reads (Get on tailer first-open, Save after
+        '  every successful read iteration) and no batching. SQLite
+        '  writes are sub-millisecond on local disks, and persistence
+        '  on every iteration is what lets a node crash mid-tail lose
+        '  at most one poll cycle's worth of position drift.
+        ' ============================================================
+
+        ''' <summary>
+        ''' Returns the saved tailer cursor for (instanceId, logPath),
+        ''' or Nothing when no row exists. Caller compares the saved
+        ''' Fingerprint against a fresh hash of the current file's
+        ''' first bytes to decide whether the position is still valid
+        ''' for the file present at that path.
+        ''' </summary>
+        Public Function GetTailerPosition(instanceId As String,
+                                          logPath As String) As TailerPositionRow
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "SELECT BytePosition, Fingerprint
+                        FROM TailerPositions
+                        WHERE InstanceId = @id AND LogPath = @path"
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    cmd.Parameters.AddWithValue("@path", logPath)
+                    Using reader = cmd.ExecuteReader()
+                        If Not reader.Read() Then Return Nothing
+                        Return New TailerPositionRow With {
+                            .BytePosition = reader.GetInt64(0),
+                            .Fingerprint = reader.GetString(1)
+                        }
+                    End Using
+                End Using
+            End Using
+        End Function
+
+        ''' <summary>
+        ''' Upserts the tailer cursor for (instanceId, logPath).
+        ''' Called after every successful read iteration in the
+        ''' tailer loop — cheap on local SQLite, and persistence
+        ''' density determines how much progress is lost if the node
+        ''' is killed mid-tail. (Worst case: ~500ms of unread tail
+        ''' that we re-read on next start, which is harmless since
+        ''' the position cursor catches up immediately.)
+        ''' </summary>
+        Public Sub SaveTailerPosition(instanceId As String,
+                                       logPath As String,
+                                       bytePosition As Long,
+                                       fingerprint As String)
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "INSERT OR REPLACE INTO TailerPositions
+                        (InstanceId, LogPath, BytePosition, Fingerprint, UpdatedAtUtc)
+                        VALUES (@id, @path, @pos, @fp, @ts)"
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    cmd.Parameters.AddWithValue("@path", logPath)
+                    cmd.Parameters.AddWithValue("@pos", bytePosition)
+                    cmd.Parameters.AddWithValue("@fp", fingerprint)
+                    cmd.Parameters.AddWithValue("@ts", DateTime.UtcNow.ToString("o"))
+                    cmd.ExecuteNonQuery()
+                End Using
+            End Using
+        End Sub
+
+    End Class
+
+    ''' <summary>
+    ''' Single row from the TailerPositions table. Returned by
+    ''' NodeDatabase.GetTailerPosition; Nothing means no saved cursor.
+    ''' </summary>
+    Public Class TailerPositionRow
+        Public Property BytePosition As Long
+        Public Property Fingerprint As String
     End Class
 
 End Namespace

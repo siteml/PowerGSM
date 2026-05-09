@@ -64,6 +64,7 @@ Namespace GSM.Manager.UI
         Private _configPanel As Panel
         Private _saveButton As Button
         Private _cancelButton As Button
+        Private _steamCredLabel As Label
         Private _steamCredComboBox As ComboBox
         Private _runRedistCheckBox As CheckBox
 
@@ -106,6 +107,20 @@ Namespace GSM.Manager.UI
         ' If the user changes node selection mid-fetch, we abandon
         ' the older request rather than letting two responses race.
         Private _statusFetchCts As CancellationTokenSource
+
+        ''' <summary>
+        ''' The ID of the newly-created installation, populated by
+        ''' OnSave on the success path immediately before closing
+        ''' with DialogResult.OK. Empty string before save and on
+        ''' the cancel path.
+        '''
+        ''' MainForm.OnNewInstallation reads this after ShowDialog
+        ''' returns OK to know which installation to select in the
+        ''' tree and run InstallAsync against. The form itself
+        ''' doesn't run the install — that's MainForm's job, so the
+        ''' InstallationPanel can host the progress UI.
+        ''' </summary>
+        Public Property NewInstallationId As String = ""
 
         ''' <summary>
         ''' Construct the form, optionally with a pre-selected node.
@@ -169,6 +184,16 @@ Namespace GSM.Manager.UI
             _methodComboBox.Location = New Point(150, y)
             _methodComboBox.Size = New Size(200, 24)
             _methodComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+            ' When the method changes between SteamCmd and DirectDownload
+            ' the Steam-credential row should appear/disappear — having
+            ' it sit there asking which account to log in as for a
+            ' direct-download install is just confusing. The handler
+            ' is wired now and fires on every method-combo change
+            ' (including the synthetic SelectedIndex=0 assignment from
+            ' OnGameChanged), which guarantees the visibility state
+            ' tracks the active method without us having to invoke
+            ' the toggle from multiple places.
+            AddHandler _methodComboBox.SelectedIndexChanged, AddressOf OnMethodChanged
             Me.Controls.Add(_methodComboBox)
             y += 35
 
@@ -197,8 +222,12 @@ Namespace GSM.Manager.UI
             Me.Controls.Add(_pathTextBox)
             y += 35
 
-            ' Steam credentials
-            AddLabel("Steam Account:", 20, y)
+            ' Steam credentials. Hidden for non-Steam install
+            ' methods via OnMethodChanged — a direct-download
+            ' install never logs in to Steam, so the dropdown
+            ' would be misleading. Capture the label so we can
+            ' toggle its visibility alongside the combo.
+            _steamCredLabel = AddLabel("Steam Account:", 20, y)
             _steamCredComboBox = New ComboBox()
             _steamCredComboBox.Location = New Point(150, y)
             _steamCredComboBox.Size = New Size(300, 24)
@@ -407,6 +436,40 @@ Namespace GSM.Manager.UI
             Task.Run(Async Function()
                          Await RefreshSuggestedInstallPathAsync()
                      End Function)
+        End Sub
+
+        ''' <summary>
+        ''' Toggle the Steam-credential row's visibility based on
+        ''' the currently-selected install method. SteamCmd installs
+        ''' use the chosen credential to authenticate with Steam;
+        ''' every other method (DirectDownload, Manual) doesn't
+        ''' touch Steam at all, and presenting an account picker for
+        ''' those is just clutter that suggests the choice matters.
+        '''
+        ''' OnSave still runs the same code path either way and just
+        ''' sees an empty selectedCredId when the row is hidden —
+        ''' the dropdown is force-reset to its "(Anonymous)" entry
+        ''' here so a stale selection from a previous SteamCmd-method
+        ''' state can't leak into a DirectDownload save.
+        ''' </summary>
+        Private Sub OnMethodChanged(sender As Object, e As EventArgs)
+            Dim isSteam = _methodComboBox.SelectedItem IsNot Nothing AndAlso
+                          String.Equals(_methodComboBox.SelectedItem.ToString(),
+                                          InstallMethod.SteamCmd.ToString(),
+                                          StringComparison.OrdinalIgnoreCase)
+            If _steamCredLabel IsNot Nothing Then _steamCredLabel.Visible = isSteam
+            If _steamCredComboBox IsNot Nothing Then
+                _steamCredComboBox.Visible = isSteam
+                If Not isSteam AndAlso _steamCredComboBox.Items.Count > 0 Then
+                    ' Index 0 is always the "(Anonymous — no login)"
+                    ' entry, mapped to credential id "" in _steamCredIds.
+                    ' Forcing it here means OnSave's lookup will pick
+                    ' an empty cred id even if the user had selected a
+                    ' real Steam account before flipping to direct
+                    ' download.
+                    _steamCredComboBox.SelectedIndex = 0
+                End If
+            End If
         End Sub
 
         ''' <summary>
@@ -825,52 +888,16 @@ Namespace GSM.Manager.UI
                 db.SaveChanges()
             End Using
 
-            ' Ask whether to run the install now
-            Dim runNow = MessageBox.Show(
-                "Installation record created. Run the install on the node now?" & vbCrLf & vbCrLf &
-                "This will download the game server files to the specified path.",
-                "Run Install?", MessageBoxButtons.YesNo, MessageBoxIcon.Question)
-
-            If runNow = DialogResult.Yes Then
-                ' Fire install in background
-                Dim installMgr = ManagerProgram.Services.GetService(Of InstallationManager)()
-                If installMgr IsNot Nothing Then
-                    _saveButton.Enabled = False
-                    _saveButton.Text = "Installing..."
-
-                    Task.Run(Async Function()
-                                 Try
-                                     Dim ok = Await installMgr.InstallAsync(
-                                         installId, selectedCredId,
-                                         promptHandler:=AddressOf HandleSteamPrompt)
-                                     Me.BeginInvoke(Sub()
-                                                        If ok Then
-                                                            MessageBox.Show("Installation completed successfully!",
-                                                                          "Install Complete", MessageBoxButtons.OK,
-                                                                          MessageBoxIcon.Information)
-                                                        Else
-                                                            MessageBox.Show("Installation failed. Check the node logs for details.",
-                                                                          "Install Failed", MessageBoxButtons.OK,
-                                                                          MessageBoxIcon.Warning)
-                                                        End If
-                                                        Me.DialogResult = DialogResult.OK
-                                                        Me.Close()
-                                                    End Sub)
-                                 Catch ex As Exception
-                                     Me.BeginInvoke(Sub()
-                                                        MessageBox.Show($"Installation error: {ex.Message}" & vbCrLf & vbCrLf &
-                                                                       $"Details: {ex.ToString()}",
-                                                                       "Install Error", MessageBoxButtons.OK,
-                                                                       MessageBoxIcon.Error)
-                                                        _saveButton.Enabled = True
-                                                        _saveButton.Text = "Create"
-                                                    End Sub)
-                                 End Try
-                             End Function)
-                    Return ' Don't close yet — wait for install
-                End If
-            End If
-
+            ' Hand off to MainForm. The InstallationPanel is the
+            ' canonical UI for in-flight installs now —
+            ' MainForm.OnNewInstallation reads NewInstallationId
+            ' from this form, refreshes the tree, selects the new
+            ' installation (which surfaces its InstallationPanel),
+            ' and fires InstallAsync with userInitiated:=True so the
+            ' panel auto-selects its Progress tab. The wizard's job
+            ' ends with persisting the entity — it doesn't run the
+            ' install or display progress itself.
+            Me.NewInstallationId = installId
             Me.DialogResult = DialogResult.OK
             Me.Close()
         End Sub
@@ -882,22 +909,6 @@ Namespace GSM.Manager.UI
             lbl.Location = New Point(x, y + 3)
             Me.Controls.Add(lbl)
             Return lbl
-        End Function
-
-        Private Function HandleSteamPrompt(promptType As PromptType,
-                                            message As String) As Task(Of String)
-            ' Marshal to UI thread to show input dialog
-            Dim result As String = Nothing
-            Me.Invoke(Sub()
-                          Dim title = If(promptType = PromptType.TwoFactorCode,
-                              "Steam Mobile Authenticator", "Steam Guard Code")
-                          Dim prompt = If(String.IsNullOrEmpty(message),
-                              "Enter the code from your email or authenticator app:",
-                              message)
-                          result = Microsoft.VisualBasic.Interaction.InputBox(
-                              prompt, title, "")
-                      End Sub)
-            Return Task.FromResult(result)
         End Function
 
     End Class

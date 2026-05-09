@@ -94,6 +94,15 @@ Namespace GSM.Manager
             serviceCollection.AddSingleton(Of NotificationEmitter)()
             serviceCollection.AddSingleton(Of DiscordWebhookPlugin)()
 
+            ' Phase 5d-1 — Discord bot plugin. Coexists with the
+            ' webhook plugin (both are independent INotificationPlugin
+            ' implementations); the bot maintains persistent control
+            ' panels in addition to acting as a transport for outbound
+            ' notifications (5d-4). Registered as singleton so the
+            ' DiscordBotForm can resolve it for Test Connection +
+            ' panel reload.
+            serviceCollection.AddSingleton(Of DiscordBotPlugin)()
+
             ' ---- Phase 4 Core services ----
             serviceCollection.AddSingleton(Of NodeHttpClientFactory)()
             serviceCollection.AddSingleton(Of CredentialService)()
@@ -167,24 +176,45 @@ Namespace GSM.Manager
             ' anything the MainForm triggers on Shown) would be emitted
             ' before the plugin knows which destinations are configured
             ' and would silently drop.
+            '
+            ' RegisterPluginAsync handles InitialiseAsync internally:
+            ' it loads the plugin's config row from the DB and passes
+            ' the NotificationService itself as the IRemoteCommandHandler.
+            ' (Webhooks ignore the handler since they're write-only;
+            ' the bot uses it for the Manage flow's command dispatch.)
+            ' Earlier startup code called InitialiseAsync explicitly
+            ' before RegisterPluginAsync, which double-initialised
+            ' both plugins — visible as duplicate "config reloaded"
+            ' lines in the webhook plugin and a connect/disconnect/
+            ' reconnect cycle in the bot. The pre-init also passed an
+            ' empty config dict, so the first pass loaded zero
+            ' destinations — useless work that the second pass had to
+            ' redo with the real config.
             Dim discordPlugin = Services.GetRequiredService(Of DiscordWebhookPlugin)()
             Dim notifications = Services.GetRequiredService(Of NotificationService)()
             Dim startupLogger = Services.
                 GetRequiredService(Of ILoggerFactory)().
                 CreateLogger("Startup")
             Try
-                ' Webhooks are write-only — no inbound commands from
-                ' Discord, so pass Nothing for the IRemoteCommandHandler.
-                discordPlugin.InitialiseAsync(
-                    New Dictionary(Of String, String)(),
-                    Nothing,
-                    CancellationToken.None).GetAwaiter().GetResult()
                 notifications.RegisterPluginAsync(
                     discordPlugin, CancellationToken.None).
                     GetAwaiter().GetResult()
             Catch ex As Exception
                 ' Never fatal — Manager runs with or without Discord.
                 startupLogger.LogWarning(ex, "Failed to register Discord plugin at startup")
+            End Try
+
+            ' Phase 5d-1 — register the Discord bot plugin. Same
+            ' pattern as the webhook plugin: best-effort, a failure
+            ' (bad token, Discord unreachable, missing config) logs
+            ' a warning and leaves the Manager running.
+            Dim discordBotPlugin = Services.GetRequiredService(Of DiscordBotPlugin)()
+            Try
+                notifications.RegisterPluginAsync(
+                    discordBotPlugin, CancellationToken.None).
+                    GetAwaiter().GetResult()
+            Catch ex As Exception
+                startupLogger.LogWarning(ex, "Failed to register Discord bot plugin at startup")
             End Try
 
             ' After services built, before Application.Run(mainForm)
@@ -282,6 +312,20 @@ Namespace GSM.Manager
             Try
                 If mgr IsNot Nothing Then
                     mgr.StopBackgroundPollingAsync().GetAwaiter().GetResult()
+                End If
+            Catch
+            End Try
+
+            ' Phase 5d-1 — disconnect the Discord bot. Done last
+            ' so any state-change notifications fired during other
+            ' shutdown steps still get a chance to refresh panels
+            ' before the gateway closes. Best-effort; never blocks
+            ' process exit.
+            Try
+                Dim botShutdown = Services.GetService(Of DiscordBotPlugin)()
+                If botShutdown IsNot Nothing Then
+                    botShutdown.ShutdownAsync(CancellationToken.None).
+                        GetAwaiter().GetResult()
                 End If
             Catch
             End Try

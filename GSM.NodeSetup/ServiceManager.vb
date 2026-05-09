@@ -54,6 +54,38 @@ Public Module ServiceManager
         Return File.Exists(GetNodeExecutablePath())
     End Function
 
+    ''' <summary>
+    ''' Ensures the GSM.Node binary has +x on Linux. Files copied via
+    ''' SCP/SFTP from a Windows publish typically arrive at mode 0644,
+    ''' which prevents systemd (and the user) from running them. This
+    ''' setup tool is already running so it has +x on itself; from here
+    ''' we can fix its sibling Node binary in one shot.
+    '''
+    ''' Uses File.SetUnixFileMode (.NET 7+). No-op on Windows. Best
+    ''' effort — a chmod failure isn't fatal because the operator can
+    ''' still chmod manually, and systemd will surface a clear error
+    ''' on enable if the bit didn't get set.
+    ''' </summary>
+    Public Sub EnsureNodeExecutable()
+        If ConfigHelpers.RunningOnWindows() Then Return
+
+        Dim nodePath = GetNodeExecutablePath()
+        If Not File.Exists(nodePath) Then Return
+
+        Try
+            Dim currentMode = File.GetUnixFileMode(nodePath)
+            Dim newMode = currentMode Or
+                          UnixFileMode.UserExecute Or
+                          UnixFileMode.GroupExecute Or
+                          UnixFileMode.OtherExecute
+            If currentMode <> newMode Then
+                File.SetUnixFileMode(nodePath, newMode)
+            End If
+        Catch
+            ' Best effort; the operator can still chmod manually.
+        End Try
+    End Sub
+
     ' --------------------------------------------------------
     ' Windows path
     ' --------------------------------------------------------
@@ -271,12 +303,24 @@ Public Module ServiceManager
     ''' <summary>
     ''' Returns the three-line copy/enable/start instruction block users
     ''' must run as root after WriteSystemdUnit.
+    '''
+    ''' Uses `install -m 644` rather than `cp` for two reasons:
+    '''   1. Many distros alias `cp` to `cp -i` for safety, which
+    '''      prompts on overwrite and silently waits for stdin if a
+    '''      previous unit file already exists at the destination —
+    '''      this looked like the command "freezing" the terminal.
+    '''   2. `install` is the standard systemd-packaging convention
+    '''      and sets ownership/permissions explicitly (mode 644 is
+    '''      what systemctl expects for unit files).
+    ''' Paths under our control don't need quoting (no spaces in
+    ''' AppContext.BaseDirectory in any sane Linux deployment), so we
+    ''' emit them unquoted to keep the command paste-friendly.
     ''' </summary>
     Public Function GetSystemdInstallInstructions(unitPath As String) As String
         Dim sb As New StringBuilder()
         sb.AppendLine("To install the systemd unit, run as root:")
         sb.AppendLine()
-        sb.AppendLine("  sudo cp """ & unitPath & """ /etc/systemd/system/gsmnode.service")
+        sb.AppendLine("  sudo install -m 644 " & unitPath & " /etc/systemd/system/gsmnode.service")
         sb.AppendLine("  sudo systemctl daemon-reload")
         sb.AppendLine("  sudo systemctl enable --now gsmnode")
         sb.AppendLine()
@@ -284,6 +328,261 @@ Public Module ServiceManager
         sb.AppendLine("  systemctl status gsmnode")
         sb.AppendLine("  journalctl -u gsmnode -f")
         Return sb.ToString()
+    End Function
+
+    ''' <summary>
+    ''' Performs the systemd install directly when the setup tool is
+    ''' running as root. Replaces the manual three-command sequence
+    ''' from GetSystemdInstallInstructions when we have the privileges
+    ''' to do it ourselves. Returns the combined output of all three
+    ''' commands (install, daemon-reload, enable --now) so the caller
+    ''' can show the operator what happened.
+    '''
+    ''' On any failure, returns Success=False and Output containing
+    ''' the failing command's stderr. The unit file at <unitPath> is
+    ''' left in place so the operator can retry manually.
+    ''' </summary>
+    Public Function InstallSystemdServiceAsRoot(unitPath As String) As ServiceResult
+        If ConfigHelpers.RunningOnWindows() Then
+            Return New ServiceResult With {.Success = False, .Message = "Not on Linux."}
+        End If
+        If Not ConfigHelpers.RunningElevated() Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = "Root privileges are required to install a systemd service."
+            }
+        End If
+        If Not File.Exists(unitPath) Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = "Unit file not found at: " & unitPath
+            }
+        End If
+
+        Dim combinedOutput As New StringBuilder()
+
+        ' Step 1: install -m 644 <unitPath> /etc/systemd/system/gsmnode.service
+        Dim installOut As String = Nothing
+        If Not RunCommand("install",
+                          {"-m", "644", unitPath, "/etc/systemd/system/gsmnode.service"},
+                          installOut) Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = "Failed to copy unit file to /etc/systemd/system.",
+                .Output = installOut
+            }
+        End If
+        combinedOutput.AppendLine("Installed unit file to /etc/systemd/system/gsmnode.service")
+
+        ' Step 2: systemctl daemon-reload
+        Dim reloadOut As String = Nothing
+        If Not RunCommand("systemctl", {"daemon-reload"}, reloadOut) Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = "systemctl daemon-reload failed.",
+                .Output = combinedOutput.ToString() & vbLf & reloadOut
+            }
+        End If
+        combinedOutput.AppendLine("systemd daemon reloaded")
+
+        ' Step 3: systemctl enable gsmnode
+        '
+        ' Just enable, no --now. The original code used `enable --now`,
+        ' which starts the unit only if it's not already running — so a
+        ' re-run that wanted to apply a new User= or other unit-file change
+        ' would silently leave the old process going with the old config.
+        ' We split enable from start, then unconditionally `restart` below
+        ' so config changes always take effect.
+        Dim enableOut As String = Nothing
+        If Not RunCommand("systemctl", {"enable", "gsmnode"}, enableOut) Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = "systemctl enable failed. Run `systemctl status gsmnode` for details.",
+                .Output = combinedOutput.ToString() & vbLf & enableOut
+            }
+        End If
+        combinedOutput.AppendLine("Service enabled")
+
+        ' Step 4: systemctl restart gsmnode
+        '
+        ' restart works as both "start when stopped" and "stop+start when
+        ' running", so the same command path covers a fresh install and a
+        ' config-update re-run. Important: `daemon-reload` above only
+        ' refreshes systemd's in-memory unit graph; the running process
+        ' itself doesn't pick up the new ExecStart / User= / etc. without
+        ' an explicit restart.
+        Dim restartOut As String = Nothing
+        If Not RunCommand("systemctl", {"restart", "gsmnode"}, restartOut) Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = "systemctl restart failed. Run `systemctl status gsmnode` for details.",
+                .Output = combinedOutput.ToString() & vbLf & restartOut
+            }
+        End If
+        combinedOutput.AppendLine("Service started")
+
+        Return New ServiceResult With {
+            .Success = True,
+            .Message = "Service 'gsmnode' installed, enabled, and started.",
+            .Output = combinedOutput.ToString()
+        }
+    End Function
+
+    ''' <summary>
+    ''' Returns True if a Linux user account with the given name exists.
+    ''' Uses `getent passwd` which works without root and consults all
+    ''' configured NSS sources (local /etc/passwd, LDAP, etc.) rather
+    ''' than just reading the file directly. Empty/whitespace names
+    ''' return False without invoking getent.
+    ''' </summary>
+    Public Function CheckLinuxUserExists(userName As String) As Boolean
+        If ConfigHelpers.RunningOnWindows() Then Return False
+        If String.IsNullOrWhiteSpace(userName) Then Return False
+        Dim output As String = Nothing
+        Return RunCommand("getent", {"passwd", userName.Trim()}, output)
+    End Function
+
+    ''' <summary>
+    ''' Creates a system account suitable for running the node service:
+    '''   - --system          UID below 1000 (service-account range)
+    '''   - --create-home     /home/&lt;name&gt; for steam_appid.txt,
+    '''                       ~/.steam/sdk64/steamclient.so symlinks,
+    '''                       Steam content cache
+    '''   - --shell /bin/bash so the operator can `sudo -u &lt;name&gt; bash`
+    '''                       to debug; not a security concern because
+    '''                       no password is set
+    ''' useradd's default group behaviour creates a same-named primary
+    ''' group, so we don't pass --user-group explicitly.
+    '''
+    ''' Idempotent against existing accounts: callers should check via
+    ''' CheckLinuxUserExists first; this function reports useradd's
+    ''' "already exists" exit code as a failure.
+    ''' </summary>
+    Public Function CreateLinuxSystemUser(userName As String) As ServiceResult
+        If ConfigHelpers.RunningOnWindows() Then
+            Return New ServiceResult With {.Success = False, .Message = "Not on Linux."}
+        End If
+        If Not ConfigHelpers.RunningElevated() Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = "Root privileges are required to create a system user."
+            }
+        End If
+        If String.IsNullOrWhiteSpace(userName) Then
+            Return New ServiceResult With {.Success = False, .Message = "User name cannot be empty."}
+        End If
+
+        Dim out As String = Nothing
+        Dim ok = RunCommand("useradd",
+                             {"--system", "--create-home", "--shell", "/bin/bash", userName.Trim()},
+                             out)
+        If ok Then
+            Return New ServiceResult With {
+                .Success = True,
+                .Message = $"Created system user '{userName.Trim()}'.",
+                .Output = out
+            }
+        End If
+        Return New ServiceResult With {
+            .Success = False,
+            .Message = $"useradd failed for '{userName.Trim()}'.",
+            .Output = out
+        }
+    End Function
+
+    ''' <summary>
+    ''' Ensures &lt;path&gt; exists (mkdir -p) and is owned recursively by
+    ''' &lt;userName&gt;:&lt;userName&gt;. Used to hand the install / data /
+    ''' servers directories to the service account so the node can read
+    ''' and write them after dropping root.
+    '''
+    ''' We chown to user:user (rather than user:nogroup or anything
+    ''' similar) because useradd's default behaviour creates a primary
+    ''' group with the same name as the user. If a site has overridden
+    ''' that, the operator can fix permissions manually — we don't
+    ''' second-guess /etc/login.defs.
+    '''
+    ''' Idempotent: mkdir -p succeeds on existing dirs; chown -R on an
+    ''' already-correct tree is a no-op.
+    ''' </summary>
+    Public Function PrepareDirAndChown(path As String, userName As String) As ServiceResult
+        If ConfigHelpers.RunningOnWindows() Then
+            Return New ServiceResult With {.Success = False, .Message = "Not on Linux."}
+        End If
+        If Not ConfigHelpers.RunningElevated() Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = "Root privileges are required to chown directories."
+            }
+        End If
+        If String.IsNullOrWhiteSpace(path) Then
+            Return New ServiceResult With {.Success = True, .Message = "(no path supplied; skipped)"}
+        End If
+        If String.IsNullOrWhiteSpace(userName) Then
+            Return New ServiceResult With {.Success = False, .Message = "User name cannot be empty."}
+        End If
+
+        Dim p = path.Trim()
+        Dim u = userName.Trim()
+
+        ' mkdir -p — create the directory (and parents) if missing.
+        Dim mkdirOut As String = Nothing
+        If Not RunCommand("mkdir", {"-p", p}, mkdirOut) Then
+            Return New ServiceResult With {
+                .Success = False,
+                .Message = $"mkdir -p failed for {p}.",
+                .Output = mkdirOut
+            }
+        End If
+
+        ' chown -R user:user path. The colon form makes the primary
+        ' group match the user's primary group on most distros.
+        Dim chownOut As String = Nothing
+        If RunCommand("chown", {"-R", $"{u}:{u}", p}, chownOut) Then
+            Return New ServiceResult With {
+                .Success = True,
+                .Message = $"{p} → {u}:{u}",
+                .Output = chownOut
+            }
+        End If
+        Return New ServiceResult With {
+            .Success = False,
+            .Message = $"chown failed for {p}.",
+            .Output = chownOut
+        }
+    End Function
+
+    ''' <summary>
+    ''' Generic wrapper around Process.Start with stdout+stderr capture.
+    ''' Returns True iff the command exited with code 0. The caller is
+    ''' expected to handle non-zero with a meaningful message rather
+    ''' than passing the raw output up.
+    ''' </summary>
+    Private Function RunCommand(fileName As String,
+                                 args As String(),
+                                 ByRef output As String) As Boolean
+        Try
+            Dim psi As New ProcessStartInfo(fileName) With {
+                .RedirectStandardOutput = True,
+                .RedirectStandardError = True,
+                .UseShellExecute = False,
+                .CreateNoWindow = True
+            }
+            For Each a In args
+                psi.ArgumentList.Add(a)
+            Next
+
+            Using proc = Process.Start(psi)
+                Dim stdOut = proc.StandardOutput.ReadToEnd()
+                Dim stdErr = proc.StandardError.ReadToEnd()
+                proc.WaitForExit()
+                output = (stdOut & stdErr).Trim()
+                Return proc.ExitCode = 0
+            End Using
+        Catch ex As Exception
+            output = ex.Message
+            Return False
+        End Try
     End Function
 
     ''' <summary>
