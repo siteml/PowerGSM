@@ -60,8 +60,18 @@ jobs:
       # --no-restore to skip redundant restores. Restore-on-publish
       # would also work, but doing it once at the top makes failures
       # easier to attribute to a single step.
+      #
+      # PublishReadyToRun=true is pinned because the publish steps
+      # below also pin it. R2R needs the platform-specific runtime
+      # package (Microsoft.NETCore.App.Runtime.<rid> for crossgen2)
+      # to be RESTORED — not just available at publish time. Without
+      # this flag on restore, publish errors with NETSDK1094: "Unable
+      # to optimize assemblies for performance: a valid runtime
+      # package was not found." The flag has no effect on projects
+      # that don't end up using R2R (Contracts, CtrlCSender at this
+      # restore stage) — they just see a property they ignore.
       - name: Restore solution
-        run: dotnet restore PowerGSM.sln
+        run: dotnet restore PowerGSM.sln -p:PublishReadyToRun=true
 
       # Order matters here: Node publishes FIRST so its publish folder
       # exists. NodeSetup's Win64.pubxml then copies itself into Node's

@@ -55,8 +55,25 @@
       RuntimeIdentifier=win-x64 explicitly and is unaffected by this
       scrub. The regular Build of CtrlCSender just needs the no-RID
       net8.0 slot, which restore always generates.
+
+      Condition gates the ProjectReference itself on the RID, with
+      the same expression the publish-side targets below use. As of
+      the v0.3.0 release attempts, UndefineProperties=RuntimeIdentifier
+      alone stopped being sufficient — the Linux job's Node publish
+      started getting NETSDK1047 against CtrlCSender's net8.0/linux-x64
+      slot despite the scrub, likely a .NET 8 SDK update changing how
+      project-graph evaluation handles property scrubbing. Conditioning
+      the reference itself dodges the issue at the source: on Linux
+      publish the reference is excluded entirely, so MSBuild never
+      asks CtrlCSender about any RID. Restore happens with empty RID
+      (the workflow's per-project restore doesn't pin one), so the
+      reference IS included at restore time and CtrlCSender's assets
+      get generated normally. Restore-time-included, publish-time-
+      excluded — same end result UndefineProperties was aiming for,
+      just via a more durable mechanism.
     -->
-    <ProjectReference Include="..\GSM.CtrlCSender\GSM.CtrlCSender.vbproj">
+    <ProjectReference Include="..\GSM.CtrlCSender\GSM.CtrlCSender.vbproj"
+                      Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <Private>false</Private>
       <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
