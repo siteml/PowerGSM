@@ -10,6 +10,7 @@ Imports System.Threading.Tasks
 Imports GSM.Plugin
 Imports GSM.Node.Api
 Imports Microsoft.Extensions.Logging
+Imports Microsoft.Win32.SafeHandles
 
 ' ============================================================
 '  ProcessManager — owns all game server processes on this node.
@@ -246,7 +247,29 @@ Namespace GSM.Node
             managed.Strategy = ResolveStrategy(request.StdoutIsLog,
                                                 request.RequiresConsoleIsolation,
                                                 request.LogFilePaths)
-            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture)
+
+            ' CaptureStdout governs whether the stdout pipe data is
+            ' forwarded to the ring buffer + EventStore. Strategy A
+            ' (StdoutCapture) is the only strategy that has a stdout
+            ' pipe to read from at all — Strategy B/C don't redirect.
+            ' But Strategy A on Linux is the path for file-logged
+            ' UE4-class games too, since Linux can't use Strategy B/C
+            ' (CREATE_NEW_CONSOLE is Win32-only). In that case the
+            ' plugin has declared file log sources and the file is the
+            ' authoritative log surface — stdout would be a partial
+            ' duplicate at best, and on UE4 specifically misses every
+            ' Verbose-category line (LogPersistence "Processing
+            ' character update" / "Persisting" etc.) because the
+            ' Linux UE4 console output device filters at Display.
+            ' Setting CaptureStdout=False here keeps .NET's pipe
+            ' drainer running (so the child doesn't block on a full
+            ' stdout pipe after ~4KB) but routes everything through
+            ' the file tailer instead, matching the Windows Strategy B
+            ' behaviour and giving the EventStore the full Verbose
+            ' stream rather than a Display-filtered subset.
+            Dim hasFileLogs = request.LogFilePaths IsNot Nothing AndAlso request.LogFilePaths.Count > 0
+            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture) AndAlso
+                                    Not hasFileLogs
 
             ' Resolve the file-tailer startup delay. Negative values
             ' (including the -1 "plugin didn't specify" sentinel) fall
@@ -405,6 +428,369 @@ Namespace GSM.Node
         End Function
 
         ' ============================================================
+        '  Process re-adoption on node startup
+        '
+        '  When the node restarts (binary swap, service restart,
+        '  crash recovery, whatever), its in-memory _instances
+        '  dict starts empty — but the game-server child processes
+        '  it spawned previously are likely still running. They
+        '  outlive the node by design: spawned with their own
+        '  hidden console (Strategy B/C) or as standalone child
+        '  processes (Strategy A), not joined to any kill-on-close
+        '  Job Object, and Windows / Linux both let parents die
+        '  without taking the children with them.
+        '
+        '  Without re-adoption, the new node has no idea those
+        '  processes exist: GetInstanceStatus reports them all as
+        '  Stopped, the manager fires false "instance stopped"
+        '  notifications, crash detection is dead because no
+        '  Process.Exited handler is attached, and an unsuspecting
+        '  click of Start spawns a duplicate (which then fails on
+        '  port-in-use).
+        '
+        '  AdoptSnapshots fixes this by reading the persisted
+        '  InstanceSnapshots table on startup, looking up each
+        '  PID, verifying identity via start-time match, and
+        '  re-creating the ManagedInstance record with the live
+        '  Process handle attached. After this, the new node is
+        '  functionally indistinguishable from the previous one
+        '  with respect to those instances: same crash detection,
+        '  same log tailers (which resume from saved
+        '  TailerPositions cursors), same graceful-stop path,
+        '  same status reports to the manager. Players never
+        '  noticed the node restart.
+        '
+        '  The manager's existing rule re-push on reconnect
+        '  (UpdateParseRulesAsync from EnsureLogStreamAsync) then
+        '  layers on top to reconcile any plugin rule changes
+        '  that happened while the node was down — the
+        '  snapshot's rules are stale until that push, but the
+        '  window is typically seconds.
+        '
+        '  Limitations:
+        '    • Strategy A (StdoutIsLog=True, redirected stdio): we
+        '      can't reconnect to a stdout pipe of a process we
+        '      didn't spawn. The adopted process keeps running
+        '      but its stdout is no longer captured. Neither LO
+        '      (Strategy B) nor Factorio (Strategy C) hits this
+        '      path today; theoretical for any future plugin
+        '      that opts into A.
+        '    • Pre-migration snapshots have NULL for every
+        '      recovery field. We can't adopt those — the row
+        '      is removed and the instance shows as stopped
+        '      until the operator restarts it.
+        '    • Adoption is synchronous on startup before app.Run().
+        '      With many snapshots and live process lookups, this
+        '      adds startup latency proportional to the snapshot
+        '      count. Acceptable while the realistic scale is 1–10
+        '      instances per node.
+        ' ============================================================
+
+        ''' <summary>
+        ''' Read all persisted InstanceSnapshots and re-adopt the
+        ''' ones whose game processes are still alive. Synchronous
+        ''' so the HTTP listener doesn't accept requests until the
+        ''' in-memory _instances dict reflects ground truth. Each
+        ''' adoption failure (PID gone, identity mismatch, etc.)
+        ''' removes the offending snapshot — a stale row never
+        ''' lingers across more than one startup.
+        ''' </summary>
+        Public Sub AdoptSnapshots()
+            Dim snapshots = _database.LoadAllInstanceSnapshots()
+            If snapshots Is Nothing OrElse snapshots.Count = 0 Then
+                _logger.LogInformation(
+                    "No instance snapshots present on startup — nothing to adopt.")
+                Return
+            End If
+
+            _logger.LogInformation(
+                "Attempting to adopt {Count} instance snapshot(s) on startup...",
+                snapshots.Count)
+
+            Dim adopted As Integer = 0
+            Dim discarded As Integer = 0
+            For Each snapshot In snapshots
+                Try
+                    If TryAdoptOne(snapshot) Then
+                        adopted += 1
+                    Else
+                        discarded += 1
+                    End If
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Snapshot adoption threw for {Id} — removing",
+                        snapshot.InstanceId)
+                    Try
+                        _database.RemoveInstanceSnapshot(snapshot.InstanceId)
+                    Catch
+                    End Try
+                    discarded += 1
+                End Try
+            Next
+
+            _logger.LogInformation(
+                "Snapshot adoption pass complete: {Adopted} adopted, {Discarded} discarded.",
+                adopted, discarded)
+        End Sub
+
+        ''' <summary>
+        ''' Single-snapshot adoption attempt. Returns True on
+        ''' successful adoption (instance now in _instances and
+        ''' fully wired up) or False on any non-throwing rejection
+        ''' (PID gone, identity mismatch, missing recovery payload
+        ''' from a pre-migration snapshot, intentional-stop
+        ''' bookkeeping in flight). False results also clean up
+        ''' the snapshot row so the next startup doesn't re-try.
+        ''' </summary>
+        Private Function TryAdoptOne(snapshot As InstanceSnapshotRow) As Boolean
+            Dim id = snapshot.InstanceId
+
+            ' Pre-migration snapshots have no recovery payload.
+            ' Without ExePath and the spawn metadata we can't
+            ' reconstruct ProcessStartInfo for crash-restart, and
+            ' without ParseRulesJson the EventStore would track
+            ' the adopted instance with zero rules. Bail.
+            If String.IsNullOrEmpty(snapshot.ExePath) Then
+                _logger.LogInformation(
+                    "Snapshot {Id}: no recovery payload (pre-migration row) — discarding",
+                    id)
+                _database.RemoveInstanceSnapshot(id)
+                Return False
+            End If
+
+            ' Stop intent was pending when we wrote the snapshot.
+            ' Most likely path: graceful stop was in flight at the
+            ' moment the node was killed. Treat as fully stopped
+            ' — even if the game process happens to still be
+            ' running, the operator's intent was to stop it, and
+            ' re-adopting would defy that intent.
+            If snapshot.StopIntentPending Then
+                _logger.LogInformation(
+                    "Snapshot {Id}: StopIntentPending was set — honoring stop and discarding",
+                    id)
+                _database.RemoveInstanceSnapshot(id)
+                Return False
+            End If
+
+            ' Look up the saved PID. ArgumentException = no
+            ' process with that ID currently exists, which means
+            ' the game already exited — nothing to adopt.
+            Dim proc As Process = Nothing
+            Try
+                proc = Process.GetProcessById(snapshot.Pid)
+            Catch ex As ArgumentException
+                _logger.LogInformation(
+                    "Snapshot {Id}: PID {Pid} not running — discarding",
+                    id, snapshot.Pid)
+                _database.RemoveInstanceSnapshot(id)
+                Return False
+            End Try
+
+            ' Verify identity via start-time match. proc.StartTime
+            ' is what the kernel recorded at process creation; it
+            ' doesn't drift. Snapshot's StartedAtUtc was captured
+            ' from the same source on the original FinalizeStart
+            ' (post the FinalizeStart change in this same
+            ' commit), so they should match exactly when it's the
+            ' same process. 60-second tolerance covers occasional
+            ' system-clock adjustments during downtime (manual
+            ' time change, NTP correction during boot) and is
+            ' nowhere near tight enough to risk false accept on
+            ' real PID reuse (Windows recycles PIDs over minutes-
+            ' to-hours timescales, not seconds).
+            Dim adoptedStartUtc As DateTime
+            Try
+                adoptedStartUtc = proc.StartTime.ToUniversalTime()
+            Catch ex As Exception
+                _logger.LogInformation(
+                    "Snapshot {Id}: PID {Pid} found but start time unreadable ({Err}) — discarding",
+                    id, snapshot.Pid, ex.Message)
+                _database.RemoveInstanceSnapshot(id)
+                Return False
+            End Try
+
+            Dim delta = (adoptedStartUtc - snapshot.StartedAtUtc).Duration()
+            If delta > TimeSpan.FromSeconds(60) Then
+                _logger.LogInformation(
+                    "Snapshot {Id}: PID {Pid} appears to be a different process (start time differs by {Delta}: saved {Saved:o}, found {Found:o}) — discarding",
+                    id, snapshot.Pid, delta, snapshot.StartedAtUtc, adoptedStartUtc)
+                _database.RemoveInstanceSnapshot(id)
+                Return False
+            End If
+
+            ' Identity verified. Reconstruct the ManagedInstance.
+            Dim managed As New ManagedInstance()
+            managed.InstanceId = id
+            managed.Process = proc
+            managed.Pid = proc.Id
+            managed.StartedAt = adoptedStartUtc
+            managed.State = InstanceState.Running
+            managed.StateChangedAt = DateTime.UtcNow
+            managed.StopIntentPending = False
+            managed.CrashCount = 0
+
+            ' Restore crash-policy fields. CrashPolicyJson is the
+            ' same anonymous-typed shape FinalizeStart serialized
+            ' it as — we read it into a named class so
+            ' JsonSerializer.Deserialize has a target type.
+            If Not String.IsNullOrEmpty(snapshot.CrashPolicyJson) Then
+                Try
+                    Dim policy = JsonSerializer.Deserialize(Of CrashPolicyState)(snapshot.CrashPolicyJson)
+                    If policy IsNot Nothing Then
+                        Dim parsed As CrashRestartPolicy
+                        If [Enum].TryParse(Of CrashRestartPolicy)(policy.Policy, parsed) Then
+                            managed.CrashPolicy = parsed
+                        End If
+                        If policy.MaxCrash > 0 Then managed.MaxCrashCount = policy.MaxCrash
+                        If policy.WindowMin > 0 Then managed.CrashWindowMinutes = policy.WindowMin
+                    End If
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Snapshot {Id}: CrashPolicyJson parse failed, using defaults", id)
+                End Try
+            End If
+
+            ' Spawn metadata.
+            managed.Strategy = CType(snapshot.Strategy, SpawnStrategy)
+            managed.StdoutIsLog = snapshot.StdoutIsLog
+            managed.RequiresConsoleIsolation = snapshot.RequiresConsoleIsolation
+            managed.LogTailerStartDelayMs = snapshot.LogTailerStartDelayMs
+            ' CaptureStdout is set below, after we deserialize the
+            ' log-file-paths JSON — the hasFileLogs check needs the
+            ' list, not the raw JSON string.
+
+            ' Rebuild a ProcessStartInfo so a post-adopt crash
+            ' can be restarted via the existing crash-restart
+            ' path. Mirrors the psi shape StartInstanceAsync
+            ' originally built. We DO NOT re-execute Start() on
+            ' this psi unless the process actually crashes —
+            ' the adopted process keeps running with whatever
+            ' redirection settings the previous node session
+            ' gave it.
+            Dim psi As New ProcessStartInfo()
+            psi.FileName = snapshot.ExePath
+            psi.Arguments = If(snapshot.Arguments, "")
+            psi.WorkingDirectory = If(snapshot.WorkingDirectory,
+                                       Path.GetDirectoryName(snapshot.ExePath))
+            psi.UseShellExecute = False
+            psi.WindowStyle = ProcessWindowStyle.Minimized
+            psi.RedirectStandardInput = True
+            psi.RedirectStandardOutput = True
+            psi.RedirectStandardError = True
+            psi.CreateNoWindow = True
+            managed.StartInfo = psi
+
+            ' Deserialize log file paths + parse rules. Both are
+            ' optional — a snapshot with no rules means the
+            ' instance was running with declarative-rules off,
+            ' which is fine.
+            Dim logFilePaths As IList(Of String) = Nothing
+            If Not String.IsNullOrEmpty(snapshot.LogFilePathsJson) Then
+                Try
+                    logFilePaths = JsonSerializer.Deserialize(Of List(Of String))(snapshot.LogFilePathsJson)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Snapshot {Id}: LogFilePathsJson parse failed, no tailers", id)
+                End Try
+            End If
+            managed.LogFilePaths = logFilePaths
+
+            ' CaptureStdout follows the same hasFileLogs-aware rule as
+            ' StartInstanceAsync — see the comment block there for the
+            ' full rationale. For adopted processes specifically, the
+            ' stdout pipe is already gone (we can't re-attach to a
+            ' process we didn't spawn), so this flag has no behavioural
+            ' effect during adoption itself. It matters when an adopted
+            ' instance later crashes and gets restarted: FinalizeStart
+            ' reads CaptureStdout to decide whether to forward the
+            ' freshly-spawned process's stdout to the EventStore, and
+            ' we want that decision to match the original spawn's
+            ' behaviour rather than flip to "capture stdout" just
+            ' because the snapshot has Strategy=StdoutCapture.
+            Dim adoptHasFileLogs = managed.LogFilePaths IsNot Nothing AndAlso
+                                    managed.LogFilePaths.Count > 0
+            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture) AndAlso
+                                    Not adoptHasFileLogs
+
+            Dim parseRules As IList(Of LogParseRule) = Nothing
+            If Not String.IsNullOrEmpty(snapshot.ParseRulesJson) Then
+                Try
+                    parseRules = JsonSerializer.Deserialize(Of List(Of LogParseRule))(snapshot.ParseRulesJson)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Snapshot {Id}: ParseRulesJson parse failed, no event tracking until manager re-pushes", id)
+                End Try
+            End If
+            managed.ParseRules = parseRules
+
+            ' Wire up handlers + push into _instances. The Exited
+            ' event will now fire if the process subsequently
+            ' exits, routing through HandleProcessExited's existing
+            ' crash-detection path. proc.EnableRaisingEvents must
+            ' be set BEFORE the Exited handler is attached or .NET
+            ' silently drops the handler.
+            proc.EnableRaisingEvents = True
+            AttachProcessHandlers(proc, managed)
+            _instances(id) = managed
+
+            ' EventStore registration: arms in-memory player and
+            ' server-state tracking. Subsequent tail lines flow
+            ' through ProcessLine and rebuild state incrementally.
+            ' hydrateState:=True so the new node session inherits
+            ' tile / match-state values from the prior session's
+            ' persisted instance_state row, rather than blanking
+            ' them until the next state-change event happens to
+            ' land. Live events override the hydrated fields as
+            ' they fire.
+            If parseRules IsNot Nothing AndAlso parseRules.Count > 0 Then
+                _eventStore.RegisterInstance(id, parseRules, hydrateState:=True)
+            End If
+
+            ' File tailers will resume from saved TailerPositions
+            ' cursors via the existing first-open logic, so any
+            ' log lines written during the node-down window get
+            ' streamed in and processed by the rules we just
+            ' registered. The 5-second startup delay in TailFileAsync
+            ' is fine here — we're not racing engine init the
+            ' way a fresh spawn does.
+            '
+            ' skipResume:=True forces the first-open backfill path
+            ' even though a cursor exists. The cursor points PAST
+            ' the historical PlayerJoin / TileLoaded lines that
+            ' the freshly-registered (and therefore empty) EventStore
+            ' needs in order to know who's currently connected and
+            ' what tile is hosted. Without the replay, /players and
+            ' /server-state return empty until a player happens to
+            ' join or the tile happens to reload — on a populated
+            ' realm with no churn that can be hours. The 512KB
+            ' backfill on a typical UE4 log file covers minutes-to-
+            ' hours of recent activity, which is enough to catch
+            ' the latest TileLoaded and all live PlayerJoin lines.
+            ' Duplicate-event hazards are handled downstream: the
+            ' node's EventStore deduplicates players by name, the
+            ' manager's HandlePlayerJoin / HandleTileLoaded check
+            ' for prior membership / existing rows before emitting
+            ' or persisting.
+            If logFilePaths IsNot Nothing AndAlso logFilePaths.Count > 0 Then
+                StartFileTailers(managed, logFilePaths, skipResume:=True)
+            End If
+
+            ' Re-arm the crash-count-reset timer against this
+            ' specific process so a long-running adopted instance
+            ' clears its crash counter at the same cadence a
+            ' freshly-spawned one would.
+            ScheduleCrashCountReset(managed, proc)
+
+            _logger.LogInformation(
+                "Adopted instance {Id} (PID {Pid}, started {Started:o}, {RuleCount} rule(s), {LogCount} log file(s), strategy={Strategy})",
+                id, snapshot.Pid, adoptedStartUtc,
+                If(parseRules?.Count, 0),
+                If(logFilePaths?.Count, 0),
+                managed.Strategy)
+            Return True
+        End Function
+
+        ' ============================================================
         '  Spawn dispatch
         '
         '  SpawnGameProcess picks one of three strategies based on
@@ -489,6 +875,24 @@ Namespace GSM.Node
 
             If strategy = SpawnStrategy.StdoutCapture Then
                 ' Strategy A: redirected stdio.
+
+                ' Linux: wrap the launch in `setsid` so the child
+                ' starts in a new session with no controlling
+                ' terminal. This is what actually prevents Ctrl+C
+                ' from propagating from the node's terminal to the
+                ' child — see WrapInSetsidIfLinux's header comment
+                ' for why a setpgid-after-Start attempt loses the
+                ' race with the child's exec and can't isolate the
+                ' child after the fact. Mutates psi in place;
+                ' caller must do this BEFORE proc.Start.
+                '
+                ' Windows is a no-op (different process-group
+                ' machinery, served by Strategy B/C's
+                ' CREATE_NEW_CONSOLE setup).
+                If Not OperatingSystem.IsWindows() Then
+                    WrapInSetsidIfLinux(psi)
+                End If
+
                 Dim proc As New Process()
                 proc.StartInfo = psi
                 proc.EnableRaisingEvents = True
@@ -1043,6 +1447,186 @@ Namespace GSM.Node
         End Function
 
         ' ============================================================
+        '  Linux: detach children from the controlling terminal
+        '
+        '  Background: on Linux, when the node is launched from a
+        '  terminal, the kernel groups it and every
+        '  Process.Start'd descendant into a single foreground
+        '  process group attached to the controlling terminal.
+        '  Ctrl+C sends SIGINT to every member of that group, not
+        '  just the foreground process. Result: Ctrl+C'ing the
+        '  node also delivers SIGINT directly to every game-server
+        '  child — and since UE4 (LaunchUnix.cpp) and Factorio
+        '  both map SIGINT/SIGTERM to graceful shutdown, the
+        '  games proceed to save-and-quit. That defeats the whole
+        '  point of process re-adoption: the new node was
+        '  supposed to be able to come back up and pick those
+        '  processes back up, but they're not there anymore.
+        '
+        '  First-attempt approach (call setpgid from the parent
+        '  AFTER Process.Start returns) DOES NOT WORK on .NET 8.
+        '  The runtime spawns children via posix_spawn, which
+        '  does not return until after the child's exec has
+        '  completed. The parent's setpgid call then fails with
+        '  EACCES because the kernel forbids changing the process
+        '  group of a child that has already exec'd — see man
+        '  setpgid(2). The race is unwinnable from user code on
+        '  the parent side. Confirmed by observation: under the
+        '  setpgid-after-Start scheme, Ctrl+C still propagated to
+        '  game children exactly as before.
+        '
+        '  Working approach: launch the child through the
+        '  `setsid` command instead of directly. setsid invokes
+        '  the setsid(2) system call (new session + new process
+        '  group + DETACH CONTROLLING TERMINAL) and then
+        '  execvp's the real binary. Because the setsid() call
+        '  runs in the child before exec, there's no race to lose.
+        '  execvp preserves the PID, so our process tracking
+        '  still points at the right place; the only practical
+        '  difference vs. spawning the binary directly is that
+        '  the child has no controlling tty and is in its own
+        '  session+group.
+        '
+        '  Why "no controlling tty" is sufficient: SIGINT routing
+        '  from a terminal requires both a controlling tty (the
+        '  terminal that delivers the signal) AND foreground-
+        '  group membership (which group on that terminal
+        '  receives it). setsid removes the tty entirely, so the
+        '  foreground-group question becomes moot — the kernel
+        '  has nothing to deliver the SIGINT through.
+        '
+        '  Manager-initiated graceful stop continues to work
+        '  unchanged: SendSigTermToProcess shoots /bin/kill at
+        '  the PID directly, which doesn't care about controlling
+        '  ttys or process groups. Crash detection works the same
+        '  way (Exited event on the same PID).
+        '
+        '  Dependency: `setsid` ships in util-linux on every
+        '  modern Linux distribution by default — same baseline
+        '  assumption as /bin/kill, which we already depend on.
+        '
+        '  Spaces in exe paths: the FileName + Arguments
+        '  concatenation below uses plain string concatenation
+        '  rather than shell-style quoting. LO and Factorio
+        '  binaries live in paths without spaces so this is
+        '  fine for both supported games. If a future plugin
+        '  produces a spaced exe path, the binary path should
+        '  be wrapped in double quotes — .NET on Linux parses
+        '  ProcessStartInfo.Arguments with POSIX-flavoured
+        '  quoting before passing argv to the kernel, so the
+        '  quotes survive correctly.
+        '
+        '  Windows: this whole helper is unused. Win32's process-
+        '  group concept (CREATE_NEW_PROCESS_GROUP) is unrelated
+        '  and is handled by Strategy B/C's CREATE_NEW_CONSOLE
+        '  setup, which gives each child its own console for
+        '  AttachConsole+CTRL_C_EVENT delivery.
+        ' ============================================================
+
+        ''' <summary>
+        ''' Mutates psi to wrap its FileName + Arguments in a
+        ''' call to /usr/bin/setsid, so the spawned child starts
+        ''' in a new session detached from the controlling
+        ''' terminal. Caller is responsible for guarding on
+        ''' OperatingSystem.IsWindows() — this method does no
+        ''' platform check internally.
+        ''' </summary>
+        Private Sub WrapInSetsidIfLinux(psi As ProcessStartInfo)
+            ' Idempotent: skip if psi is already in wrapped form.
+            ' Two paths hit a second call on the same psi:
+            '   1. Crash-restart — RestartInstanceAsync re-uses
+            '      managed.StartInfo, which we mutated on the
+            '      first spawn.
+            '   2. Adopted-then-restarted — TryAdoptOne rebuilds
+            '      psi from snapshot.ExePath / snapshot.Arguments
+            '      which were saved AFTER the first wrap, so they
+            '      already read "setsid" + "<binary> <args>".
+            ' Without this guard the second call would produce
+            ' "setsid setsid <binary> <args>", and execvp would
+            ' end up trying to run setsid as the game binary.
+            If String.Equals(psi.FileName, "setsid", StringComparison.Ordinal) Then
+                Return
+            End If
+
+            Dim originalExe = psi.FileName
+            Dim originalArgs = If(psi.Arguments, "")
+
+            ' setsid argv = ["setsid", "<exe>", arg1, arg2, ...]
+            ' After setsid's execvp, the binary sees its own argv
+            ' starting from "<exe>" — standard argv[0] convention.
+            psi.FileName = "setsid"
+            psi.Arguments = If(String.IsNullOrEmpty(originalArgs),
+                               originalExe,
+                               $"{originalExe} {originalArgs}")
+
+            _logger.LogInformation(
+                "Wrapping spawn in `setsid` for Linux controlling-tty detachment: setsid {Args}",
+                psi.Arguments)
+        End Sub
+
+        ' ============================================================
+        '  Linux libc.open() escape hatch for the file tailer
+        '
+        '  UE4 dedicated servers (MistServer etc.) hold an advisory
+        '  write lock on their log file for the entire lifetime of
+        '  the process — confirmed via `lsof` showing "3uW" (capital
+        '  W = write lock on the entire file). On Linux, .NET 8's
+        '  FileStream constructor interacts with that lock in some
+        '  way that causes our reader-side open to fail (silent
+        '  IOException retry loop) or block indefinitely, even with
+        '  `FileShare.ReadWrite Or FileShare.Delete`, which per docs
+        '  should mean "no lock taken". Symptom: tailer task stays
+        '  completely silent for hours, then suddenly succeeds at
+        '  the exact moment UE4 releases the lock during shutdown.
+        '
+        '  Verified that plain `head` and `cat` on the same file as
+        '  the same user (powergsm) succeed while the lock is held.
+        '  Those just call open(O_RDONLY), which doesn't care about
+        '  advisory locks. We replicate that path via P/Invoke,
+        '  wrapping the resulting fd in a SafeFileHandle and handing
+        '  THAT to FileStream's pre-opened-handle constructor (which
+        '  doesn't take additional locks).
+        '
+        '  Windows uses the regular FileStream constructor — file
+        '  locking on Windows is mandatory and FileShare semantics
+        '  work as documented; no need for the escape hatch there.
+        ' ============================================================
+
+        <DllImport("libc", SetLastError:=True, EntryPoint:="open")>
+        Private Shared Function LibcOpen(<MarshalAs(UnmanagedType.LPStr)> pathname As String,
+                                          flags As Integer) As Integer
+        End Function
+
+        Private Const O_RDONLY As Integer = 0
+
+        ''' <summary>
+        ''' Opens a log file for read-only tailing in a way that
+        ''' coexists with advisory write locks held by the producing
+        ''' process. On Linux: raw libc.open(O_RDONLY) + SafeFileHandle.
+        ''' On Windows: regular FileStream with FileShare.ReadWrite Or
+        ''' FileShare.Delete (which already works correctly there).
+        ''' Caller owns the returned FileStream and must dispose it.
+        ''' </summary>
+        Private Shared Function OpenLogFileForTailing(path As String) As FileStream
+            If OperatingSystem.IsLinux() Then
+                Dim fd = LibcOpen(path, O_RDONLY)
+                If fd < 0 Then
+                    Dim errno = Marshal.GetLastWin32Error()
+                    Throw New IOException(
+                        $"libc.open() failed for {path} (errno={errno})")
+                End If
+                Dim handle As New SafeFileHandle(New IntPtr(fd), ownsHandle:=True)
+                ' FileStream(SafeFileHandle, FileAccess) doesn't take
+                ' additional locks — it just adopts the handle. Disposal
+                ' propagates to the SafeFileHandle which closes the fd.
+                Return New FileStream(handle, FileAccess.Read)
+            End If
+
+            Return New FileStream(path, FileMode.Open, FileAccess.Read,
+                                   FileShare.ReadWrite Or FileShare.Delete)
+        End Function
+
+        ' ============================================================
         '  Log file tailing
         ' ============================================================
 
@@ -1051,15 +1635,28 @@ Namespace GSM.Node
         ''' polls the file for new bytes and appends lines to the
         ''' instance's ring buffer. Files are opened with FileShare.ReadWrite
         ''' so they don't interfere with the game process writing to them.
+        '''
+        ''' skipResume = True makes the tailer ignore any saved cursor
+        ''' in the TailerPositions table and fall into the first-open
+        ''' backfill path (read from 0 for small files, last 512KB for
+        ''' large ones). Used by process adoption so the node's
+        ''' freshly-empty EventStore can rebuild player/tile state by
+        ''' re-processing recent log history through the parse rules —
+        ''' without this, the tailer resumes past the historical
+        ''' PlayerJoin / TileLoaded lines and the server-state /
+        ''' player-list endpoints return empty payloads until new
+        ''' events naturally fire (which on a quiet LO realm with a
+        ''' few connected players can be many minutes).
         ''' </summary>
-        Private Sub StartFileTailers(managed As ManagedInstance, paths As IList(Of String))
+        Private Sub StartFileTailers(managed As ManagedInstance, paths As IList(Of String),
+                                      Optional skipResume As Boolean = False)
             If paths Is Nothing OrElse paths.Count = 0 Then
                 _logger.LogInformation("No file log sources for {Id}", managed.InstanceId)
                 Return
             End If
 
-            _logger.LogInformation("Starting {Count} file tailer(s) for {Id}: {Paths}",
-                                   paths.Count, managed.InstanceId, String.Join(", ", paths))
+            _logger.LogInformation("Starting {Count} file tailer(s) for {Id}: {Paths} (skipResume={Skip})",
+                                   paths.Count, managed.InstanceId, String.Join(", ", paths), skipResume)
 
             managed.TailerCancellations = New List(Of CancellationTokenSource)
             For Each path In paths
@@ -1069,7 +1666,9 @@ Namespace GSM.Node
                 Dim capturedPath = path
                 Dim capturedId = managed.InstanceId
                 Dim capturedDelay = managed.LogTailerStartDelayMs
-                Task.Run(Function() TailFileAsync(capturedId, capturedPath, capturedDelay, cts.Token))
+                Dim capturedSkipResume = skipResume
+                Task.Run(Function() TailFileAsync(capturedId, capturedPath, capturedDelay,
+                                                   capturedSkipResume, cts.Token))
             Next
         End Sub
 
@@ -1098,6 +1697,7 @@ Namespace GSM.Node
         Private Async Function TailFileAsync(instanceId As String,
                                               path As String,
                                               startDelayMs As Integer,
+                                              skipResume As Boolean,
                                               token As CancellationToken) As Task
             Try
                 ' Wait for file to appear (up to 60 seconds)
@@ -1164,10 +1764,29 @@ Namespace GSM.Node
                 ' than the fingerprint window — see TryComputeFingerprint.
                 Dim currentFingerprint As String = Nothing
 
+                ' Diagnostic counter so we can identify which iteration
+                ' a log line is from. Cheap; rolls over harmlessly after
+                ' billions of iterations.
+                Dim iterationCount As Long = 0
+
+                ' DIAGNOSTIC counters — the silent IOException catch
+                ' below is suspected of swallowing repeated flock
+                ' contention with UE4's write lock on the log file.
+                ' Without this logging we couldn't distinguish a
+                ' blocked syscall from a tight retry loop, since
+                ' both present as 4 hours of silence in the node log.
+                Dim ioExceptionCount As Long = 0
+                Dim ioExceptionFirstLogged As Boolean = False
+                Dim otherExceptionCount As Long = 0
+                Dim otherExceptionFirstLogged As Boolean = False
+
+                _logger.LogInformation(
+                    "Tailer read loop starting for {Id} ({Path}, skipResume={Skip})",
+                    instanceId, path, skipResume)
+
                 While Not token.IsCancellationRequested
                     Try
-                        Using fs As New FileStream(path, FileMode.Open, FileAccess.Read,
-                                                    FileShare.ReadWrite Or FileShare.Delete)
+                        Using fs As FileStream = OpenLogFileForTailing(path)
                             ' First open: try to resume from a saved cursor.
                             ' Resume is allowed only when the current file's
                             ' first-bytes fingerprint matches the saved one
@@ -1183,7 +1802,11 @@ Namespace GSM.Node
                             If position < 0 Then
                                 currentFingerprint = TryComputeFingerprint(fs)
                                 Dim saved = _database.GetTailerPosition(instanceId, path)
-                                Dim canResume = saved IsNot Nothing AndAlso
+                                ' skipResume forces the first-open backfill path even
+                                ' when a valid cursor exists — used by process adoption
+                                ' so EventStore rebuilds state from recent history.
+                                Dim canResume = (Not skipResume) AndAlso
+                                                saved IsNot Nothing AndAlso
                                                 currentFingerprint IsNot Nothing AndAlso
                                                 String.Equals(saved.Fingerprint,
                                                               currentFingerprint,
@@ -1229,8 +1852,20 @@ Namespace GSM.Node
                                     currentFingerprint = TryComputeFingerprint(fs)
                                 End If
 
+                                Dim startPos = position
                                 fs.Seek(position, SeekOrigin.Begin)
                                 Dim endLength = fs.Length
+
+                                ' Only log when there's meaningful new data — idle
+                                ' iterations where fs.Length didn't change would
+                                ' have skipped this whole block anyway. The
+                                ' first-iteration read (potentially MB of backfill)
+                                ' is what we most want visibility on.
+                                _logger.LogInformation(
+                                    "Tailer iter {Iter} reading {Id}: {Start}→{End} ({Bytes} bytes)",
+                                    iterationCount, instanceId, startPos, endLength, endLength - startPos)
+
+                                Dim linesEmitted As Long = 0
                                 Using reader As New StreamReader(fs)
                                     Dim buffer(8191) As Char
                                     Dim read = reader.Read(buffer, 0, buffer.Length)
@@ -1244,6 +1879,7 @@ Namespace GSM.Node
                                             If ch = ChrW(10) Then
                                                 EmitTailLine(instanceId, pending.ToString().TrimEnd(ChrW(13)))
                                                 pending.Clear()
+                                                linesEmitted += 1
                                             Else
                                                 pending.Append(ch)
                                             End If
@@ -1252,6 +1888,10 @@ Namespace GSM.Node
                                     End While
                                 End Using
                                 position = endLength
+
+                                _logger.LogInformation(
+                                    "Tailer iter {Iter} read complete for {Id}: {Lines} line(s) emitted, position now {Pos}",
+                                    iterationCount, instanceId, linesEmitted, position)
 
                                 ' Persist the new cursor so the next instance
                                 ' (re)start can resume here instead of replaying
@@ -1263,15 +1903,75 @@ Namespace GSM.Node
                                         _database.SaveTailerPosition(
                                             instanceId, path, position, currentFingerprint)
                                     Catch ex As Exception
-                                        _logger.LogDebug(ex,
+                                        ' Elevated to Warning while diagnosing why
+                                        ' adopted tailers aren't saving positions.
+                                        ' Revert to Debug once the root cause is
+                                        ' fixed — a save failure is non-fatal to
+                                        ' tailing (lines are already in the ring
+                                        ' buffer) so Warning is louder than ideal
+                                        ' for steady-state operation.
+                                        _logger.LogWarning(ex,
                                             "Failed to save tailer position for {Path}", path)
                                     End Try
                                 End If
                             End If
+
+                            iterationCount += 1
+                            ' Once per minute, log a heartbeat so we can
+                            ' tell the loop is iterating even when the
+                            ' file isn't growing. 120 iterations × 500ms
+                            ' = ~60 seconds.
+                            If iterationCount Mod 120 = 0 Then
+                                _logger.LogInformation(
+                                    "Tailer heartbeat for {Id}: iter={Iter}, position={Pos}",
+                                    instanceId, iterationCount, position)
+                            End If
                         End Using
                     Catch ioEx As IOException
-                        ' Transient — UE4 may be holding the file exclusively
-                        ' for a moment. Back off and retry next tick.
+                        ' Was silently swallowed. Now logged on first
+                        ' occurrence + every 1000th so we can tell
+                        ' whether this catch is firing repeatedly
+                        ' (silent tight loop) or never (blocked
+                        ' inside the Using block in a syscall like
+                        ' flock waiting for UE4 to release its log
+                        ' file lock). The original "transient—back
+                        ' off and retry" comment is still the right
+                        ' steady-state behaviour; we just want
+                        ' visibility while debugging.
+                        ioExceptionCount += 1
+                        If Not ioExceptionFirstLogged Then
+                            _logger.LogWarning(ioEx,
+                                "Tailer iter pre-increment IOException for {Path} ({Type}) — first occurrence",
+                                path, ioEx.GetType().Name)
+                            ioExceptionFirstLogged = True
+                        ElseIf ioExceptionCount Mod 1000 = 0 Then
+                            _logger.LogWarning(
+                                "Tailer iter pre-increment IOException for {Path}: {Count} occurrences so far",
+                                path, ioExceptionCount)
+                        End If
+                    Catch ex As Exception
+                        ' Anything non-IOException would previously
+                        ' propagate to the outer Catch and log
+                        ' "Tailer error for {Path}" — fatal to the
+                        ' task. Catch it here too so the tailer can
+                        ' recover from transient non-IO failures
+                        ' (SqliteException on lock contention,
+                        ' UnauthorizedAccessException on a path that
+                        ' temporarily disappeared, etc.) and so the
+                        ' diagnostic stays useful even when the root
+                        ' cause turns out to be something other than
+                        ' file-share locking.
+                        otherExceptionCount += 1
+                        If Not otherExceptionFirstLogged Then
+                            _logger.LogWarning(ex,
+                                "Tailer iter pre-increment unexpected {Type} for {Path} — first occurrence",
+                                ex.GetType().Name, path)
+                            otherExceptionFirstLogged = True
+                        ElseIf otherExceptionCount Mod 1000 = 0 Then
+                            _logger.LogWarning(
+                                "Tailer iter pre-increment exceptions for {Path}: {Count} occurrences so far",
+                                path, otherExceptionCount)
+                        End If
                     End Try
 
                     Await Task.Delay(500, token)
@@ -1538,18 +2238,33 @@ Namespace GSM.Node
                                                     End If
                                                 End Sub
 
+            ' Stderr handler is intentionally a no-op beyond draining.
+            ' UE4 dedicated servers on Linux with -log mirror every
+            ' log line to BOTH stdout and stderr (built-in behaviour
+            ' of FUnixOutputDeviceConsole + FUnixErrorOutputDevice).
+            ' If we forwarded both to the ring buffer, the manager
+            ' UI would see every line twice. The stdout handler
+            ' above is already capturing the canonical copy.
+            '
+            ' We still need a handler attached so .NET's
+            ' BeginErrorReadLine drainer doesn't stall — without an
+            ' active subscriber the pipe fills at ~4KB and back-
+            ' pressures the child's writes. The empty body lets the
+            ' reader thread keep cycling without touching shared
+            ' state.
+            '
+            ' Tradeoff: games that emit important content ONLY on
+            ' stderr (rare for dedicated game servers; possible for
+            ' wrapper scripts) won't surface those lines in the
+            ' manager log view. Such content does still appear on
+            ' the node's own stderr (terminal output or journald
+            ' when running under systemd). If a future plugin needs
+            ' stderr capture, the right extension is a
+            ' LaunchOptions.CaptureStderr flag plumbed onto
+            ' ManagedInstance.CaptureStderr and gated here, in the
+            ' same shape as CaptureStdout above.
             AddHandler proc.ErrorDataReceived, Sub(sender, e)
-                                                   If e.Data Is Nothing Then Return
-                                                   Dim ts = DateTime.UtcNow
-                                                   If managed.CaptureStdout Then
-                                                       _logStore.Append(managed.InstanceId,
-                                                           New BufferedLogLine With {
-                                                               .Timestamp = ts,
-                                                               .Text = e.Data,
-                                                               .IsError = True
-                                                           })
-                                                       _eventStore.ProcessLine(managed.InstanceId, ts, e.Data)
-                                                   End If
+                                                   ' Drain only — see comment block above.
                                                End Sub
 
             ' The Exited handler MUST NOT throw. .NET multicast events
@@ -1585,7 +2300,23 @@ Namespace GSM.Node
         Private Sub FinalizeStart(managed As ManagedInstance, proc As Process)
             managed.Process = proc
             managed.Pid = proc.Id
-            managed.StartedAt = DateTime.UtcNow
+
+            ' Prefer proc.StartTime (the kernel-recorded process
+            ' start time) over DateTime.UtcNow so the snapshot we
+            ' write carries the same value that re-adoption reads
+            ' back via Process.GetProcessById(...).StartTime on the
+            ' next node startup. That makes PID-reuse detection an
+            ' effectively-exact equality check rather than a
+            ' best-effort tolerance window. Falls back to UtcNow if
+            ' StartTime throws — some access-restricted processes
+            ' refuse to disclose it; none of our game-server
+            ' children would, but defensive coverage is cheap.
+            Try
+                managed.StartedAt = proc.StartTime.ToUniversalTime()
+            Catch
+                managed.StartedAt = DateTime.UtcNow
+            End Try
+
             managed.State = InstanceState.Running
             managed.StateChangedAt = DateTime.UtcNow
             managed.StopIntentPending = False
@@ -1601,7 +2332,70 @@ Namespace GSM.Node
             ' mirrored into the instance's log buffer. The old tailers
             ' were already cancelled by StopFileTailers inside
             ' HandleProcessExited, so this re-creates them.
-            StartFileTailers(managed, managed.LogFilePaths)
+            '
+            ' Start file tailers when the plugin has declared file
+            ' log sources. The tailers become the authoritative log
+            ' source whenever CaptureStdout is False — either because
+            ' the spawn strategy doesn't redirect stdio at all (Windows
+            ' Strategy B/C with their own hidden console) or because
+            ' Strategy A's redirected stdio is being silently drained
+            ' rather than forwarded to the EventStore (Linux + file
+            ' logs, where stdout would be a Display-filtered subset of
+            ' what the file contains).
+            '
+            ' The previous gate was on Strategy alone, which left the
+            ' Linux file-logged case in a broken state: stdout was the
+            ' source but missed every Verbose-category line, so events
+            ' like "Processing character update" (LogPersistence
+            ' Verbose) never reached the EventStore. Player sessions
+            ' on Linux instances never bound PlatformUserId, and
+            ' Persisting lines (also Verbose) couldn't correlate back
+            ' — the in-game character name never resolved past the
+            ' Steam handle until reconnect. Windows Strategy B already
+            ' tailed the file, which is why the same plugin worked
+            ' there on the same code.
+            Dim hasFileLogsForTailing = managed.LogFilePaths IsNot Nothing AndAlso
+                                         managed.LogFilePaths.Count > 0
+            If hasFileLogsForTailing AndAlso Not managed.CaptureStdout Then
+                StartFileTailers(managed, managed.LogFilePaths)
+            End If
+
+            ' Persist everything needed for re-adoption on next
+            ' node startup. See ProcessManager.AdoptSnapshots for
+            ' the read path. Serialization wrapped in try-catch
+            ' so a single weirdly-shaped value never blocks
+            ' the snapshot write — a partial snapshot is better
+            ' than no snapshot.
+            Dim logFilePathsJson As String = Nothing
+            If managed.LogFilePaths IsNot Nothing AndAlso managed.LogFilePaths.Count > 0 Then
+                Try
+                    logFilePathsJson = JsonSerializer.Serialize(managed.LogFilePaths)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Failed to serialize LogFilePaths for snapshot of {Id}",
+                        managed.InstanceId)
+                End Try
+            End If
+
+            Dim parseRulesJson As String = Nothing
+            If managed.ParseRules IsNot Nothing AndAlso managed.ParseRules.Count > 0 Then
+                Try
+                    parseRulesJson = JsonSerializer.Serialize(managed.ParseRules)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Failed to serialize ParseRules for snapshot of {Id}",
+                        managed.InstanceId)
+                End Try
+            End If
+
+            Dim exePath As String = Nothing
+            Dim arguments As String = Nothing
+            Dim workingDir As String = Nothing
+            If managed.StartInfo IsNot Nothing Then
+                exePath = managed.StartInfo.FileName
+                arguments = managed.StartInfo.Arguments
+                workingDir = managed.StartInfo.WorkingDirectory
+            End If
 
             _database.SaveInstanceSnapshot(
                 managed.InstanceId, managed.State.ToString(),
@@ -1611,7 +2405,16 @@ Namespace GSM.Node
                     .MaxCrash = managed.MaxCrashCount,
                     .WindowMin = managed.CrashWindowMinutes
                 }),
-                managed.StopIntentPending)
+                managed.StopIntentPending,
+                exePath,
+                arguments,
+                workingDir,
+                logFilePathsJson,
+                parseRulesJson,
+                CInt(managed.Strategy),
+                managed.StdoutIsLog,
+                managed.RequiresConsoleIsolation,
+                managed.LogTailerStartDelayMs)
 
             ' If the instance stays up long enough, clear CrashCount
             ' so the next crash starts from a clean backoff baseline.
@@ -1864,5 +2667,22 @@ Namespace GSM.Node
         Halt
         NoRestart
     End Enum
+
+    ''' <summary>
+    ''' JSON-deserialization target for the CrashPolicyJson
+    ''' column on InstanceSnapshots. The shape mirrors the
+    ''' anonymous-type object FinalizeStart serializes
+    ''' (.Policy / .MaxCrash / .WindowMin) — a named class is
+    ''' needed because System.Text.Json can't deserialize into
+    ''' VB.Net anonymous types. Used only by
+    ''' ProcessManager.TryAdoptOne; lives alongside ManagedInstance
+    ''' rather than in its own file to keep the snapshot read
+    ''' path adjacent to the write path.
+    ''' </summary>
+    Friend Class CrashPolicyState
+        Public Property Policy As String
+        Public Property MaxCrash As Integer
+        Public Property WindowMin As Integer
+    End Class
 
 End Namespace

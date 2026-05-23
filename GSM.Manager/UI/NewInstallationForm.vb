@@ -3,6 +3,7 @@ Imports System.Collections.Generic
 Imports System.Drawing
 Imports System.IO
 Imports System.Linq
+Imports System.Net
 Imports System.Text.Json
 Imports System.Threading
 Imports System.Threading.Tasks
@@ -72,6 +73,17 @@ Namespace GSM.Manager.UI
         Private _nodeEntities As List(Of NodeEntity)
         Private _steamCredIds As New List(Of String)
 
+        ' Phase 5h Realm picker. Visible only when the currently-
+        ' selected game's plugin implements ISharedConfigProvider.
+        ' Populated by RefreshRealmPicker on every game-selection
+        ' change. _newRealmProvider holds the cast result so
+        ' OnRealmNewClicked / OnSave don't have to re-cast.
+        Private _realmLabel As Label
+        Private _realmComboBox As ComboBox
+        Private _realmNewButton As Button
+        Private _realmIds As New List(Of String)
+        Private _newRealmProvider As ISharedConfigProvider
+
         ' Notice panel — rendered between the config panel and the
         ' action buttons, populated from
         ' IInstallationNoticeProvider.GetPreInstallNotices on every
@@ -108,6 +120,13 @@ Namespace GSM.Manager.UI
         ' the older request rather than letting two responses race.
         Private _statusFetchCts As CancellationTokenSource
 
+        ' Cancellation source for the in-flight prerequisite check.
+        ' Tripped whenever game OR node selection changes so a stale
+        ' result from an earlier selection can't clobber notices for
+        ' the current one — same pattern as _statusFetchCts above,
+        ' but driven by a different combination of user actions.
+        Private _prereqCheckCts As CancellationTokenSource
+
         ''' <summary>
         ''' The ID of the newly-created installation, populated by
         ''' OnSave on the success path immediately before closing
@@ -135,19 +154,43 @@ Namespace GSM.Manager.UI
             InitializeControls()
             LoadNodes()
             LoadGames()
-            ' Initial path suggestion — fire and forget. Both the node
-            ' and game combos have valid selections at this point
-            ' (LoadNodes / LoadGames pick index 0), so this triggers
-            ' a fetch and populates the path field with whatever the
-            ' node reports.
-            Task.Run(Async Function()
-                         Await RefreshSuggestedInstallPathAsync()
-                     End Function)
+            ' Initial path suggestion is deferred to OnShown — see
+            ' that override for the rationale. Firing it from the
+            ' constructor (the previous approach) silently failed
+            ' because RefreshSuggestedInstallPathAsync uses Me.Invoke
+            ' to capture combo selections, and Me.Invoke throws
+            ' before the form's window handle is created. The same
+            ' silent failure also explains why the path field came
+            ' up blank but populated as soon as the user changed
+            ' node or game after the form was visible.
+        End Sub
+
+        ''' <summary>
+        ''' Form-lifecycle hook: fires after the form's window handle
+        ''' exists and the user can see it. Used to kick off the
+        ''' initial install-path suggestion now that Me.Invoke (which
+        ''' RefreshSuggestedInstallPathAsync uses internally to read
+        ''' the combo selections from a background thread) is safe
+        ''' to call.
+        '''
+        ''' Called once per form-open in normal usage; subsequent
+        ''' path refreshes are driven by OnNodeChanged / OnGameChanged
+        ''' when the user changes selections.
+        '''
+        ''' No need to Task.Run here — OnShown runs on the UI thread,
+        ''' so RefreshSuggestedInstallPathAsync's first awaitable
+        ''' (the wire call to the node) yields the UI thread back
+        ''' to the message pump naturally. Wrapping in Task.Run
+        ''' would only add a thread-pool hop with no benefit.
+        ''' </summary>
+        Protected Overrides Sub OnShown(e As EventArgs)
+            MyBase.OnShown(e)
+            Dim _unusedPathRefresh = RefreshSuggestedInstallPathAsync()
         End Sub
 
         Private Sub InitializeControls()
             Me.Text = "New Installation"
-            Me.Size = New Size(600, 740)
+            Me.Size = New Size(600, 775)
             Me.FormBorderStyle = FormBorderStyle.FixedDialog
             Me.MaximizeBox = False
             Me.MinimizeBox = False
@@ -234,6 +277,30 @@ Namespace GSM.Manager.UI
             _steamCredComboBox.DropDownStyle = ComboBoxStyle.DropDownList
             Me.Controls.Add(_steamCredComboBox)
             LoadSteamCredentials()
+            y += 35
+
+            ' Phase 5h — Realm (shared-config) picker row.
+            ' Hidden by default; OnGameChanged calls
+            ' RefreshRealmPicker which makes the row visible when
+            ' the selected plugin implements ISharedConfigProvider.
+            _realmLabel = New Label() With {
+                .Text = "Realm:", .AutoSize = True,
+                .Location = New Point(20, y + 3),
+                .Visible = False}
+            Me.Controls.Add(_realmLabel)
+            _realmComboBox = New ComboBox() With {
+                .Location = New Point(150, y),
+                .Size = New Size(300, 24),
+                .DropDownStyle = ComboBoxStyle.DropDownList,
+                .Visible = False}
+            Me.Controls.Add(_realmComboBox)
+            _realmNewButton = New Button() With {
+                .Text = "New...",
+                .Location = New Point(455, y - 2),
+                .Size = New Size(85, 28),
+                .Visible = False}
+            AddHandler _realmNewButton.Click, AddressOf OnRealmNewClicked
+            Me.Controls.Add(_realmNewButton)
             y += 35
 
             ' Run _CommonRedist toggle — off by default since most
@@ -382,6 +449,14 @@ Namespace GSM.Manager.UI
             Task.Run(Async Function()
                          Await RefreshSuggestedInstallPathAsync()
                      End Function)
+
+            ' Node selection feeds the prerequisite check (which
+            ' probes that specific node for runtime deps), so
+            ' switching nodes invalidates the current prereq notices.
+            ' Refresh both static + dynamic notices for the new node.
+            ' Fire-and-forget; UI updates happen on resumption via
+            ' the captured SyncContext.
+            Dim _unusedNoticeRefresh = RefreshNoticesAsync()
         End Sub
 
         Private Sub OnGameChanged(sender As Object, e As EventArgs)
@@ -413,22 +488,19 @@ Namespace GSM.Manager.UI
                 _configPanel.Controls.Add(_schemaResult.Panel)
             End If
 
-            ' Refresh the notices panel for the new plugin. Plugins
-            ' that don't implement IInstallationNoticeProvider get
-            ' an empty list here and the panel hides itself.
-            Dim notices As IReadOnlyList(Of InstallationNotice) = Nothing
-            Dim provider = TryCast(currentPlugin, IInstallationNoticeProvider)
-            If provider IsNot Nothing Then
-                Try
-                    notices = provider.GetPreInstallNotices()
-                Catch
-                    ' Plugin throwing during a UI-triggered notice
-                    ' fetch shouldn't take the form down. Treat as
-                    ' "no notices" and move on.
-                    notices = Nothing
-                End Try
-            End If
-            RebuildNoticesPanel(notices)
+            ' Refresh the notices panel for the new plugin. Two-pass
+            ' flow: render static notices immediately (sync, cheap),
+            ' then async-append any prerequisite notices once the
+            ' node check completes. Fire-and-forget here — the
+            ' awaited part runs on the captured UI SyncContext so
+            ' RebuildNoticesPanel inside the async fn lands on the
+            ' UI thread without an explicit marshal.
+            Dim _unusedNoticeRefresh = RefreshNoticesAsync()
+
+            ' Phase 5h — refresh the Realm picker visibility +
+            ' contents. Plugins not implementing ISharedConfigProvider
+            ' get the row hidden; plugins that do get it populated.
+            RefreshRealmPicker(currentPlugin)
 
             ' Re-suggest the install path with the new game's GameId
             ' appended to the cached node status (no re-fetch needed
@@ -471,6 +543,187 @@ Namespace GSM.Manager.UI
                 End If
             End If
         End Sub
+
+        ''' <summary>
+        ''' Refresh the notices panel from the currently-selected
+        ''' plugin and node. Two-phase:
+        '''
+        '''   1. STATIC — IInstallationNoticeProvider.GetPreInstallNotices.
+        '''      Sync, cheap, renders immediately so the user sees
+        '''      visual feedback for the game change without waiting
+        '''      on the wire call below.
+        '''
+        '''   2. DYNAMIC — IPrerequisiteProvider.GetRequiredPrerequisites
+        '''      then a wire call to the selected node's
+        '''      /api/system/prerequisites endpoint. For each prereq
+        '''      reported missing (Recognized=True AndAlso
+        '''      Installed=False), synthesise a Warning notice with
+        '''      the node-supplied display fields. Append to the
+        '''      static list and re-render. Silent on every failure
+        '''      mode (no node selected, plugin doesn't implement
+        '''      the interface, 404 on pre-feature node, connection
+        '''      timeout) — prereq notices are a quality-of-life
+        '''      add, not a gate.
+        '''
+        ''' Cancellation: each call cancels and replaces the
+        ''' previous in-flight CTS so a fast game-or-node switch
+        ''' doesn't let a stale wire response clobber the current
+        ''' notice list. Resumes on the captured UI SyncContext so
+        ''' the final RebuildNoticesPanel call lands on the UI
+        ''' thread without an explicit marshal.
+        ''' </summary>
+        Private Async Function RefreshNoticesAsync() As Task
+            ' Replace any in-flight previous refresh's CTS. Disposing
+            ' the old one only after Cancel() is the right order
+            ' — outstanding awaits see the cancellation before the
+            ' source goes away.
+            Dim oldCts = _prereqCheckCts
+            _prereqCheckCts = New CancellationTokenSource()
+            Try
+                If oldCts IsNot Nothing Then
+                    oldCts.Cancel()
+                    oldCts.Dispose()
+                End If
+            Catch
+            End Try
+            Dim token = _prereqCheckCts.Token
+
+            ' --- Resolve the selected plugin ---
+            Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+            If registry Is Nothing OrElse Me.IsDisposed Then
+                If Not Me.IsDisposed Then RebuildNoticesPanel(Nothing)
+                Return
+            End If
+
+            Dim plugins = registry.GetAllPlugins()
+            If _gameComboBox.SelectedIndex < 0 OrElse
+               _gameComboBox.SelectedIndex >= plugins.Count Then
+                RebuildNoticesPanel(Nothing)
+                Return
+            End If
+            Dim currentPlugin = plugins(_gameComboBox.SelectedIndex)
+
+            ' --- Phase 1: static notices (sync, cheap) ---
+            Dim staticNotices As New List(Of InstallationNotice)
+            Dim noticeProvider = TryCast(currentPlugin, IInstallationNoticeProvider)
+            If noticeProvider IsNot Nothing Then
+                Try
+                    Dim source = noticeProvider.GetPreInstallNotices()
+                    If source IsNot Nothing Then staticNotices.AddRange(source)
+                Catch
+                    ' Plugin throwing during a UI-triggered notice
+                    ' fetch shouldn't take the form down. Treat as
+                    ' "no static notices" and continue to the
+                    ' dynamic phase.
+                End Try
+            End If
+
+            ' Render static immediately so the user sees something
+            ' for the game change — the dynamic phase below replaces
+            ' this with the combined list once the wire call lands.
+            RebuildNoticesPanel(staticNotices)
+
+            ' --- Phase 2: dynamic prereq notices (requires node + wire call) ---
+            Dim prereqProvider = TryCast(currentPlugin, IPrerequisiteProvider)
+            If prereqProvider Is Nothing Then Return
+            If _nodeComboBox.SelectedIndex < 0 Then Return
+            If _nodeEntities Is Nothing OrElse
+               _nodeComboBox.SelectedIndex >= _nodeEntities.Count Then Return
+
+            Dim prereqNames As IReadOnlyList(Of String) = Nothing
+            Try
+                prereqNames = prereqProvider.GetRequiredPrerequisites()
+            Catch
+                ' Same defensive stance as the static side — plugin
+                ' throwing here is a plugin bug, not a form-fatal
+                ' condition. Skip the dynamic phase silently.
+                Return
+            End Try
+            If prereqNames Is Nothing OrElse prereqNames.Count = 0 Then Return
+
+            Dim factory = ManagerProgram.Services.GetService(Of NodeHttpClientFactory)()
+            If factory Is Nothing Then Return
+
+            Dim selectedNode = _nodeEntities(_nodeComboBox.SelectedIndex)
+            Dim client = factory.GetClient(
+                selectedNode.NodeId,
+                selectedNode.HostAddress,
+                selectedNode.Port,
+                selectedNode.AuthToken)
+
+            Dim response As PrerequisiteCheckResponse = Nothing
+            Try
+                response = Await client.CheckPrerequisitesAsync(prereqNames, token)
+            Catch ex As OperationCanceledException
+                ' Newer refresh cancelled us before the response came
+                ' back; the newer refresh will render its own notices.
+                Return
+            Catch ex As NodeApiException When ex.StatusCode.HasValue AndAlso
+                                                ex.StatusCode.Value = HttpStatusCode.NotFound
+                ' Pre-prereq-feature node — the endpoint doesn't exist
+                ' yet. Best-effort feature; leave the static notices
+                ' rendered and move on.
+                Return
+            Catch
+                ' Connection/timeout/HTTP/deserialisation failure —
+                ' silently skip rather than surface a transient
+                ' network hiccup as a user-facing error. The user
+                ' can still proceed with the install (and if the
+                ' prereq really is missing they'll discover that
+                ' at launch time).
+                Return
+            End Try
+
+            If token.IsCancellationRequested OrElse Me.IsDisposed Then Return
+            If response Is Nothing OrElse response.Results Is Nothing Then Return
+
+            ' Synthesise a Warning notice for each prereq the node
+            ' reports as missing + recognised. Unrecognised entries
+            ' (older node, newer plugin) are silently skipped — see
+            ' the contract docs on PrerequisiteCheckResult.
+            Dim dynamicNotices As New List(Of InstallationNotice)
+            For Each r In response.Results
+                If r Is Nothing Then Continue For
+                If Not r.Recognized Then Continue For
+                If r.Installed Then Continue For
+
+                Dim displayName = If(String.IsNullOrEmpty(r.DisplayName),
+                                      r.Name,
+                                      r.DisplayName)
+                Dim title = $"Required runtime missing: {displayName}"
+
+                ' Body combines the node's Instructions plus a
+                ' separate "Download:" line so the URL is
+                ' visually distinct from the prose. The notice
+                ' renderer doesn't make URLs clickable today — the
+                ' user copies the link — but the separation makes
+                ' that copy-and-paste trivial.
+                Dim body = If(r.Instructions, "")
+                If Not String.IsNullOrEmpty(r.DownloadUrl) Then
+                    If body.Length > 0 Then body &= vbCrLf & vbCrLf
+                    body &= "Download: " & r.DownloadUrl
+                End If
+
+                dynamicNotices.Add(New InstallationNotice With {
+                    .Severity = NoticeSeverity.Warning,
+                    .Title = title,
+                    .Body = body
+                })
+            Next
+
+            ' Nothing missing — no need to re-render. The static-only
+            ' panel from Phase 1 is already correct.
+            If dynamicNotices.Count = 0 Then Return
+
+            ' Combined list: static first (game-level context the
+            ' user benefits from regardless of prereq state), then
+            ' dynamic (the actionable "install this to proceed"
+            ' notices).
+            Dim combined As New List(Of InstallationNotice)
+            combined.AddRange(staticNotices)
+            combined.AddRange(dynamicNotices)
+            RebuildNoticesPanel(combined)
+        End Function
 
         ''' <summary>
         ''' Replace the contents of _noticesPanel with rendered
@@ -791,6 +1044,21 @@ Namespace GSM.Manager.UI
                     .CreatedUtc = DateTime.UtcNow,
                     .UpdatedUtc = DateTime.UtcNow
                 }
+
+                ' Phase 5h — link to the selected Realm if the
+                ' picker is visible and the user chose something
+                ' other than "(none)". Empty string maps to NULL
+                ' on the FK column — the merge then falls through
+                ' to the install + instance layers only.
+                If _realmComboBox IsNot Nothing AndAlso _realmComboBox.Visible AndAlso
+                   _realmComboBox.SelectedIndex >= 0 AndAlso
+                   _realmComboBox.SelectedIndex < _realmIds.Count Then
+                    Dim selectedRealmId = _realmIds(_realmComboBox.SelectedIndex)
+                    If Not String.IsNullOrEmpty(selectedRealmId) Then
+                        installEntity.SharedConfigGroupId = selectedRealmId
+                    End If
+                End If
+
                 db.Installations.Add(installEntity)
 
                 ' Optionally create first instance
@@ -910,6 +1178,102 @@ Namespace GSM.Manager.UI
             Me.Controls.Add(lbl)
             Return lbl
         End Function
+
+        ''' <summary>
+        ''' Phase 5h — refresh the Realm picker for the currently
+        ''' selected game's plugin. Plugins without
+        ''' ISharedConfigProvider get the row hidden; plugins that
+        ''' opt in get the row visible with the plugin's
+        ''' SharedConfigLabel as the label text and existing
+        ''' groups populating the combo.
+        ''' </summary>
+        Private Sub RefreshRealmPicker(currentPlugin As IGamePlugin)
+            _newRealmProvider = TryCast(currentPlugin, ISharedConfigProvider)
+            If _newRealmProvider Is Nothing Then
+                _realmLabel.Visible = False
+                _realmComboBox.Visible = False
+                _realmNewButton.Visible = False
+                Return
+            End If
+
+            _realmLabel.Text = _newRealmProvider.SharedConfigLabel & ":"
+            _realmLabel.Visible = True
+            _realmComboBox.Visible = True
+            _realmNewButton.Visible = True
+            PopulateRealmCombo(preselectGroupId:=Nothing)
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5h — fill the Realm combo with "(none)" plus
+        ''' all existing groups for the currently-selected
+        ''' plugin. Defaults to "(none)"; passing a non-empty
+        ''' preselectGroupId selects that group instead, used
+        ''' after the create-new flow to highlight the realm
+        ''' the user just made.
+        ''' </summary>
+        Private Sub PopulateRealmCombo(preselectGroupId As String)
+            _realmComboBox.Items.Clear()
+            _realmIds.Clear()
+            _realmComboBox.Items.Add("(none)")
+            _realmIds.Add("")
+
+            If _newRealmProvider Is Nothing Then
+                _realmComboBox.SelectedIndex = 0
+                Return
+            End If
+
+            Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+            Dim svc = ManagerProgram.Services.GetService(Of SharedConfigService)()
+            If registry Is Nothing OrElse svc Is Nothing OrElse
+               _gameComboBox.SelectedIndex < 0 Then
+                _realmComboBox.SelectedIndex = 0
+                Return
+            End If
+
+            Dim plugins = registry.GetAllPlugins()
+            If _gameComboBox.SelectedIndex >= plugins.Count Then
+                _realmComboBox.SelectedIndex = 0
+                Return
+            End If
+            Dim currentPlugin = plugins(_gameComboBox.SelectedIndex)
+
+            Dim selectedIdx = 0
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim groups = svc.ListGroups(db, currentPlugin.GameId, _newRealmProvider.SharedConfigKey)
+                For Each g In groups
+                    _realmComboBox.Items.Add(g.DisplayName)
+                    _realmIds.Add(g.GroupId)
+                    If Not String.IsNullOrEmpty(preselectGroupId) AndAlso
+                       String.Equals(g.GroupId, preselectGroupId, StringComparison.Ordinal) Then
+                        selectedIdx = _realmComboBox.Items.Count - 1
+                    End If
+                Next
+            End Using
+            _realmComboBox.SelectedIndex = selectedIdx
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5h — open the SharedConfigGroupEditForm in
+        ''' create-new mode for the current plugin, then re-
+        ''' populate the realm combo and select the new group
+        ''' via dlg.SavedGroupId.
+        ''' </summary>
+        Private Sub OnRealmNewClicked(sender As Object, e As EventArgs)
+            If _newRealmProvider Is Nothing Then Return
+            Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+            If registry Is Nothing Then Return
+            Dim plugins = registry.GetAllPlugins()
+            If _gameComboBox.SelectedIndex < 0 OrElse
+               _gameComboBox.SelectedIndex >= plugins.Count Then Return
+            Dim currentPlugin = plugins(_gameComboBox.SelectedIndex)
+
+            Using dlg As New SharedConfigGroupEditForm(currentPlugin, _newRealmProvider, Nothing)
+                If dlg.ShowDialog(Me) = DialogResult.OK Then
+                    PopulateRealmCombo(dlg.SavedGroupId)
+                End If
+            End Using
+        End Sub
 
     End Class
 

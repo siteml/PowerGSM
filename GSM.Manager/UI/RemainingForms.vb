@@ -334,6 +334,464 @@ Namespace GSM.Manager.UI
     End Class
 
     ' ============================================================
+    '  SharedConfigGroupsForm — manage plugin-defined shared
+    '  configuration groups (Phase 5h)
+    '
+    '  One tab per loaded plugin that implements
+    '  ISharedConfigProvider. Each tab lists the groups belonging
+    '  to that plugin's SharedConfigKey and lets the user add /
+    '  edit / delete them. Schema for each group's fields comes
+    '  from the plugin via GetSharedConfigSchema, rendered with
+    '  the existing SchemaFormBuilder in SharedConfigGroupEditForm.
+    '
+    '  If no loaded plugin implements ISharedConfigProvider, the
+    '  form opens with a single "no plugins" tab containing an
+    '  explanatory message — better than throwing a quiet "empty
+    '  TabControl" at the user.
+    ' ============================================================
+
+    Public Class SharedConfigGroupsForm
+        Inherits Form
+
+        Private _tabControl As TabControl
+
+        ' Small bundle for the (plugin, provider) pair instead of
+        ' a named tuple. VB.NET's case-insensitive name resolution
+        ' rejects a `(GamePlugin As IGamePlugin, ...)` tuple
+        ' element name with BC30112 when GSM.Plugin is imported —
+        ' the compiler resolves `gamePlugin`-style identifiers in
+        ' the same scope as if they were references to the imported
+        ' namespace, even though the tuple element name and the
+        ' loop variable are distinct identifiers. A private nested
+        ' class side-steps the whole question.
+        Private Class ProviderEntry
+            Public ReadOnly Game As IGamePlugin
+            Public ReadOnly Provider As ISharedConfigProvider
+            Public Sub New(g As IGamePlugin, p As ISharedConfigProvider)
+                Game = g
+                Provider = p
+            End Sub
+        End Class
+
+        Public Sub New()
+            FormIconHelper.ApplyTo(Me)
+            InitializeControls()
+        End Sub
+
+        Private Sub InitializeControls()
+            Me.Text = "Shared Resources"
+            Me.Size = New Size(720, 500)
+            Me.StartPosition = FormStartPosition.CenterParent
+            Me.MinimumSize = New Size(560, 380)
+
+            _tabControl = New TabControl() With {
+                .Dock = DockStyle.Fill,
+                .Padding = New Point(12, 4)
+            }
+            Me.Controls.Add(_tabControl)
+
+            PopulateTabs()
+        End Sub
+
+        Private Sub PopulateTabs()
+            _tabControl.TabPages.Clear()
+
+            Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+            Dim providers As New List(Of ProviderEntry)
+            If registry IsNot Nothing Then
+                For Each gp In registry.GetAllPlugins()
+                    Dim provider = TryCast(gp, ISharedConfigProvider)
+                    If provider IsNot Nothing Then
+                        providers.Add(New ProviderEntry(gp, provider))
+                    End If
+                Next
+            End If
+
+            If providers.Count = 0 Then
+                Dim emptyTab As New TabPage("(none)")
+                Dim emptyLbl As New Label() With {
+                    .Text = "No loaded plugin declares shared resources." & vbCrLf & vbCrLf &
+                           "Plugins opt into this feature by implementing" & vbCrLf &
+                           "ISharedConfigProvider — Last Oasis uses it for" & vbCrLf &
+                           "the Realm concept, for example. Reload plugins" & vbCrLf &
+                           "from Tools → Reload Plugins if you've recently" & vbCrLf &
+                           "added or updated one.",
+                    .AutoSize = False,
+                    .Dock = DockStyle.Fill,
+                    .TextAlign = ContentAlignment.MiddleCenter,
+                    .ForeColor = Color.DimGray,
+                    .Font = New Font("Segoe UI", 9.5F)
+                }
+                emptyTab.Controls.Add(emptyLbl)
+                _tabControl.TabPages.Add(emptyTab)
+                Return
+            End If
+
+            For Each entry In providers
+                ' Tab label uses the plugin's user-facing
+                ' SharedConfigLabel + "s" — the interface contract
+                ' says plugins supply the singular form and the UI
+                ' pluralises. Ascii "s" suffix is fine for English
+                ' labels ("Realm" → "Realms"); irregular plurals
+                ' would need a richer interface eventually.
+                Dim tab As New TabPage(entry.Provider.SharedConfigLabel & "s")
+                tab.Padding = New Padding(6)
+                Dim panel = BuildProviderTab(entry.Game, entry.Provider)
+                panel.Dock = DockStyle.Fill
+                tab.Controls.Add(panel)
+                _tabControl.TabPages.Add(tab)
+            Next
+        End Sub
+
+        ''' <summary>
+        ''' Builds one tab's contents — the per-plugin list of
+        ''' shared-config groups plus the Add / Edit / Delete
+        ''' buttons. Each tab owns its own ListView so reloading
+        ''' one plugin's groups doesn't disturb other tabs.
+        ''' </summary>
+        Private Function BuildProviderTab(gamePlugin As IGamePlugin,
+                                          provider As ISharedConfigProvider) As Control
+            Dim host As New Panel() With {.Dock = DockStyle.Fill}
+
+            Dim listView As New ListView() With {
+                .View = View.Details,
+                .FullRowSelect = True,
+                .GridLines = True,
+                .HideSelection = False,
+                .Location = New Point(10, 50),
+                .Size = New Size(660, 340),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or
+                          AnchorStyles.Right Or AnchorStyles.Bottom
+            }
+            listView.Columns.Add("Name", 240)
+            listView.Columns.Add("Linked installations", 200)
+            listView.Columns.Add("Updated", 180)
+            host.Controls.Add(listView)
+
+            Dim refreshList As Action =
+                Sub() RefreshGroupList(listView, gamePlugin, provider)
+
+            Dim addBtn As New Button() With {
+                .Text = "Add",
+                .Size = New Size(90, 30),
+                .Location = New Point(10, 12)
+            }
+            AddHandler addBtn.Click,
+                Sub(s, e)
+                    Using dlg As New SharedConfigGroupEditForm(gamePlugin, provider, groupId:=Nothing)
+                        If dlg.ShowDialog(Me) = DialogResult.OK Then refreshList()
+                    End Using
+                End Sub
+            host.Controls.Add(addBtn)
+
+            Dim editBtn As New Button() With {
+                .Text = "Edit",
+                .Size = New Size(90, 30),
+                .Location = New Point(110, 12)
+            }
+            AddHandler editBtn.Click,
+                Sub(s, e)
+                    If listView.SelectedItems.Count = 0 Then Return
+                    Dim selectedId = TryCast(listView.SelectedItems(0).Tag, String)
+                    If String.IsNullOrEmpty(selectedId) Then Return
+                    Using dlg As New SharedConfigGroupEditForm(gamePlugin, provider, selectedId)
+                        If dlg.ShowDialog(Me) = DialogResult.OK Then refreshList()
+                    End Using
+                End Sub
+            host.Controls.Add(editBtn)
+
+            Dim deleteBtn As New Button() With {
+                .Text = "Delete",
+                .Size = New Size(90, 30),
+                .Location = New Point(210, 12)
+            }
+            AddHandler deleteBtn.Click,
+                Sub(s, e)
+                    If listView.SelectedItems.Count = 0 Then Return
+                    Dim selectedId = TryCast(listView.SelectedItems(0).Tag, String)
+                    If String.IsNullOrEmpty(selectedId) Then Return
+                    Dim selectedName = listView.SelectedItems(0).Text
+                    ' Warn if the group has linked installations — the FK
+                    ' nulls out on delete (per InstallationEntityConfig)
+                    ' rather than cascading, so installations survive,
+                    ' but they revert to install-level config and lose
+                    ' the realm-level values until re-linked.
+                    Dim linkedCount = CountLinkedInstallations(selectedId)
+                    Dim message = $"Delete the {provider.SharedConfigLabel.ToLowerInvariant()} '{selectedName}'?"
+                    If linkedCount > 0 Then
+                        message &= vbCrLf & vbCrLf &
+                            $"{linkedCount} installation(s) currently link to this group. " &
+                            "Deleting it will leave those installations without a shared link — " &
+                            "they'll keep working using their own install-level config (if any), " &
+                            "but lose access to the group's shared fields until you link them to " &
+                            $"another {provider.SharedConfigLabel.ToLowerInvariant()}."
+                    End If
+                    Dim confirm = MessageBox.Show(message, "Confirm delete",
+                        MessageBoxButtons.YesNo,
+                        If(linkedCount > 0, MessageBoxIcon.Warning, MessageBoxIcon.Question))
+                    If confirm <> DialogResult.Yes Then Return
+
+                    Dim svc = ManagerProgram.Services.GetService(Of SharedConfigService)()
+                    If svc Is Nothing Then Return
+                    Using scope = ManagerProgram.Services.CreateScope()
+                        Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                        svc.DeleteGroup(db, selectedId)
+                    End Using
+                    refreshList()
+                End Sub
+            host.Controls.Add(deleteBtn)
+
+            refreshList()
+            Return host
+        End Function
+
+        Private Sub RefreshGroupList(listView As ListView,
+                                     gamePlugin As IGamePlugin,
+                                     provider As ISharedConfigProvider)
+            listView.Items.Clear()
+            Dim svc = ManagerProgram.Services.GetService(Of SharedConfigService)()
+            If svc Is Nothing Then Return
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim groups = svc.ListGroups(db, gamePlugin.GameId, provider.SharedConfigKey)
+                For Each g In groups
+                    Dim linkedCount = db.Installations.
+                        Count(Function(i) i.SharedConfigGroupId = g.GroupId)
+                    Dim linkedText As String
+                    If linkedCount = 0 Then
+                        linkedText = "(none)"
+                    ElseIf linkedCount = 1 Then
+                        linkedText = "1 installation"
+                    Else
+                        linkedText = $"{linkedCount} installations"
+                    End If
+                    Dim item As New ListViewItem(g.DisplayName)
+                    item.SubItems.Add(linkedText)
+                    item.SubItems.Add(g.UpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"))
+                    item.Tag = g.GroupId
+                    listView.Items.Add(item)
+                Next
+            End Using
+        End Sub
+
+        ''' <summary>
+        ''' Count of installations currently linked to a given
+        ''' group. Used to warn the user before delete — deleting a
+        ''' group with live links nulls out those installations'
+        ''' SharedConfigGroupId, which is recoverable but might be
+        ''' surprising.
+        ''' </summary>
+        Private Function CountLinkedInstallations(groupId As String) As Integer
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Return db.Installations.Count(Function(i) i.SharedConfigGroupId = groupId)
+            End Using
+        End Function
+
+    End Class
+
+    ' ============================================================
+    '  SharedConfigGroupEditForm — per-item editor for a shared-
+    '  config group, schema-driven via SchemaFormBuilder.
+    '
+    '  Constructor takes the plugin + ISharedConfigProvider it
+    '  exposes plus an optional groupId; null groupId = create-
+    '  new flow, non-null = edit existing.
+    ' ============================================================
+
+    Friend Class SharedConfigGroupEditForm
+        Inherits Form
+
+        Private ReadOnly _plugin As IGamePlugin
+        Private ReadOnly _provider As ISharedConfigProvider
+        Private ReadOnly _groupId As String
+        Private ReadOnly _isNew As Boolean
+
+        Private _displayNameTextBox As TextBox
+        Private _configPanel As Panel
+        Private _schemaResult As SchemaFormResult
+
+        ''' <summary>
+        ''' Group id assigned after a successful save. For Create-
+        ''' new, this is the GUID CreateGroup minted; for Edit,
+        ''' it's the same id the form was opened with. Empty
+        ''' before save, on the cancel path, or if save fails.
+        ''' Lets a calling form (e.g. NewInstallationForm,
+        ''' EditInstallationForm) re-select the just-created
+        ''' group in a dropdown after the dialog closes.
+        ''' </summary>
+        Public Property SavedGroupId As String = ""
+
+        Public Sub New(gamePlugin As IGamePlugin,
+                       provider As ISharedConfigProvider,
+                       groupId As String)
+            FormIconHelper.ApplyTo(Me)
+            _plugin = gamePlugin
+            _provider = provider
+            _groupId = groupId
+            _isNew = String.IsNullOrEmpty(groupId)
+            InitializeControls()
+            LoadExistingValues()
+        End Sub
+
+        Private Sub InitializeControls()
+            Me.Text = If(_isNew,
+                $"Add {_provider.SharedConfigLabel}",
+                $"Edit {_provider.SharedConfigLabel}")
+            Me.Size = New Size(580, 520)
+            Me.FormBorderStyle = FormBorderStyle.FixedDialog
+            Me.MaximizeBox = False
+            Me.MinimizeBox = False
+            Me.StartPosition = FormStartPosition.CenterParent
+
+            Dim y = 20
+
+            Dim nameLbl As New Label() With {
+                .Text = $"{_provider.SharedConfigLabel} name:",
+                .AutoSize = True,
+                .Location = New Point(20, y + 3)
+            }
+            Me.Controls.Add(nameLbl)
+            _displayNameTextBox = New TextBox() With {
+                .Location = New Point(180, y),
+                .Size = New Size(360, 24)
+            }
+            Me.Controls.Add(_displayNameTextBox)
+            y += 35
+
+            Dim configLabel As New Label() With {
+                .Text = $"{_provider.SharedConfigLabel} configuration",
+                .Font = New Font("Segoe UI", 10, FontStyle.Bold),
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(configLabel)
+            y += 25
+
+            _configPanel = New Panel() With {
+                .Location = New Point(20, y),
+                .Size = New Size(520, 340),
+                .BorderStyle = BorderStyle.FixedSingle,
+                .AutoScroll = True
+            }
+            Me.Controls.Add(_configPanel)
+            y += 350
+
+            Dim saveBtn As New Button() With {
+                .Text = "Save",
+                .Size = New Size(100, 32),
+                .Location = New Point(330, y)
+            }
+            AddHandler saveBtn.Click, AddressOf OnSave
+            Me.Controls.Add(saveBtn)
+
+            Dim cancelBtn As New Button() With {
+                .Text = "Cancel",
+                .Size = New Size(100, 32),
+                .Location = New Point(440, y),
+                .DialogResult = DialogResult.Cancel
+            }
+            Me.Controls.Add(cancelBtn)
+            Me.CancelButton = cancelBtn
+            Me.AcceptButton = saveBtn
+        End Sub
+
+        Private Sub LoadExistingValues()
+            Dim schema = _provider.GetSharedConfigSchema()
+            Dim existingValues As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+            If Not _isNew Then
+                Dim svc = ManagerProgram.Services.GetService(Of SharedConfigService)()
+                If svc IsNot Nothing Then
+                    Using scope = ManagerProgram.Services.CreateScope()
+                        Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                        Dim entity = svc.GetGroup(db, _groupId)
+                        If entity IsNot Nothing Then
+                            _displayNameTextBox.Text = entity.DisplayName
+                            existingValues = svc.LoadGroupFieldsPlaintext(db, _groupId, schema)
+                        End If
+                    End Using
+                End If
+            End If
+
+            _schemaResult = SchemaFormBuilder.Build(schema, existingValues)
+            If _schemaResult.Panel IsNot Nothing Then
+                _schemaResult.Panel.Dock = DockStyle.Fill
+                _configPanel.Controls.Add(_schemaResult.Panel)
+            End If
+        End Sub
+
+        Private Sub OnSave(sender As Object, e As EventArgs)
+            If String.IsNullOrWhiteSpace(_displayNameTextBox.Text) Then
+                MessageBox.Show(
+                    $"{_provider.SharedConfigLabel} name is required.",
+                    "Validation",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                Return
+            End If
+
+            Dim values As Dictionary(Of String, String)
+            If _schemaResult IsNot Nothing AndAlso _schemaResult.ValueExtractor IsNot Nothing Then
+                values = _schemaResult.ValueExtractor.Invoke()
+            Else
+                values = New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+            End If
+
+            ' Enforce required fields from the schema. The schema
+            ' form doesn't currently validate required-ness on its
+            ' own (it leaves that to the consuming form), so do it
+            ' here before persisting.
+            Dim schema = _provider.GetSharedConfigSchema()
+            For Each descriptor In schema
+                If descriptor.IsRequired Then
+                    Dim value = ""
+                    values.TryGetValue(descriptor.Key, value)
+                    If String.IsNullOrWhiteSpace(value) Then
+                        MessageBox.Show(
+                            $"'{descriptor.Label}' is required.",
+                            "Validation",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                        Return
+                    End If
+                End If
+            Next
+
+            Try
+                Dim svc = ManagerProgram.Services.GetService(Of SharedConfigService)()
+                If svc Is Nothing Then
+                    MessageBox.Show("SharedConfigService is not registered.",
+                        "Internal error", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                    Return
+                End If
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    If _isNew Then
+                        Me.SavedGroupId = svc.CreateGroup(db,
+                            _plugin.GameId,
+                            _provider.SharedConfigKey,
+                            _displayNameTextBox.Text.Trim(),
+                            values,
+                            schema)
+                    Else
+                        svc.UpdateGroup(db,
+                            _groupId,
+                            _displayNameTextBox.Text.Trim(),
+                            values,
+                            schema)
+                        Me.SavedGroupId = _groupId
+                    End If
+                End Using
+                Me.DialogResult = DialogResult.OK
+                Me.Close()
+            Catch ex As Exception
+                MessageBox.Show($"Failed to save: {ex.Message}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error)
+            End Try
+        End Sub
+
+    End Class
+
+    ' ============================================================
     '  AutomationRulesForm — list and manage automation rules
     ' ============================================================
 
@@ -2742,6 +3200,16 @@ Namespace GSM.Manager.UI
         Private _configPanel As Panel
         Private _schemaResult As SchemaFormResult
 
+        ' Phase 5h Realm picker (shown only when the plugin
+        ' implements ISharedConfigProvider). Populated by
+        ' LoadExistingValues once the entity + plugin are known.
+        Private _realmLabel As Label
+        Private _realmComboBox As ComboBox
+        Private _realmNewButton As Button
+        Private _realmIds As New List(Of String)
+        Private _editPlugin As IGamePlugin
+        Private _editRealmProvider As ISharedConfigProvider
+
         Public Sub New(installationId As String)
             FormIconHelper.ApplyTo(Me)
             _installationId = installationId
@@ -2751,7 +3219,7 @@ Namespace GSM.Manager.UI
 
         Private Sub InitializeControls()
             Me.Text = "Edit Installation"
-            Me.Size = New Size(580, 640)
+            Me.Size = New Size(580, 680)
             Me.FormBorderStyle = FormBorderStyle.FixedDialog
             Me.MaximizeBox = False
             Me.MinimizeBox = False
@@ -2799,6 +3267,32 @@ Namespace GSM.Manager.UI
                 .Size = New Size(380, 24),
                 .DropDownStyle = ComboBoxStyle.DropDownList}
             Me.Controls.Add(_steamCredCombo)
+            y += 35
+
+            ' Phase 5h — Realm (shared-config) picker row.
+            ' Hidden by default; LoadExistingValues makes it
+            ' visible if the installation's plugin implements
+            ' ISharedConfigProvider. Label text comes from the
+            ' plugin's SharedConfigLabel so non-LO plugins that
+            ' opt in get appropriate copy ("Cluster:", etc.).
+            _realmLabel = New Label() With {
+                .Text = "Realm:", .AutoSize = True,
+                .Location = New Point(20, y + 3),
+                .Visible = False}
+            Me.Controls.Add(_realmLabel)
+            _realmComboBox = New ComboBox() With {
+                .Location = New Point(160, y),
+                .Size = New Size(290, 24),
+                .DropDownStyle = ComboBoxStyle.DropDownList,
+                .Visible = False}
+            Me.Controls.Add(_realmComboBox)
+            _realmNewButton = New Button() With {
+                .Text = "New...",
+                .Location = New Point(455, y - 2),
+                .Size = New Size(85, 28),
+                .Visible = False}
+            AddHandler _realmNewButton.Click, AddressOf OnRealmNewClicked
+            Me.Controls.Add(_realmNewButton)
             y += 35
 
             ' Run _CommonRedist toggle — off by default since most
@@ -2903,6 +3397,72 @@ Namespace GSM.Manager.UI
                     _schemaResult.Panel.Dock = DockStyle.Fill
                     _configPanel.Controls.Add(_schemaResult.Panel)
                 End If
+
+                ' Capture plugin reference for the Realm picker's
+                ' refresh + create-new path.
+                _editPlugin = gamePlugin
+                _editRealmProvider = TryCast(gamePlugin, ISharedConfigProvider)
+                If _editRealmProvider IsNot Nothing Then
+                    _realmLabel.Text = _editRealmProvider.SharedConfigLabel & ":"
+                    _realmLabel.Visible = True
+                    _realmComboBox.Visible = True
+                    _realmNewButton.Visible = True
+                    PopulateRealmCombo(installEntity.SharedConfigGroupId)
+                End If
+            End Using
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5h — fill the Realm combo with "(none)" plus
+        ''' all existing groups for the installation's plugin,
+        ''' then select the one matching preselectGroupId (or
+        ''' fall back to "(none)" when preselect is empty or no
+        ''' longer exists).
+        ''' </summary>
+        Private Sub PopulateRealmCombo(preselectGroupId As String)
+            _realmComboBox.Items.Clear()
+            _realmIds.Clear()
+            _realmComboBox.Items.Add("(none)")
+            _realmIds.Add("")
+
+            If _editPlugin Is Nothing OrElse _editRealmProvider Is Nothing Then
+                _realmComboBox.SelectedIndex = 0
+                Return
+            End If
+
+            Dim svc = ManagerProgram.Services.GetService(Of SharedConfigService)()
+            If svc Is Nothing Then
+                _realmComboBox.SelectedIndex = 0
+                Return
+            End If
+
+            Dim selectedIdx = 0
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim groups = svc.ListGroups(db, _editPlugin.GameId, _editRealmProvider.SharedConfigKey)
+                For Each g In groups
+                    _realmComboBox.Items.Add(g.DisplayName)
+                    _realmIds.Add(g.GroupId)
+                    If Not String.IsNullOrEmpty(preselectGroupId) AndAlso
+                       String.Equals(g.GroupId, preselectGroupId, StringComparison.Ordinal) Then
+                        selectedIdx = _realmComboBox.Items.Count - 1
+                    End If
+                Next
+            End Using
+            _realmComboBox.SelectedIndex = selectedIdx
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5h — open the SharedConfigGroupEditForm in create-
+        ''' new mode, then re-populate the realm combo and select
+        ''' the newly-created group via the form's SavedGroupId.
+        ''' </summary>
+        Private Sub OnRealmNewClicked(sender As Object, e As EventArgs)
+            If _editPlugin Is Nothing OrElse _editRealmProvider Is Nothing Then Return
+            Using dlg As New SharedConfigGroupEditForm(_editPlugin, _editRealmProvider, Nothing)
+                If dlg.ShowDialog(Me) = DialogResult.OK Then
+                    PopulateRealmCombo(dlg.SavedGroupId)
+                End If
             End Using
         End Sub
 
@@ -2933,6 +3493,20 @@ Namespace GSM.Manager.UI
                 installEntity.SteamCredentialId = If(String.IsNullOrEmpty(selectedCredId),
                                                       Nothing, selectedCredId)
                 installEntity.RunCommonRedist = _runRedistCheckBox.Checked
+
+                ' Phase 5h — update the Realm link if the picker is
+                ' visible (i.e. the plugin opts into shared config).
+                ' Empty selection clears the link (FK becomes NULL),
+                ' which falls back the three-layer merge to the
+                ' install layer for this installation's instances.
+                If _realmComboBox IsNot Nothing AndAlso _realmComboBox.Visible AndAlso
+                   _realmComboBox.SelectedIndex >= 0 AndAlso
+                   _realmComboBox.SelectedIndex < _realmIds.Count Then
+                    Dim selectedRealmId = _realmIds(_realmComboBox.SelectedIndex)
+                    installEntity.SharedConfigGroupId = If(
+                        String.IsNullOrEmpty(selectedRealmId), Nothing, selectedRealmId)
+                End If
+
                 installEntity.UpdatedUtc = DateTime.UtcNow
                 db.SaveChanges()
             End Using

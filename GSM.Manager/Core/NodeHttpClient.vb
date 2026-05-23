@@ -2,6 +2,7 @@ Imports System
 Imports System.Collections.Concurrent
 Imports System.Collections.Generic
 Imports System.IO
+Imports System.Linq
 Imports System.Net
 Imports System.Net.Http
 Imports System.Net.Http.Json
@@ -135,6 +136,52 @@ Namespace GSM.Manager.Core
             End SyncLock
         End Function
 
+        ' ---- Host-side prerequisite checks (Phase 5g side-feature) ----
+
+        ''' <summary>
+        ''' Query the node for the install state of named host-side
+        ''' runtime dependencies. See INodeClient.CheckPrerequisitesAsync
+        ''' for the contract; this implementation joins names as a
+        ''' single comma-separated query value, individually escaped
+        ''' via Uri.EscapeDataString so embedded commas (none today,
+        ''' but defensive) survive the round trip without colliding
+        ''' with the delimiter.
+        '''
+        ''' Empty / Nothing names list short-circuits with an empty
+        ''' response — no point round-tripping when there's nothing
+        ''' to ask. Other failures (network, 404 on older nodes,
+        ''' deserialisation) flow through WrapException so callers
+        ''' can catch NodeConnectionException / NodeApiException
+        ''' specifically.
+        ''' </summary>
+        Public Async Function CheckPrerequisitesAsync(names As IReadOnlyList(Of String),
+                                                       cancellation As CancellationToken) As Task(Of PrerequisiteCheckResponse) Implements INodeClient.CheckPrerequisitesAsync
+            If names Is Nothing OrElse names.Count = 0 Then
+                Return New PrerequisiteCheckResponse With {
+                    .Results = New List(Of PrerequisiteCheckResult)()
+                }
+            End If
+
+            Try
+                Dim joined = String.Join(",",
+                    names.Select(Function(n) Uri.EscapeDataString(If(n, ""))))
+                Dim url = $"/api/system/prerequisites?names={joined}"
+                Dim result = Await _httpClient.GetFromJsonAsync(Of PrerequisiteCheckResponse)(
+                    url, cancellation)
+                If result Is Nothing Then
+                    Return New PrerequisiteCheckResponse With {
+                        .Results = New List(Of PrerequisiteCheckResult)()
+                    }
+                End If
+                If result.Results Is Nothing Then
+                    result.Results = New List(Of PrerequisiteCheckResult)()
+                End If
+                Return result
+            Catch ex As Exception
+                Throw WrapException("CheckPrerequisites", ex)
+            End Try
+        End Function
+
         ' ---- Instance lifecycle ----
 
         Public Async Function StartInstanceAsync(request As StartInstanceRequest,
@@ -225,6 +272,26 @@ Namespace GSM.Manager.Core
                 Return If(result, New List(Of ChatMessage))
             Catch ex As Exception
                 Throw WrapException("GetChatHistory", ex)
+            End Try
+        End Function
+
+        Public Async Function UpdateParseRulesAsync(instanceId As String,
+                                                     rules As IList(Of LogParseRule),
+                                                     cancellation As CancellationToken) As Task Implements INodeClient.UpdateParseRulesAsync
+            ' Manager-side caller is the reconnect path — if the
+            ' node is older than this endpoint we want a clean
+            ' NodeApiException(StatusCode=NotFound) bubbling up
+            ' for the caller's catch-and-proceed handler, not a
+            ' generic connection error. WrapException already
+            ' translates HTTP-status errors into NodeApiException
+            ' with the StatusCode populated, so the caller can
+            ' branch on that.
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/parse-rules"
+                Dim resp = Await _httpClient.PostAsJsonAsync(url, rules, cancellation)
+                resp.EnsureSuccessStatusCode()
+            Catch ex As Exception
+                Throw WrapException("UpdateParseRules", ex)
             End Try
         End Function
 

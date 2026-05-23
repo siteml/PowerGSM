@@ -29,6 +29,26 @@ Namespace GSM.Manager.Data
         Public Property HostAddress As String
         Public Property Port As Integer = 8765
         Public Property AuthToken As String
+
+        ''' <summary>
+        ''' Attach/detach toggle (True = attached, False =
+        ''' detached). When detached, the manager skips the node
+        ''' in background polling loops (status refresh, version
+        ''' checks) and filters it out of new-installation
+        ''' pickers, but preserves all configuration so the
+        ''' operator can re-attach later without re-entering
+        ''' anything. Existing log streams to a detached node
+        ''' aren't actively cancelled — they continue until the
+        ''' TCP connection drops or the operator closes the
+        ''' viewer manually. Explicit operator actions (manual
+        ''' Start/Stop/Restart from the InstancePanel, opening a
+        ''' log viewer) are NOT gated by this flag; only
+        ''' background polling is. Defaults to True so new nodes
+        ''' are pollable on creation. Property name kept as
+        ''' "IsEnabled" rather than "IsAttached" to avoid an EF
+        ''' column-rename migration; the attach/detach vocabulary
+        ''' lives in UI labels only.
+        ''' </summary>
         Public Property IsEnabled As Boolean = True
         Public Property LastSeenUtc As DateTime
         Public Property OsDescription As String
@@ -80,6 +100,22 @@ Namespace GSM.Manager.Data
         Public Property InstallMethod As String
         Public Property InstalledVersion As String
         Public Property SteamCredentialId As String
+
+        ''' <summary>
+        ''' Phase 5h — optional link to a SharedConfigGroupEntity
+        ''' row, used by plugins that implement
+        ''' ISharedConfigProvider to share config fields across
+        ''' multiple installations (LO's Realm being the canonical
+        ''' case). When set, the manager merges the group's
+        ''' ConfigJson into InstanceConfig.CustomFields with lower
+        ''' precedence than the installation's own ConfigJson, so
+        ''' a per-installation override is still possible. Null
+        ''' for installations of plugins that don't implement
+        ''' ISharedConfigProvider, and for installations the user
+        ''' has explicitly chosen to leave unlinked.
+        ''' </summary>
+        Public Property SharedConfigGroupId As String
+
         Public Property ConfigJson As String
         Public Property CreatedUtc As DateTime
         Public Property UpdatedUtc As DateTime
@@ -135,6 +171,7 @@ Namespace GSM.Manager.Data
 
         Public Overridable Property Node As NodeEntity
         Public Overridable Property Instances As ICollection(Of InstanceEntity)
+        Public Overridable Property SharedConfigGroup As SharedConfigGroupEntity
     End Class
 
     ''' <summary>
@@ -631,7 +668,36 @@ Namespace GSM.Manager.Data
         ''' the same SessionIdentity if the tile migrated.</summary>
         Public Property InstanceId As String
         Public Property TimestampUtc As DateTime
-        Public Property PlayerName As String
+
+        ''' <summary>
+        ''' In-game character name as it appeared in the chat line
+        ''' — the same string that shows in-game. Stored as-text
+        ''' per message so a historical row retains the name the
+        ''' player was using when they spoke, even if they later
+        ''' renamed their character on myrealm. Always populated.
+        ''' </summary>
+        Public Property DisplayName As String
+
+        ''' <summary>
+        ''' Resolved Steam/Xbox/etc. ID for the speaker at the
+        ''' moment the chat line was parsed. Nothing for messages
+        ''' whose speaker hadn't been identity-resolved yet (chat
+        ''' arriving in the small window between a player's join
+        ''' and their first Persisting autosave tick) and Nothing
+        ''' for historical rows that pre-date Phase 5g-1 (the
+        ''' column was added by migration with no backfill).
+        ''' </summary>
+        Public Property PlatformUserId As String
+
+        ''' <summary>
+        ''' Resolved CharacterId for the speaker, same provenance
+        ''' caveats as PlatformUserId. Stable across renames — the
+        ''' canonical durable identity for cross-rename history
+        ''' queries ("every chat line from this character, no
+        ''' matter what name they were going by at the time").
+        ''' </summary>
+        Public Property CharacterId As String
+
         Public Property Text As String
     End Class
 
@@ -714,11 +780,70 @@ Namespace GSM.Manager.Data
         Public Property NodeId As String
         Public Property InstanceId As String
         Public Property TimestampUtc As DateTime
+
+        ''' <summary>
+        ''' Raw name string as the parser saw it on the log line
+        ''' that produced this event. On Last Oasis this is the
+        ''' platform persona (Steam handle / Xbox gamertag from the
+        ''' login URL) — distinct from the in-game character name.
+        ''' On Factorio it's the character name (game has no
+        ''' separate platform layer). Always populated; the durable
+        ''' fallback the renderer falls back to when the resolved
+        ''' identity columns below are NULL.
+        ''' </summary>
         Public Property PlayerName As String
+
         ''' <summary>"join" or "leave" — stored as lowercase string
         ''' for future extensibility (kick, ban, etc.). Kept short
         ''' so index covering is cheap.</summary>
         Public Property EventKind As String
+
+        ''' <summary>
+        ''' Phase 5g-2: snapshot of the speaker's CharacterId at
+        ''' the moment the event row was written, captured via a
+        ''' wire call to the Node's /players endpoint. Stable
+        ''' across in-game character name changes; the durable
+        ''' join key for cross-rename history queries ("every
+        ''' join/leave ever by this character, no matter what
+        ''' name they were going by then"). NULL when the Node's
+        ''' /players lookup missed or hadn't resolved CharacterId
+        ''' yet (common on PlayerLeave events — the Node removes
+        ''' the session from its in-memory dict on the same log
+        ''' line the Manager is processing) and NULL for rows
+        ''' that pre-date the migration that introduced this
+        ''' column.
+        ''' </summary>
+        Public Property CharacterId As String
+
+        ''' <summary>
+        ''' Phase 5g-2: snapshot of the speaker's PlatformUserId
+        ''' (Steam ID / Xbox LIVE ID / etc.) at write time. Same
+        ''' provenance and NULL semantics as CharacterId — both
+        ''' resolved together from the same /players row in
+        ''' InstanceManager.PersistPlayerObservation.
+        ''' </summary>
+        Public Property PlatformUserId As String
+
+        ''' <summary>
+        ''' Phase 5g-2: snapshot of the speaker's in-game
+        ''' DisplayName at write time. Stored alongside PlayerName
+        ''' so History rendering doesn't need a live join against
+        ''' a Manager-side mirror of the Node's players table —
+        ''' the renderer just coalesces DisplayName ?? PlayerName
+        ''' via IdentityFormatter, falling back to the raw
+        ''' PlayerName for rows where DisplayName never resolved
+        ''' (short LO sessions that ended before the autosave tick
+        ''' bridged platform persona to display name) and for
+        ''' rows that pre-date the migration.
+        '''
+        ''' Snapshot semantics on purpose: a character's chosen
+        ''' name is generally stable over its lifetime, so the
+        ''' snapshot is correct for nearly every player. The rare
+        ''' myrealm-admin-rename case leaves old rows showing the
+        ''' old name, which is arguably more honest about what
+        ''' the player was actually called at the time.
+        ''' </summary>
+        Public Property DisplayName As String
     End Class
 
     ''' <summary>
@@ -731,6 +856,63 @@ Namespace GSM.Manager.Data
     Public Class AppSettingEntity
         Public Property SettingKey As String
         Public Property Value As String
+    End Class
+
+    ''' <summary>
+    ''' Phase 5h — a shared-config group declared by a plugin
+    ''' that implements ISharedConfigProvider. One row holds the
+    ''' fields multiple installations of the same plugin share
+    ''' (e.g. Last Oasis Realm: CustomerKey, ProviderKey,
+    ''' RealmName). Installations point at the group via
+    ''' Installation.SharedConfigGroupId; the manager merges the
+    ''' group's ConfigJson into InstanceConfig.CustomFields with
+    ''' lower precedence than the installation's own ConfigJson
+    ''' at start-instance time, so plugins read merged values
+    ''' transparently regardless of which layer supplied each.
+    ''' </summary>
+    Public Class SharedConfigGroupEntity
+        ''' <summary>Manager-generated GUID. Primary key.</summary>
+        Public Property GroupId As String
+
+        ''' <summary>Matches Installation.GameId. Filters
+        ''' which groups belong to which plugin so the
+        ''' management UI shows only the relevant ones per
+        ''' plugin context.</summary>
+        Public Property PluginId As String
+
+        ''' <summary>Matches the plugin's
+        ''' ISharedConfigProvider.SharedConfigKey, e.g. "realm".
+        ''' Persisted (rather than derived at runtime from the
+        ''' plugin) so a database loaded without the owning
+        ''' plugin still surfaces meaningful information about
+        ''' what kind of group each row represents.</summary>
+        Public Property GroupType As String
+
+        ''' <summary>User-facing name shown in pickers and
+        ''' management UI (e.g. "Site's World"). Required; the
+        ''' UI uses this to refer to the group everywhere except
+        ''' the internal GroupId.</summary>
+        Public Property DisplayName As String
+
+        ''' <summary>Field values for this group, serialised as
+        ''' a JSON dictionary keyed by the plugin's
+        ''' GetSharedConfigSchema field keys. Fields declared
+        ''' IsSensitive in the schema are encrypted with a
+        ''' sentinel-prefixed base64 wrapper (see
+        ''' SharedConfigService for the encode/decode pair);
+        ''' non-sensitive fields are stored in plaintext for
+        ''' direct readability when dumping the database.</summary>
+        Public Property ConfigJson As String
+
+        Public Property CreatedUtc As DateTime
+        Public Property UpdatedUtc As DateTime
+
+        ''' <summary>Reverse navigation — installations linked
+        ''' to this group. Populated by EF Core via the FK
+        ''' relationship configured on InstallationEntityConfig.
+        ''' Typical use case: "show me all the installations on
+        ''' this realm."</summary>
+        Public Overridable Property Installations As ICollection(Of InstallationEntity)
     End Class
 
     ' ============================================================
@@ -762,6 +944,7 @@ Namespace GSM.Manager.Data
         Public Property SessionHosts As DbSet(Of SessionHostEntity)
         Public Property PlayerActivity As DbSet(Of PlayerActivityEntity)
         Public Property AppSettings As DbSet(Of AppSettingEntity)
+        Public Property SharedConfigGroups As DbSet(Of SharedConfigGroupEntity)
 
         Protected Overrides Sub OnModelCreating(modelBuilder As ModelBuilder)
             modelBuilder.ApplyConfiguration(New NodeEntityConfig())
@@ -782,6 +965,7 @@ Namespace GSM.Manager.Data
             modelBuilder.ApplyConfiguration(New SessionHostEntityConfig())
             modelBuilder.ApplyConfiguration(New PlayerActivityEntityConfig())
             modelBuilder.ApplyConfiguration(New AppSettingEntityConfig())
+            modelBuilder.ApplyConfiguration(New SharedConfigGroupEntityConfig())
         End Sub
 
     End Class
@@ -810,6 +994,20 @@ Namespace GSM.Manager.Data
             builder.HasOne(Function(i) i.Node).
                 WithMany(Function(n) n.Installations).
                 HasForeignKey(Function(i) i.NodeId)
+            ' Phase 5h — optional link to a SharedConfigGroup.
+            ' IsRequired(False) makes the FK nullable; EF Core's
+            ' default OnDelete for optional FKs is ClientSetNull,
+            ' so deleting a SharedConfigGroup leaves linked
+            ' installations intact with SharedConfigGroupId = NULL
+            ' (rather than cascading deletion, which would lose
+            ' the installations themselves — dangerous if the
+            ' user accidentally deletes a realm). Re-linking
+            ' those installations to a different (or new) group
+            ' is the recovery path.
+            builder.HasOne(Function(i) i.SharedConfigGroup).
+                WithMany(Function(g) g.Installations).
+                HasForeignKey(Function(i) i.SharedConfigGroupId).
+                IsRequired(False)
         End Sub
     End Class
 
@@ -1024,7 +1222,18 @@ Namespace GSM.Manager.Data
             builder.Property(Function(m) m.SessionIdentity).IsRequired().HasMaxLength(200)
             builder.Property(Function(m) m.NodeId).HasMaxLength(100)
             builder.Property(Function(m) m.InstanceId).HasMaxLength(100)
-            builder.Property(Function(m) m.PlayerName).HasMaxLength(100)
+            builder.Property(Function(m) m.DisplayName).HasMaxLength(100)
+            ' Platform user IDs: Steam IDs are 17-digit base-10
+            ' numbers, Xbox LIVE IDs are similar length; future
+            ' platforms (EOS GUIDs, etc.) may run longer. 64 chars
+            ' is generous headroom without bloating the row.
+            builder.Property(Function(m) m.PlatformUserId).HasMaxLength(64)
+            ' CharacterId on Last Oasis is a base-10 number similar
+            ' in shape to PlatformUserId. Same 64-char cap for
+            ' consistency — cheap, and matches what we'd want for
+            ' any future game that surfaces a stable per-character
+            ' identifier.
+            builder.Property(Function(m) m.CharacterId).HasMaxLength(64)
             builder.Property(Function(m) m.Text).HasMaxLength(4000)
             ' Composite index for the dominant query: "give me chat
             ' for this session, newest first". Covers both the live
@@ -1035,6 +1244,12 @@ Namespace GSM.Manager.Data
             ' queries WHERE TimestampUtc < cutoff regardless of
             ' session, so give it a dedicated index.
             builder.HasIndex(Function(m) m.TimestampUtc)
+            ' Phase 5g-1: index on CharacterId to support "every
+            ' chat line ever spoken by this character across
+            ' rename history" queries. NULLs (pre-5g rows + chat
+            ' that arrived before identity-resolution completed)
+            ' are excluded from the index by SQLite automatically.
+            builder.HasIndex(Function(m) m.CharacterId)
         End Sub
     End Class
 
@@ -1083,6 +1298,15 @@ Namespace GSM.Manager.Data
             builder.Property(Function(a) a.InstanceId).HasMaxLength(100)
             builder.Property(Function(a) a.PlayerName).IsRequired().HasMaxLength(100)
             builder.Property(Function(a) a.EventKind).IsRequired().HasMaxLength(20)
+            ' Phase 5g-2 identity columns. Caps match the
+            ' ChatMessageEntity equivalents from 5g-1 for
+            ' schema consistency: 64 chars for the numeric ID
+            ' columns (Steam IDs are 17 digits, Xbox LIVE
+            ' similar shape, EOS GUIDs leave headroom), 100
+            ' for DisplayName.
+            builder.Property(Function(a) a.CharacterId).HasMaxLength(64)
+            builder.Property(Function(a) a.PlatformUserId).HasMaxLength(64)
+            builder.Property(Function(a) a.DisplayName).HasMaxLength(100)
             ' The dominant query is the History-window timeline:
             ' "give me all activity for session X in time range Y".
             ' Composite index covers it.
@@ -1090,6 +1314,12 @@ Namespace GSM.Manager.Data
             ' For the "filter by player name" query path, where the
             ' caller may not know which session(s) to look in.
             builder.HasIndex(Function(a) New With {a.PlayerName, a.TimestampUtc})
+            ' Phase 5g-2: index on CharacterId for "every activity
+            ' row this character has ever produced" queries, the
+            ' counterpart to the ix_chat_character index 5g-1
+            ' added to ChatMessages. NULLs are excluded by SQLite
+            ' automatically so pre-migration rows don't bloat it.
+            builder.HasIndex(Function(a) a.CharacterId)
         End Sub
     End Class
 
@@ -1100,6 +1330,23 @@ Namespace GSM.Manager.Data
             builder.HasKey(Function(s) s.SettingKey)
             builder.Property(Function(s) s.SettingKey).HasMaxLength(100)
             builder.Property(Function(s) s.Value).HasMaxLength(4000)
+        End Sub
+    End Class
+
+    Public Class SharedConfigGroupEntityConfig
+        Implements IEntityTypeConfiguration(Of SharedConfigGroupEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of SharedConfigGroupEntity)) Implements IEntityTypeConfiguration(Of SharedConfigGroupEntity).Configure
+            builder.HasKey(Function(g) g.GroupId)
+            builder.Property(Function(g) g.PluginId).IsRequired().HasMaxLength(100)
+            builder.Property(Function(g) g.GroupType).IsRequired().HasMaxLength(50)
+            builder.Property(Function(g) g.DisplayName).IsRequired().HasMaxLength(200)
+            builder.Property(Function(g) g.ConfigJson).IsRequired()
+            ' Composite index for "list all groups of this type
+            ' belonging to this plugin" — the common query when
+            ' rendering a plugin-specific management UI ("show
+            ' me all LO realms").
+            builder.HasIndex(Function(g) New With {g.PluginId, g.GroupType})
         End Sub
     End Class
 

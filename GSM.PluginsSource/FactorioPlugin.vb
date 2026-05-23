@@ -529,22 +529,27 @@ Public Class FactorioPlugin
     Public Function GetLogParseRules() As IReadOnlyList(Of LogParseRule) Implements IGamePlugin.GetLogParseRules
         ' Factorio's headless server writes clear, parseable lines for
         ' player join/leave and chat. All of these appear in stdout and
-        ' in factorio-current.log with the same format.
+        ' in factorio-current.log with the same format. Factorio doesn't
+        ' distinguish between a platform persona and an in-game character
+        ' name — the multiplayer username is both — so the captures land
+        ' on DisplayName. PlatformPersona stays Nothing for Factorio
+        ' sessions; UIs default to DisplayName ?? PlatformPersona which
+        ' renders identically.
         Return New LogParseRule() {
             New LogParseRule With {
                 .Name = "Player Join",
                 .Kind = ParsedEventKind.PlayerJoin,
-                .Pattern = "\[JOIN\] (?<" & "Name" & ">\S+) joined the game"
+                .Pattern = "\[JOIN\] (?<" & "DisplayName" & ">\S+) joined the game"
             },
             New LogParseRule With {
                 .Name = "Player Leave",
                 .Kind = ParsedEventKind.PlayerLeave,
-                .Pattern = "\[LEAVE\] (?<" & "Name" & ">\S+) left the game"
+                .Pattern = "\[LEAVE\] (?<" & "DisplayName" & ">\S+) left the game"
             },
             New LogParseRule With {
                 .Name = "Chat Message",
                 .Kind = ParsedEventKind.ChatMessage,
-                .Pattern = "\[CHAT\] (?<" & "Name" & ">[^:]+): (?<Message>.+)$"
+                .Pattern = "\[CHAT\] (?<" & "DisplayName" & ">[^:]+): (?<Message>.+)$"
             },
             New LogParseRule With {
                 .Name = "Multiplayer State",

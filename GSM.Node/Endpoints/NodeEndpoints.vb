@@ -5,8 +5,8 @@ Imports Microsoft.AspNetCore.Builder
 Imports Microsoft.AspNetCore.Http
 Imports Microsoft.Extensions.Logging
 Imports GSM.Plugin
-Imports GSM.Node.Api
 Imports GSM.Node
+Imports GSM.Node.Api
 Imports GSM.Node.Security
 
 ' ============================================================
@@ -78,6 +78,27 @@ Namespace GSM.Node.Endpoints
                         .Accepted = False,
                         .Reason = "Invalid shared secret"
                     })
+                End Function)
+
+            ' Prerequisite check (Phase 5g side-feature) — query the
+            ' install state of named host-side runtime dependencies
+            ' (VC++ redistributable, etc). Authenticated by the
+            ' standard auth middleware (anything under /api/ that
+            ' isn't /api/version or /api/auth requires the bearer
+            ' token). Names arrive as a single comma-separated
+            ' query value (?names=a,b,c) rather than repeated
+            ' ?names=a&names=b because the comma-joined form is
+            ' simpler on both sides for the small finite list of
+            ' prereqs in play, and individual names are escaped by
+            ' the Manager's NodeHttpClient so embedded commas (none
+            ' currently, but the escape is correct) survive.
+            app.MapGet("/api/system/prerequisites",
+                Function(names As String) As IResult
+                    Dim parsed As String() = If(String.IsNullOrWhiteSpace(names),
+                        New String() {},
+                        names.Split(","c, StringSplitOptions.RemoveEmptyEntries))
+                    Dim probe As New PrerequisiteProbe()
+                    Return Results.Ok(probe.Check(parsed))
                 End Function)
 
         End Sub

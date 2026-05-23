@@ -9,10 +9,10 @@ Imports Microsoft.VisualBasic
 
 Namespace Global.Migrations
     <DbContext(GetType(GsmDbContext))>
-    Partial Class GsmDbContextModelSnapshot
-        Inherits ModelSnapshot
-
-        Protected Overrides Sub BuildModel(modelBuilder As ModelBuilder)
+    <Migration("20260522145126_Phase5h_SharedConfigGroups")>
+    Partial Class Phase5h_SharedConfigGroups
+        ''' <inheritdoc />
+        Protected Overrides Sub BuildTargetModel(modelBuilder As ModelBuilder)
             modelBuilder.HasAnnotation("ProductVersion", "8.0.2")
 
             modelBuilder.Entity("GSM.Manager.Data.AppSettingEntity",

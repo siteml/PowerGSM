@@ -212,7 +212,7 @@ Namespace GSM.Manager.UI
 
                 _nameLabel.Text = nodeEntity.DisplayName
                 _hostLabel.Text = $"{nodeEntity.HostAddress}:{nodeEntity.Port}"
-                _statusLabel.Text = If(nodeEntity.IsEnabled, "Enabled", "Disabled")
+                _statusLabel.Text = If(nodeEntity.IsEnabled, "Attached", "Detached")
                 _statusLabel.ForeColor = If(nodeEntity.IsEnabled, Color.DarkGreen, Color.Gray)
 
                 ' Load installations
@@ -432,6 +432,31 @@ Namespace GSM.Manager.UI
         ' progress UI — not a fatal condition).
         Private _installationMgr As InstallationManager
 
+        ' Last-selected tab text, persisted across panel disposal +
+        ' reconstruction so the user's tab context survives navigation
+        ' between installations. Stored by .Text (e.g., "Instances",
+        ' "Configuration", "Progress") rather than index because the
+        ' Progress tab is dynamic — saved index 2 would mean
+        ' "Progress" on an installation with one in flight but be
+        ' out of range on one without. Text-keying handles both
+        ' cases uniformly and degrades gracefully (unknown text =
+        ' default tab) for any other future dynamic additions.
+        '
+        ' Static (not per-instance) by design: the user's request is
+        ' "remember which tab I was on when comparing installations",
+        ' not "remember per installation". Manager-restart scope
+        ' applies — a fresh manager session starts on the default tab.
+        Private Shared _lastSelectedTabText As String
+
+        ' Set during OnLoad's tab-restore path to suppress the
+        ' SelectedIndexChanged handler's write-back to
+        ' _lastSelectedTabText. Without this, restoring "Configuration"
+        ' would trigger the handler which would write "Configuration"
+        ' back to the shared static — a no-op in steady state but
+        ' a needless write and a source of confusion if a future
+        ' refactor adds any logic conditional on the write happening.
+        Private _restoringTabSelection As Boolean = False
+
         Public Sub New(installationId As String)
             _installationId = installationId
             InitializeControls()
@@ -455,6 +480,64 @@ Namespace GSM.Manager.UI
                 UnsubscribeFromInstallationManager()
             End If
             MyBase.Dispose(disposing)
+        End Sub
+
+        ''' <summary>
+        ''' Restore the last-selected tab from the class-shared
+        ''' static so navigating from one installation to another
+        ''' lands the user on the same tab (e.g. flipping between
+        ''' installations with Configuration open keeps you on
+        ''' Configuration). Falls through silently when the saved
+        ''' tab text doesn't match any current tab — typical case is
+        ''' the user was on "Progress" while an install was in flight
+        ''' and then navigates to an installation with no in-flight
+        ''' operation; the new panel just defaults to Instances.
+        '''
+        ''' Runs in OnLoad rather than the constructor because
+        ''' SubscribeToInstallationManager may add the Progress tab
+        ''' synchronously when GetActiveProgress returns non-null, and
+        ''' we want that potential tab to be findable by name when we
+        ''' do the restore lookup. The constructor-then-OnLoad order
+        ''' guarantees that.
+        ''' </summary>
+        Protected Overrides Sub OnLoad(e As EventArgs)
+            MyBase.OnLoad(e)
+
+            If Not String.IsNullOrEmpty(_lastSelectedTabText) Then
+                Dim target As TabPage = Nothing
+                For Each t As TabPage In _tabs.TabPages
+                    If String.Equals(t.Text, _lastSelectedTabText, StringComparison.Ordinal) Then
+                        target = t
+                        Exit For
+                    End If
+                Next
+                If target IsNot Nothing AndAlso target IsNot _tabs.SelectedTab Then
+                    _restoringTabSelection = True
+                    Try
+                        _tabs.SelectedTab = target
+                    Finally
+                        _restoringTabSelection = False
+                    End Try
+                End If
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Tab-change handler that writes the new tab's .Text to the
+        ''' class-shared static so the next panel construction can
+        ''' restore it. Suppressed during the OnLoad restore so the
+        ''' static doesn't get echo-written with what we just read.
+        ''' Auto-selects from EnsureProgressTab (user-initiated
+        ''' install/update) DO get persisted — if the user is
+        ''' watching progress and navigates away, returning to that
+        ''' installation should land them back on Progress.
+        ''' </summary>
+        Private Sub OnTabSelectionChanged(sender As Object, e As EventArgs)
+            If _restoringTabSelection Then Return
+            Dim tab = _tabs.SelectedTab
+            If tab IsNot Nothing AndAlso Not String.IsNullOrEmpty(tab.Text) Then
+                _lastSelectedTabText = tab.Text
+            End If
         End Sub
 
         Private Sub InitializeControls()
@@ -540,6 +623,16 @@ Namespace GSM.Manager.UI
 
             _tabs.TabPages.Add(_overviewTab)
             _tabs.TabPages.Add(_configTab)
+
+            ' Persist user-initiated tab changes to the class-shared
+            ' static so the next InstallationPanel constructed (when
+            ' the user navigates to a different installation) can
+            ' restore the same tab. Hooked AFTER the initial Add calls
+            ' above so the synthetic SelectedIndexChanged that fires
+            ' when the first tab gets added (SelectedIndex goes from
+            ' -1 to 0) doesn't write "Instances" to the static before
+            ' the user has actually interacted with anything.
+            AddHandler _tabs.SelectedIndexChanged, AddressOf OnTabSelectionChanged
 
             Dim bottomSpacer As New Panel()
             bottomSpacer.Dock = DockStyle.Bottom
@@ -781,7 +874,17 @@ Namespace GSM.Manager.UI
             Dim ageSuffix As String = ""
             If inst.LastVersionCheckUtc.HasValue Then
                 Dim ago = DateTime.UtcNow - inst.LastVersionCheckUtc.Value
-                ageSuffix = $", checked {FormatVersionAgo(ago)}"
+                ' "Last successfully checked" rather than just
+                ' "checked" because LastVersionCheckUtc is only
+                ' written on a successful version check (see the
+                ' header comment in VersionCheckService) — a failed
+                ' check leaves the timestamp untouched. Saying
+                ' "successfully" makes the semantics explicit so
+                ' a user looking at a stale timestamp on a node
+                ' that's been failing checks for hours knows the
+                ' value isn't lying about the failure, just about
+                ' the last good result.
+                ageSuffix = $", last successfully checked {FormatVersionAgo(ago)}"
             End If
 
             ' No latest known yet — show installed only, plus a
@@ -1055,7 +1158,7 @@ Namespace GSM.Manager.UI
                     Return
                 End If
 
-                Dim ok = Await svc.CheckInstallationAsync(
+                Dim result = Await svc.CheckInstallationAsync(
                     _installationId,
                     respectThrottle:=False,
                     cancellation:=System.Threading.CancellationToken.None)
@@ -1069,7 +1172,7 @@ Namespace GSM.Manager.UI
                     Dim inst = db.Installations.Find(_installationId)
                     If inst IsNot Nothing Then
                         ApplyVersionLabel(inst)
-                        If ok Then
+                        If result.Success Then
                             ' Surface a status message that mirrors the
                             ' version-label state so the user gets clear
                             ' "check completed" feedback even though the
@@ -1087,17 +1190,82 @@ Namespace GSM.Manager.UI
                                 _updateStatusLabel.ForeColor = Color.DarkOrange
                             End If
                         Else
-                            _updateStatusLabel.Text = "Check failed (see log for details)"
-                            _updateStatusLabel.ForeColor = Color.Firebrick
+                            ShowCheckUpdateFailure(result.ErrorMessage)
                         End If
                     End If
                 End Using
             Catch ex As Exception
-                _updateStatusLabel.Text = $"Check failed: {ex.Message}"
-                _updateStatusLabel.ForeColor = Color.Firebrick
+                If Me.IsDisposed Then Return
+                ShowCheckUpdateFailure(ex.Message)
             Finally
                 _checkUpdatesButton.Enabled = True
             End Try
+        End Sub
+
+        ''' <summary>
+        ''' Render a check-for-updates failure to the user. Short
+        ''' messages stay in the status label below the button so
+        ''' the result is visible at a glance; long or multi-line
+        ''' messages (e.g. the SteamCMD missing-libs hint that ships
+        ''' with the Linux pre-flight, ~500 chars across multiple
+        ''' lines) open in a resizable monospace dialog so the user
+        ''' can read the full diagnostic and copy it. The label
+        ''' still shows a short one-line summary in that case so
+        ''' the post-dismiss state is still informative.
+        '''
+        ''' Threshold: > 150 chars OR contains a newline. Both
+        ''' signals correlate well with "doesn't fit in a 400px-
+        ''' wide AutoSize label" in practice; using either-or
+        ''' catches the cases where one is true but not the other
+        ''' (a 1200-char single-line stack trace, a short 3-line
+        ''' formatted hint).
+        ''' </summary>
+        Private Sub ShowCheckUpdateFailure(errMessage As String)
+            Dim msg = If(String.IsNullOrEmpty(errMessage),
+                          "Check failed (no error message reported).",
+                          errMessage)
+
+            Dim isLong = msg.Length > 150 OrElse
+                         msg.IndexOf(vbLf) >= 0 OrElse
+                         msg.IndexOf(vbCr) >= 0
+
+            If isLong Then
+                ' Modal dialog with the full text. Owner is the
+                ' host form so the dialog centres correctly and
+                ' Alt+Tab grouping reads sanely. Wrapped in Try
+                ' so a dialog-open failure (rare — disposed parent,
+                ' WindowStation issue) doesn't suppress the label
+                ' fallback below.
+                Try
+                    DetailedErrorDialog.Show(Me.FindForm(),
+                        "Check for Updates Failed",
+                        "The version check failed.",
+                        msg)
+                Catch
+                End Try
+
+                ' Short summary on the label: first non-empty line,
+                ' truncated to fit. Gives the user the signal
+                ' without the full wall of text after they've
+                ' closed the dialog.
+                Dim firstLine = msg.Split({vbCr, vbLf},
+                                            StringSplitOptions.RemoveEmptyEntries).
+                                  FirstOrDefault()
+                If String.IsNullOrEmpty(firstLine) Then
+                    firstLine = "see dialog for details"
+                End If
+                If firstLine.Length > 130 Then
+                    firstLine = firstLine.Substring(0, 127) & "..."
+                End If
+                _updateStatusLabel.Text = "Check failed: " & firstLine
+            Else
+                ' Short message — fits in the label, no dialog
+                ' needed. Same surface as the previous "Check
+                ' failed: {ex.Message}" path used before the
+                ' result-object refactor.
+                _updateStatusLabel.Text = "Check failed: " & msg
+            End If
+            _updateStatusLabel.ForeColor = Color.Firebrick
         End Sub
 
         ' ============================================================
@@ -1521,10 +1689,21 @@ Namespace GSM.Manager.UI
 
         ' Overview tab controls
         Private _playerCountLabel As Label
-        Private _playerList As ListView
+        ' Custom owner-drawn list control — see BufferedListView.vb
+        ' for the rationale and design notes. Replaces the earlier
+        ' native-ListView subclass; the API is no longer ListView-
+        ' compatible (use AddColumn / AddRow / ClearRows instead of
+        ' Columns.Add / Items.Add / Items.Clear). The 3-second
+        ' refresh tick rebuilds the rows via BeginUpdate /
+        ' ClearRows / AddRow loop / EndUpdate.
+        Private _playerList As BufferedListView
 
-        ' Chat tab controls
-        Private _chatList As ListView
+        ' Chat tab controls. _chatList uses the same custom
+        ' owner-drawn BufferedListView as the player list and the
+        ' file-management lists — plain ListView under WS_EX_COMPOSITED
+        ' surfaces per-row paint cascades during window resize, which
+        ' BufferedListView avoids with its single-pass OnPaint.
+        Private _chatList As BufferedListView
         Private _lastChatTimestamp As DateTime? = Nothing
 
         ' Config tab controls
@@ -1542,6 +1721,64 @@ Namespace GSM.Manager.UI
         ' button-click operation completes.
         Private _latestProcState As InstanceStatusResponse
 
+        ' Per-instance Show Logs toggle preference, persisted across
+        ' panel disposal + reconstruction. InstancePanel is rebuilt
+        ' every time the user navigates into an instance node in the
+        ' tree (MainForm swaps right-pane contents) and the toggle's
+        ' Checked property always starts at False on a fresh panel,
+        ' so without this dict the user has to re-flip Show Logs on
+        ' every time they revisit an instance. Static so the lifetime
+        ' spans all panel instances; manager-restart scope is by
+        ' design (a fresh manager session reasonably begins with
+        ' logs hidden everywhere). Keyed by instanceId; the value
+        ' is just the last-observed Checked state. ConcurrentDictionary
+        ' is overkill for UI-thread-only access but cheap and removes
+        ' the need to remember the locking discipline.
+        Private Shared ReadOnly _showLogsPreferences As _
+            New System.Collections.Concurrent.ConcurrentDictionary(Of String, Boolean)
+
+        ' Set during OnLoad's restore-from-pref path to suppress two
+        ' side effects of OnToggleShowLogs that are unwanted on
+        ' restore: (1) writing the just-applied preference back to
+        ' the dict (it's already what we read from), and (2) the
+        ' auto-select-Logs-tab inside ShowLogsTab (the user was
+        ' presumably on a different tab when they navigated away,
+        ' and the previous selection isn't preserved — landing on
+        ' Logs unconditionally would override whatever tab the panel
+        ' naturally defaults to, which is Overview). Cleared as soon
+        ' as the restore assignment returns.
+        Private _restoringShowLogs As Boolean = False
+
+        ' Last-selected tab text, persisted across panel disposal +
+        ' reconstruction so the user's tab context survives navigation
+        ' between instances. Stored by .Text (e.g., "Overview",
+        ' "Configuration", "Chat", "Logs", "Saves", "Server Settings")
+        ' rather than index because dynamic tabs (Logs toggle, plugin-
+        ' supplied managed-files and editor tabs) shift the index
+        ' across panels — "Configuration" might be at index 1 on a
+        ' Last Oasis instance and index 1 on a Factorio instance too
+        ' but the count of trailing tabs varies, so any saved index
+        ' would be brittle. Text matching is robust and cross-game-
+        ' friendly: shared tab names map across games, game-specific
+        ' ones (e.g. "Server Settings" on Factorio) fall through to
+        ' the default tab when the saved name doesn't exist on the
+        ' new panel.
+        '
+        ' Static (not per-instance) by design: the user's request is
+        ' "remember which tab I was on when comparing instances", not
+        ' "remember per instance". One value applies to every
+        ' InstancePanel for the lifetime of the manager session.
+        Private Shared _lastSelectedTabText As String
+
+        ' Set during OnLoad's tab-restore path to suppress the
+        ' SelectedIndexChanged handler's write-back to
+        ' _lastSelectedTabText. The Show Logs restore that happens
+        ' just before tab restore in OnLoad can itself add the Logs
+        ' tab without a selection change (auto-select is gated by
+        ' _restoringShowLogs) so the only event we genuinely need
+        ' to suppress is the tab-restore's own SelectedTab assignment.
+        Private _restoringTabSelection As Boolean = False
+
         Public Sub New(instanceId As String)
             _instanceId = instanceId
             InitializeControls()
@@ -1554,6 +1791,80 @@ Namespace GSM.Manager.UI
             _refreshTimer.Interval = 3000
             AddHandler _refreshTimer.Tick, Async Sub(s, e) Await RefreshAllAsync()
             _refreshTimer.Start()
+        End Sub
+
+        ''' <summary>
+        ''' Restore the Show Logs toggle from its per-instance
+        ''' preference. Runs from OnLoad rather than the constructor
+        ''' because ShowLogsTab defers its initial buffer fill via
+        ''' Me.BeginInvoke, which throws InvalidOperationException
+        ''' when the control's handle isn't yet created — and at
+        ''' constructor time the panel hasn't been parented yet,
+        ''' so the handle doesn't exist.
+        '''
+        ''' The _restoringShowLogs flag in effect across the
+        ''' Checked-set tells OnToggleShowLogs to skip the
+        ''' preference write-back (it'd be redundant) and tells
+        ''' ShowLogsTab to skip the auto-select-Logs-tab behavior
+        ''' (so the user lands on whatever tab the panel defaults
+        ''' to, not on Logs).
+        ''' </summary>
+        Protected Overrides Sub OnLoad(e As EventArgs)
+            MyBase.OnLoad(e)
+
+            Dim prefer As Boolean
+            If _showLogsPreferences.TryGetValue(_instanceId, prefer) AndAlso prefer Then
+                _restoringShowLogs = True
+                Try
+                    _showLogsToggle.Checked = True
+                Finally
+                    _restoringShowLogs = False
+                End Try
+            End If
+
+            ' Restore last-selected tab. Runs AFTER the Show Logs
+            ' restore above so a saved "Logs" lookup can succeed
+            ' against the just-added Logs tab. If the saved tab
+            ' doesn't exist on this instance (e.g., last viewed
+            ' "Server Settings" on a Factorio instance, now
+            ' navigating to a Last Oasis instance which has no
+            ' such tab), the lookup falls through and the panel
+            ' lands on its default tab (Overview).
+            If Not String.IsNullOrEmpty(_lastSelectedTabText) Then
+                Dim target As TabPage = Nothing
+                For Each t As TabPage In _tabs.TabPages
+                    If String.Equals(t.Text, _lastSelectedTabText, StringComparison.Ordinal) Then
+                        target = t
+                        Exit For
+                    End If
+                Next
+                If target IsNot Nothing AndAlso target IsNot _tabs.SelectedTab Then
+                    _restoringTabSelection = True
+                    Try
+                        _tabs.SelectedTab = target
+                    Finally
+                        _restoringTabSelection = False
+                    End Try
+                End If
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Tab-change handler that writes the new tab's .Text to
+        ''' the class-shared static so the next InstancePanel
+        ''' constructed (e.g. when the user navigates to a different
+        ''' instance) can restore the same tab. Suppressed during
+        ''' the OnLoad restore so the static doesn't get echo-written
+        ''' with what we just read. User-initiated tab clicks and
+        ''' programmatic auto-selects (e.g. ShowLogsTab auto-select
+        ''' on user toggle) both flow through naturally.
+        ''' </summary>
+        Private Sub OnTabSelectionChanged(sender As Object, e As EventArgs)
+            If _restoringTabSelection Then Return
+            Dim tab = _tabs.SelectedTab
+            If tab IsNot Nothing AndAlso Not String.IsNullOrEmpty(tab.Text) Then
+                _lastSelectedTabText = tab.Text
+            End If
         End Sub
 
         Protected Overrides Sub Dispose(disposing As Boolean)
@@ -1659,6 +1970,26 @@ Namespace GSM.Manager.UI
             _tabs = New TabControl()
             _tabs.Dock = DockStyle.Fill
             _tabs.Font = New Font("Segoe UI", 9.5F)
+            ' Multiline so tabs wrap to additional rows when they
+            ' don't all fit horizontally, instead of falling back
+            ' to the scroll-chevron mode. The scroll-chevron mode
+            ' interacts badly with the MainForm WS_EX_COMPOSITED
+            ' style: at certain narrow widths there's a width
+            ' where, WITHOUT the chevrons the tabs fit, but WITH
+            ' the chevrons they don't — so the control ping-pongs
+            ' between the two states many times per second,
+            ' invalidating the tab strip on each iteration.
+            ' WS_EX_COMPOSITED then composites the whole form on
+            ' every iteration, which surfaces visually as the
+            ' TreeView (and every other descendant) appearing to
+            ' refresh continuously until the form is widened past
+            ' the oscillation zone. Multiline mode side-steps the
+            ' whole thing because there's no scroll-button whose
+            ' presence depends on available width — overflow just
+            ' wraps to a second tab row. The cost is slightly
+            ' less vertical space for tab content on narrow
+            ' windows, which is the right trade.
+            _tabs.Multiline = True
 
             _overviewTab = New TabPage("Overview")
             _configTab = New TabPage("Configuration")
@@ -1671,6 +2002,17 @@ Namespace GSM.Manager.UI
             _tabs.TabPages.Add(_overviewTab)
             _tabs.TabPages.Add(_configTab)
             _tabs.TabPages.Add(_chatTab)
+
+            ' Persist tab changes to the class-shared static so the
+            ' next InstancePanel constructed can restore the same
+            ' tab. Hooked AFTER the three base-tab Add calls above
+            ' so the synthetic SelectedIndexChanged that fires on
+            ' the first Add (SelectedIndex -1 → 0) doesn't pre-write
+            ' "Overview" to the static before any user interaction.
+            ' Subsequent Inserts by BuildEditorTabs / BuildManagedFilesTabs
+            ' insert before _chatTab (which is at the END), which
+            ' keeps Overview at index 0 and doesn't fire the event.
+            AddHandler _tabs.SelectedIndexChanged, AddressOf OnTabSelectionChanged
 
             ' Add Fill child first, then edge-docked children. WinForms
             ' docks in reverse z-order — later-added children claim
@@ -1699,17 +2041,24 @@ Namespace GSM.Manager.UI
             _playerCountLabel.Text = "Players online: 0"
             header.Controls.Add(_playerCountLabel)
 
-            _playerList = New ListView()
+            _playerList = New BufferedListView()
             _playerList.Dock = DockStyle.Fill
-            _playerList.View = View.Details
-            _playerList.FullRowSelect = True
-            _playerList.GridLines = True
-            _playerList.HideSelection = False
-            _playerList.Columns.Add("Name", 180)
-            _playerList.Columns.Add("Platform", 80)
-            _playerList.Columns.Add("Joined", 120)
-            _playerList.Columns.Add("IP Address", 150)
-            _playerList.Columns.Add("Steam/Platform ID", 140)
+            ' Two name columns: Character (in-game DisplayName)
+            ' and Platform name (PlatformPersona). "Platform name"
+            ' rather than "Steam name" because the slot is
+            ' game-dependent — Steam handle on LO, Funcom FLS
+            ' handle on Conan, multiplayer username on Factorio.
+            ' The column reads blank when DisplayName ==
+            ' PlatformPersona (typical for Factorio); LO and
+            ' Conan render both columns populated because
+            ' character names diverge from platform personae
+            ' routinely.
+            _playerList.AddColumn("Character", 160)
+            _playerList.AddColumn("Platform name", 120)
+            _playerList.AddColumn("Platform", 70)
+            _playerList.AddColumn("Joined", 110)
+            _playerList.AddColumn("IP Address", 140)
+            _playerList.AddColumn("Platform ID", 140)
 
             ' Order matters for Dock: Fill child must be added FIRST
             ' (it ends up z-ordered at the back), then Top child.
@@ -1729,15 +2078,16 @@ Namespace GSM.Manager.UI
         End Sub
 
         Private Sub BuildChatTab()
-            _chatList = New ListView()
+            _chatList = New BufferedListView()
             _chatList.Dock = DockStyle.Fill
-            _chatList.View = View.Details
-            _chatList.FullRowSelect = True
-            _chatList.GridLines = False
-            _chatList.HideSelection = False
-            _chatList.Columns.Add("Time", 160)
-            _chatList.Columns.Add("Player", 150)
-            _chatList.Columns.Add("Message", 500)
+            ' Chat doesn't use gridlines — the timestamp column's
+            ' regular cadence already provides enough visual
+            ' separation between rows. Matches the convention of
+            ' most chat-log UIs (Discord, IRC clients, etc.).
+            _chatList.ShowGridLines = False
+            _chatList.AddColumn("Time", 160)
+            _chatList.AddColumn("Player", 150)
+            _chatList.AddColumn("Message", 500)
             _chatTab.Controls.Add(_chatList)
         End Sub
 
@@ -2180,7 +2530,7 @@ Namespace GSM.Manager.UI
                 AppendChat(chat)
             Else
                 ' Clear live data when not running
-                _playerList.Items.Clear()
+                _playerList.ClearRows()
                 _playerCountLabel.Text = "Players online: 0"
             End If
         End Sub
@@ -2265,15 +2615,47 @@ Namespace GSM.Manager.UI
             ' ListView in place; player lists are small (<50 typically).
             _playerList.BeginUpdate()
             Try
-                _playerList.Items.Clear()
+                _playerList.ClearRows()
                 Dim nowUtc = DateTime.UtcNow
                 For Each p In players
-                    Dim item As New ListViewItem(If(p.Name, "(unknown)"))
-                    item.SubItems.Add(If(p.Platform, ""))
-                    item.SubItems.Add(FormatJoinedAge(nowUtc, p.JoinedUtc))
-                    item.SubItems.Add(If(p.RemoteAddress, ""))
-                    item.SubItems.Add(If(p.PlatformUserId, ""))
-                    _playerList.Items.Add(item)
+                    ' Character column: in-game DisplayName, falling
+                    ' back to PlatformPersona (LO's case before the
+                    ' first Persisting tick lands), then to a literal
+                    ' "(unknown)" placeholder. PlatformPersona is the
+                    ' right fallback rather than "(unknown)" because
+                    ' on a fresh join we know the Steam handle
+                    ' immediately and the in-game name only catches
+                    ' up a few ticks later; showing the persona
+                    ' temporarily reads as "we know who this is,
+                    ' character name not resolved yet" rather than
+                    ' a scarier "unknown player connected".
+                    Dim characterCol = If(Not String.IsNullOrEmpty(p.DisplayName),
+                                           p.DisplayName,
+                                           If(Not String.IsNullOrEmpty(p.PlatformPersona),
+                                              p.PlatformPersona,
+                                              "(unknown)"))
+
+                    ' Platform name column: PlatformPersona when it
+                    ' actually differs from what we put in Character.
+                    ' Equal-or-empty leaves the column blank so
+                    ' Factorio (and any session where DisplayName
+                    ' fell back to PlatformPersona above) doesn't
+                    ' show the same string twice. Ordinal compare is
+                    ' deliberate — if a character was renamed to a
+                    ' different-case variant of the platform handle,
+                    ' showing both is the correct disambiguation.
+                    Dim platformCol As String = ""
+                    If Not String.IsNullOrEmpty(p.PlatformPersona) AndAlso
+                       Not String.Equals(p.PlatformPersona, characterCol, StringComparison.Ordinal) Then
+                        platformCol = p.PlatformPersona
+                    End If
+
+                    _playerList.AddRow(characterCol,
+                                        platformCol,
+                                        If(p.Platform, ""),
+                                        FormatJoinedAge(nowUtc, p.JoinedUtc),
+                                        If(p.RemoteAddress, ""),
+                                        If(p.PlatformUserId, ""))
                 Next
             Finally
                 _playerList.EndUpdate()
@@ -2293,9 +2675,17 @@ Namespace GSM.Manager.UI
         Private Sub AppendChat(chat As IReadOnlyList(Of ChatMessage))
             If chat Is Nothing OrElse chat.Count = 0 Then Return
 
-            Dim shouldAutoscroll = _chatList.Items.Count = 0 OrElse
-                _chatList.TopItem Is Nothing OrElse
-                _chatList.TopItem.Index + _chatList.Items.Count - 1 >= _chatList.Items.Count - 3
+            ' Autoscroll detection: only follow the tail when the
+            ' user is already there (or the list is empty). The
+            ' "within 3 of the last row" tolerance lets a couple
+            ' of new messages slip past while still being followed
+            ' if the user is effectively at the bottom; scroll
+            ' farther back than that and they take over manual
+            ' control. LastVisibleRowIndex returns the index of the
+            ' bottom-most visible row, so the >= comparison maps
+            ' directly to "the tail is in view".
+            Dim shouldAutoscroll = _chatList.Rows.Count = 0 OrElse
+                _chatList.LastVisibleRowIndex >= _chatList.Rows.Count - 3
 
             _chatList.BeginUpdate()
             Try
@@ -2305,10 +2695,10 @@ Namespace GSM.Manager.UI
                     ' and sortable as text. Multi-day chat sessions would
                     ' otherwise show only time, making it impossible to
                     ' tell whether a message was today or last week.
-                    Dim item As New ListViewItem(localTime.ToString("yyyy-MM-dd HH:mm:ss"))
-                    item.SubItems.Add(If(msg.PlayerName, ""))
-                    item.SubItems.Add(If(msg.Text, ""))
-                    _chatList.Items.Add(item)
+                    _chatList.AddRow(
+                        localTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                        If(msg.DisplayName, ""),
+                        If(msg.Text, ""))
                     If msg.TimestampUtc > If(_lastChatTimestamp, DateTime.MinValue) Then
                         _lastChatTimestamp = msg.TimestampUtc
                     End If
@@ -2316,15 +2706,15 @@ Namespace GSM.Manager.UI
 
                 ' Cap at 500 messages in the view
                 Const MaxRows = 500
-                While _chatList.Items.Count > MaxRows
-                    _chatList.Items.RemoveAt(0)
+                While _chatList.Rows.Count > MaxRows
+                    _chatList.RemoveRowAt(0)
                 End While
             Finally
                 _chatList.EndUpdate()
             End Try
 
-            If shouldAutoscroll AndAlso _chatList.Items.Count > 0 Then
-                _chatList.EnsureVisible(_chatList.Items.Count - 1)
+            If shouldAutoscroll AndAlso _chatList.Rows.Count > 0 Then
+                _chatList.EnsureRowVisible(_chatList.Rows.Count - 1)
             End If
         End Sub
 
@@ -2637,6 +3027,18 @@ Namespace GSM.Manager.UI
                 _showLogsToggle.Text = "Show Logs"
                 HideLogsTab()
             End If
+
+            ' Persist the user's intent so navigating away and back
+            ' to this instance preserves the toggle state. Skip
+            ' during the OnLoad-driven restore: the dict already
+            ' holds exactly what we're reading from, no point
+            ' writing it back, and writing during restore would
+            ' also race with any concurrent constructor running
+            ' for the same instanceId (rare but possible if the
+            ' user double-clicks the tree node fast enough).
+            If Not _restoringShowLogs Then
+                _showLogsPreferences(_instanceId) = _showLogsToggle.Checked
+            End If
         End Sub
 
         ''' <summary>
@@ -2707,7 +3109,17 @@ Namespace GSM.Manager.UI
             _logsTab.Controls.Add(toolbar)
 
             _tabs.TabPages.Add(_logsTab)
-            _tabs.SelectedTab = _logsTab
+            ' Auto-select on user-initiated toggle so the user
+            ' immediately sees what they asked for. Suppressed on
+            ' OnLoad-driven restore so the panel lands on its
+            ' default tab (Overview) rather than yanking the user
+            ' onto Logs every time they navigate back to an
+            ' instance that previously had logs visible — they may
+            ' have been viewing Configuration or Chat when they
+            ' left, and the previous tab selection isn't preserved.
+            If Not _restoringShowLogs Then
+                _tabs.SelectedTab = _logsTab
+            End If
 
             ' Force handle creation + initial paint. Without this, an
             ' empty Logs tab (ring buffer empty — server stopped, or
@@ -2930,6 +3342,21 @@ Namespace GSM.Manager.UI
             ' end is much cheaper than dozens through the loop, and
             ' avoids the user seeing partial/intermediate states.
             SendMessage(_logTextBox.Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero)
+
+            ' Briefly clear ReadOnly across the programmatic mutations
+            ' below. The rich-edit window responds to EM_REPLACESEL on a
+            ' ReadOnly control by calling MessageBeep before performing
+            ' the replacement — the append still succeeds, but each call
+            ' rings the system bell. AppendText, SelectedText = "",
+            ' and the trim's Select+SelectedText all funnel through
+            ' EM_REPLACESEL, so any one of them is enough to produce a
+            ' continuous ding cascade during a LO startup burst. The
+            ' WM_SETREDRAW window above already prevents the user from
+            ' seeing or interacting with the control mid-mutation, so
+            ' the brief flip is invisible. Restored in the Finally
+            ' alongside redraw re-enable.
+            _logTextBox.ReadOnly = False
+
             Dim trimmedLineCount As Integer = 0
             Try
                 ' Offset-based trim. _logLineCount is our own counter
@@ -2982,6 +3409,7 @@ Namespace GSM.Manager.UI
                 Next
                 AppendLineRun(lines, runStart, endIdx, runIsError)
             Finally
+                _logTextBox.ReadOnly = True
                 SendMessage(_logTextBox.Handle, WM_SETREDRAW, New IntPtr(1), IntPtr.Zero)
                 _logTextBox.Invalidate()
             End Try

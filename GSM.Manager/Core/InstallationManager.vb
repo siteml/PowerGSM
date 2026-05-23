@@ -798,19 +798,40 @@ Namespace GSM.Manager.Core
                     Return result
                 End If
 
-                ' Resolve Steam credentials
-                Dim steamCred As SteamCredential = Nothing
-                If Not String.IsNullOrEmpty(installEntity.SteamCredentialId) Then
-                    steamCred = _credentialService.GetSteamCredentialForTransmit(
-                        db, installEntity.SteamCredentialId)
-                End If
-
+                ' Version check is a read-only metadata query
+                ' (+app_info_print) against Steam's public app
+                ' database. Anonymous login works for paid apps
+                ' too — what requires authentication is +app_update
+                ' (the depot download), which is the install/update
+                ' path, not the version check.
+                '
+                ' Previously this passed the installation's real
+                ' Steam credentials, which caused two problems on
+                ' nodes Steam didn't recognise (especially Linux
+                ' nodes on residential connections):
+                '   1. Every periodic check (hourly) triggered a
+                '      Steam Guard challenge to the account,
+                '      blasting the user's inbox with verification-
+                '      code emails they never asked for.
+                '   2. The challenge couldn't be answered (no UI
+                '      surface in the polling path), so SteamCMD
+                '      exited non-zero and the check reported
+                '      "failed" — exactly the wrong outcome for
+                '      what's meant to be a quiet background poll.
+                ' Anonymous login sidesteps both: no challenge
+                ' issued, no email sent, and Steam happily returns
+                ' the buildid for the public branch.
+                '
+                ' The node-side check (InstallRunner.CheckAppVersionAsync)
+                ' already falls through to +login anonymous when
+                ' SteamCredentials is Nothing or marked IsAnonymous,
+                ' so this change is manager-side only.
                 Dim req As New AppVersionCheckRequest With {
                     .InstallationId = installationId,
                     .InstallPath = installEntity.InstallPath,
                     .AppId = steamStep.AppId,
                     .BetaBranch = steamStep.BetaBranch,
-                    .SteamCredentials = steamCred
+                    .SteamCredentials = Nothing
                 }
 
                 Try

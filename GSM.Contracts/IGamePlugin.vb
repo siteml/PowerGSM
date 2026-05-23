@@ -1136,6 +1136,58 @@ Namespace GSM.Plugin
     End Class
 
     ' ============================================================
+    '  IPrerequisiteProvider — opt-in host-runtime declarations
+    '
+    '  Lets a plugin declare host-side runtime dependencies its
+    '  game needs to launch (e.g. the Microsoft VC++ 2015-2022
+    '  Redistributable for Conan Exiles, which crashes with a
+    '  silent -1073741515 exit code on machines lacking it). The
+    '  Manager queries the node for each declared name during the
+    '  new-installation flow; any reported as missing surface as
+    '  Warning-severity pre-install notices with the node-supplied
+    '  download URL and install instructions, alongside the
+    '  plugin's static IInstallationNoticeProvider notices.
+    '
+    '  Why the names are opaque strings (not enum members or
+    '  typed objects):
+    '   - The node owns the catalog of recognised names + their
+    '     detection logic + their display metadata. Plugins just
+    '     name what they need; the node returns enriched results.
+    '   - Adding new prereqs (DirectX, .NET runtime versions,
+    '     OpenAL, etc.) is a node-side change without bumping the
+    '     plugin contract version.
+    '   - Plugins that target a prereq the node doesn't recognise
+    '     get Recognized=False back and the Manager silently
+    '     skips it — graceful fallback for older nodes.
+    '
+    '  Plugins that don't implement this interface skip the
+    '  prerequisite-check step entirely. Returning an empty list
+    '  is equivalent (and the right answer for plugins that
+    '  conditionally need a prereq — return Nothing/[] when the
+    '  current configuration doesn't need it).
+    ' ============================================================
+
+    Public Interface IPrerequisiteProvider
+        ''' <summary>
+        ''' Well-known names of host-side runtime dependencies this
+        ''' game requires. See the node's PrerequisiteProbe catalog
+        ''' for the current set of recognised names. Initial entry:
+        '''
+        '''   "vcredist-2015-2022-x64"
+        '''     Microsoft Visual C++ 2015-2022 Redistributable (x64).
+        '''     Detected via the canonical
+        '''     HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64
+        '''     registry key (Installed = 1).
+        '''
+        ''' Names should be lowercase, kebab-case, version-suffixed
+        ''' when the runtime ships multiple incompatible major
+        ''' versions (e.g. "vcredist-2015-2022-x64" vs a future
+        ''' "vcredist-2026-x64" with a different runtime ABI).
+        ''' </summary>
+        Function GetRequiredPrerequisites() As IReadOnlyList(Of String)
+    End Interface
+
+    ' ============================================================
     '  ILaunchOptionsProvider — opt-in spawn customisation
     '
     '  Lets a plugin describe what its game needs at spawn time
@@ -1253,6 +1305,41 @@ Namespace GSM.Plugin
         ''' explicitly chose 0".
         ''' </summary>
         Public Property LogTailerStartDelayMs As Integer = -1
+
+        ''' <summary>
+        ''' Plugin's preferred default for the time the Manager
+        ''' should wait for a graceful exit signal (Ctrl+C on
+        ''' Windows, SIGTERM on Linux) to take effect before
+        ''' force-killing the process. Used by
+        ''' InstanceManager.StopInstanceAsync as the fallback
+        ''' when the instance's own "GracefulTimeoutMs" custom
+        ''' field is unset, replacing the universal 25-second
+        ''' default for plugins that opt in.
+        '''
+        ''' Why per-plugin: graceful-shutdown duration is
+        ''' game-engine-specific, not generic. UE4 dedicated
+        ''' servers with small world state finish RequestEngineExit
+        ''' in a few seconds (Last Oasis tile state is small,
+        ''' Factorio's autosave is fast). UE-based survival
+        ''' games with persistent worlds run minutes of cleanup
+        ''' before exiting — Conan Exiles writes the entire
+        ''' game.db to disk and waits for every connected client
+        ''' to acknowledge the shutdown packet, both of which
+        ''' scale with world size and player count and routinely
+        ''' exceed 60 seconds on a populated server. Surfacing
+        ''' the timeout through this opt-in lets each plugin
+        ''' calibrate against its engine's actual shutdown cost.
+        '''
+        ''' Users can still override per-instance by setting a
+        ''' "GracefulTimeoutMs" custom field on the instance —
+        ''' that takes precedence over the plugin's preference.
+        '''
+        ''' Negative values (including the -1 default) mean
+        ''' "plugin doesn't have an opinion" and let the Manager
+        ''' apply its universal 25-second fallback. 0 or positive
+        ''' values are honoured verbatim.
+        ''' </summary>
+        Public Property GracefulShutdownTimeoutMs As Integer = -1
     End Class
 
     ''' <summary>
@@ -1665,5 +1752,199 @@ Namespace GSM.Plugin
                                     values As Dictionary(Of String, String),
                                     existingText As String) As String
     End Interface
+
+    ''' <summary>
+    ''' Opt-in interface plugins implement to declare a "shared
+    ''' config group" — a set of fields that multiple
+    ''' installations of the same plugin can reference via a
+    ''' foreign-key association rather than re-entering across
+    ''' installations. Same precedent as the Steam credentials
+    ''' (one credential row, many installations point at it), but
+    ''' plugin-defined so the manager schema stays game-agnostic.
+    '''
+    ''' Last Oasis is the canonical motivating case: CustomerKey,
+    ''' ProviderKey, and RealmName are realm-wide values; an
+    ''' operator typically runs multiple installations against
+    ''' the same realm and shouldn't have to enter the same values
+    ''' on each one. With this interface, LO declares a "Realm"
+    ''' group containing those fields, installations link to a
+    ''' realm row, and rotation happens once per realm rather than
+    ''' once per installation.
+    '''
+    ''' Plugins that don't implement this interface have no shared-
+    ''' config concept; all of their config lives at the
+    ''' installation level (the only behaviour that existed before
+    ''' Phase 5h).
+    '''
+    ''' Runtime semantics: the manager merges the shared group's
+    ''' fields into InstanceConfig.CustomFields before invoking
+    ''' plugin methods, with precedence shared-group → installation
+    ''' → instance (instance overrides install, install overrides
+    ''' group). Plugin code reads CustomFields("<key>") the same
+    ''' way regardless of which layer supplied the value, so plugin
+    ''' authors writing this interface mainly think about WHERE the
+    ''' user enters each field, not HOW it's read.
+    ''' </summary>
+    Public Interface ISharedConfigProvider
+        ''' <summary>
+        ''' Stable lowercase identifier for the kind of shared
+        ''' entity this plugin defines. Persisted as the
+        ''' group_type column on shared_config_groups; used to
+        ''' filter rows that belong to this plugin's concept of
+        ''' "group". One plugin = one shared-config type for now;
+        ''' multi-type support would require a richer linkage
+        ''' column on installations than the current single-FK
+        ''' design.
+        '''
+        ''' Examples: "realm" for Last Oasis, "cluster" for any
+        ''' future MMO plugin that groups instances by shard.
+        ''' </summary>
+        ReadOnly Property SharedConfigKey As String
+
+        ''' <summary>
+        ''' User-facing label for the entity in menus, dialogs,
+        ''' management screens. Title case, singular form.
+        ''' Plural is derived by the UI (typically by appending
+        ''' "s") so plugins shouldn't supply it. Example: "Realm".
+        ''' </summary>
+        ReadOnly Property SharedConfigLabel As String
+
+        ''' <summary>
+        ''' Field schema for the shared entity. Same descriptor
+        ''' shape as GetInstallConfigSchema returns, so the
+        ''' existing SchemaFormBuilder renders the editor for
+        ''' the shared-group fields with zero extra UI code.
+        ''' Fields flagged IsSensitive are encrypted at rest via
+        ''' the same DPAPI helpers (CredentialService.ProtectString
+        ''' / UnprotectString) that protect Steam credential
+        ''' passwords.
+        '''
+        ''' Plugins should NOT include the same field key in both
+        ''' GetSharedConfigSchema and GetInstallConfigSchema — the
+        ''' merge would still work (install overrides group), but
+        ''' the install editor would surface duplicate inputs and
+        ''' confuse the user about which layer the value lives at.
+        ''' Move the field to whichever layer matches its scope.
+        ''' </summary>
+        Function GetSharedConfigSchema() As IReadOnlyList(Of ConfigFieldDescriptor)
+
+        ''' <summary>
+        ''' Name of the schema field whose value identifies a
+        ''' group during one-time migration of pre-existing
+        ''' installations. Installations whose ConfigJson contains
+        ''' identical values for this field get auto-grouped into
+        ''' a single shared-config row at migration time, with the
+        ''' user prompted to name the group. Nothing disables
+        ''' auto-migration; the user creates and links groups
+        ''' manually.
+        '''
+        ''' Typical choice is the field representing the broadest
+        ''' identity — LO uses CustomerKey because one CustomerKey
+        ''' equals one realm in MyRealm's identity model.
+        ''' Discriminator comparison runs on plaintext values, so
+        ''' the field may be IsSensitive without affecting matching.
+        ''' </summary>
+        ReadOnly Property DiscriminatorFieldKey As String
+    End Interface
+
+    ''' <summary>
+    ''' Phase 5h opt-in capability — plugins implement this to
+    ''' control how their rows render in the History window's
+    ''' "Source" column. The column merges the legacy
+    ''' "Tile / Session" and "Instance" columns into a single
+    ''' label, and the plugin chooses what goes in it.
+    '''
+    ''' Last Oasis uses this to put `{TileName} — {RealmName}
+    ''' — {NodeName}/{InstallationName}` in the column when
+    ''' tile + realm are both known, falling back through
+    ''' shorter formats when context is missing. Conan and
+    ''' Factorio could implement it to add their own context
+    ''' (world name, mod set, etc.).
+    '''
+    ''' Plugins NOT implementing this interface fall back to a
+    ''' manager-supplied default: `{NodeName}/{InstallationName}/{InstanceName}`.
+    ''' </summary>
+    Public Interface ISourceLabelProvider
+        ''' <summary>
+        ''' Render the Source-column label for one History row.
+        ''' Called once per row at render time; should be cheap
+        ''' (no I/O, no expensive lookups) and return a single
+        ''' line of plain text. The manager wraps the result in
+        ''' a ListViewItem's main text; tooltips and copy-id
+        ''' actions go through ctx.InstanceId / ctx.SessionIdentity
+        ''' separately, so this output is purely the visible
+        ''' label.
+        '''
+        ''' Returning Nothing or empty falls back to the
+        ''' manager-supplied default label (same as if the
+        ''' plugin didn't implement the interface), so a
+        ''' plugin that opts in but bails out under some
+        ''' condition gets a sensible default instead of a
+        ''' blank cell.
+        ''' </summary>
+        Function FormatSourceLabel(context As SourceLabelContext) As String
+    End Interface
+
+    ''' <summary>
+    ''' Phase 5h — the bundle of context the manager passes to
+    ''' ISourceLabelProvider.FormatSourceLabel for each History
+    ''' row. All fields are pre-resolved by the manager so the
+    ''' plugin doesn't need to know about EF, the session-host
+    ''' table, or the shared-config storage layer.
+    ''' </summary>
+    Public Class SourceLabelContext
+        ''' <summary>
+        ''' Game-defined session identity, e.g. for LO this is
+        ''' the raw "lastoasis:{realm_id}:{tile_id}" string
+        ''' assembled by the log parser. Plugins that want to
+        ''' surface a piece of this (e.g. the realm_id
+        ''' substring as a fallback when the group's display
+        ''' name isn't set) can parse it themselves. Nothing
+        ''' for games that don't have a session concept.
+        ''' </summary>
+        Public Property SessionIdentity As String
+
+        ''' <summary>
+        ''' Friendly tile name observed from the parse-rule
+        ''' stream (e.g. "[N5][PvE] Ikronic Pain"). Empty or
+        ''' Nothing when the row's tile isn't known yet — e.g.
+        ''' rows that landed before the "Started hosting tile"
+        ''' sequence emitted a name, or non-session-based
+        ''' games. LO plugin renders "{TileName} — …" when
+        ''' set and drops the tile segment when not.
+        ''' </summary>
+        Public Property TileName As String
+
+        ''' <summary>Display name of the node hosting the
+        ''' instance — same string that appears in the
+        ''' Nodes tree.</summary>
+        Public Property NodeName As String
+
+        ''' <summary>Display name of the installation.</summary>
+        Public Property InstallationName As String
+
+        ''' <summary>Display name of the specific instance
+        ''' within the installation.</summary>
+        Public Property InstanceName As String
+
+        ''' <summary>Full instance GUID. Used by the History UI
+        ''' for the right-click "Copy instance ID" action and
+        ''' for the hover tooltip; plugins typically don't need
+        ''' to render this in the label since the UI exposes it
+        ''' separately, but it's available for plugins that
+        ''' want to embed a short prefix.</summary>
+        Public Property InstanceId As String
+
+        ''' <summary>
+        ''' DisplayName of the SharedConfigGroup the
+        ''' installation links to, or Nothing if not linked.
+        ''' For LO this is the user-set realm name from the
+        ''' "Add Realm" dialog (e.g. "Site's World"). Plugins
+        ''' should prefer this over digging RealmName-like
+        ''' fields out of MergedConfig because the user picked
+        ''' it as their friendly label for the group.
+        ''' </summary>
+        Public Property SharedConfigGroupName As String
+    End Class
 
 End Namespace

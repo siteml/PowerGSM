@@ -257,8 +257,26 @@ Namespace GSM.Manager.Core
 
             Dim shown = 0
             For Each p In players
+                ' IdentityFormatter coalesces DisplayName →
+                ' PlatformPersona → fallback so this rendering
+                ' agrees with the History window's verdict for the
+                ' same player — they call into the same helper.
+                ' On Last Oasis the chosen in-game character name
+                ' lands in DisplayName (resolved by the Node's
+                ' identity chain from the Persisting / chat / cached
+                ' lookup paths) and the Steam handle in
+                ' PlatformPersona; PlatformPersona is the fallback
+                ' for the short window after a player joins but
+                ' before the Node has bridged their PlatformUserId
+                ' to a DisplayName. On Factorio only DisplayName is
+                ' populated. "(unknown)" only renders when both
+                ' identity surfaces are empty, which would indicate
+                ' the Node's identity resolver hadn't yet bound
+                ' either — worth showing rather than silently
+                ' dropping the row.
+                Dim displayed = IdentityFormatter.Format(p.DisplayName, p.PlatformPersona, "(unknown)")
                 Dim line As New StringBuilder()
-                line.Append($"• **{EscapeForDiscord(p.Name)}**")
+                line.Append($"• **{EscapeForDiscord(displayed)}**")
                 If Not String.IsNullOrEmpty(p.Platform) Then
                     line.Append($" ({EscapeForDiscord(p.Platform)})")
                 End If

@@ -3,6 +3,14 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
+    <!--
+      Same NETSDK1047 reasoning as GSM.Node.vbproj: a publish that
+      pins -p:RuntimeIdentifier=win-x64 while skipping the per-publish
+      restore (the release workflow does both) needs the
+      net8.0-windows/win-x64 slot to exist in obj/project.assets.json,
+      which only happens if RuntimeIdentifiers is declared here.
+    -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <UseWindowsForms>true</UseWindowsForms>
     <RootNamespace></RootNamespace>
     <Nullable>disable</Nullable>

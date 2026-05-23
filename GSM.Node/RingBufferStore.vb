@@ -65,6 +65,20 @@ Namespace GSM.Node
         ''' Streams log lines as SSE events to the HTTP response.
         ''' Sends tail lines first, then follows new lines until
         ''' the cancellation token fires.
+        '''
+        ''' The tail capture and live-stream subscription must be
+        ''' arranged atomically against the ring buffer's write
+        ''' position — see SubscribeAndGetTail for why. Doing them
+        ''' as two separate lock acquisitions (capture _writePos at
+        ''' subscription, capture _writePos again at tail) produces
+        ''' a double-emit window when Add() happens between the
+        ''' two: lines added in that gap appear in both the tail
+        ''' (because tail returns the newest N regardless of when
+        ''' they were added) AND the live stream (because
+        ''' LastSequence reflects the older _writePos and so
+        ''' GetLinesSince returns them too). A fresh LO instance
+        ''' start can produce dozens of duplicated lines this way
+        ''' before the stream settles into its steady-state.
         ''' </summary>
         Public Async Function StreamToResponseAsync(instanceId As String,
                                                      response As HttpResponse,
@@ -73,13 +87,14 @@ Namespace GSM.Node
             Dim buf = _buffers.GetOrAdd(instanceId,
                 Function(id) New InstanceBuffer(id, DefaultBufferSize))
 
-            ' Create a subscription for new line notifications
+            ' Atomic: tail snapshot + subscription registration under
+            ' the same lock acquisition. Anything added before this
+            ' call returns is in the tail; anything added after this
+            ' call returns will be in the live stream. No overlap.
             Dim subscription As New LineSubscription()
-            buf.AddSubscription(subscription)
+            Dim tail = buf.SubscribeAndGetTail(subscription, tailLines)
 
             Try
-                ' Send tail first
-                Dim tail = buf.GetTail(tailLines)
                 For Each line In tail
                     Await WriteSseLineAsync(response, line, cancellation)
                 Next
@@ -201,9 +216,69 @@ Namespace GSM.Node
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Atomically captures the current tail AND registers a
+        ''' new subscription, under a single lock acquisition.
+        '''
+        ''' Returns a snapshot of the last 'tailCount' lines in the
+        ''' buffer at the moment the lock was held. Sets the
+        ''' subscription's LastSequence such that GetLinesSince
+        ''' (LastSequence) called by the caller will return only
+        ''' lines added AFTER this method returned — no overlap
+        ''' with the returned tail, no gap.
+        '''
+        ''' Required because the alternative of "AddSubscription
+        ''' then GetTail" takes the lock twice; between the two
+        ''' calls, Add() can fire and the line it inserts ends up
+        ''' in BOTH the tail (which sees it because GetTail just
+        ''' walks the last N entries from the current _writePos)
+        ''' AND the live stream (because subscription.LastSequence
+        ''' was captured from the older _writePos at
+        ''' AddSubscription time, so GetLinesSince picks it up
+        ''' again). The symmetric fix — update LastSequence to the
+        ''' tail's last seq after sending tail — produces a gap
+        ''' instead: lines added between the subscription request
+        ''' and the tail capture but pushed out of the tail's
+        ''' window are lost from both. Doing both under one lock
+        ''' is the only seamless option.
+        ''' </summary>
+        Public Function SubscribeAndGetTail(subscription As LineSubscription,
+                                             tailCount As Integer) As IReadOnlyList(Of BufferedLogLine)
+            SyncLock _lock
+                ' Inline GetTail under the lock, using a single
+                ' captured value of _writePos for both the tail walk
+                ' and the LastSequence assignment below. This is the
+                ' invariant that makes the contract work: tail covers
+                ' (_writePos - take) .. (_writePos - 1), live stream
+                ' starts at _writePos.
+                Dim available = CInt(Math.Min(_writePos, CLng(_ring.Length)))
+                Dim take = Math.Min(tailCount, available)
+                Dim result As New List(Of BufferedLogLine)(take)
+                For i = _writePos - take To _writePos - 1
+                    Dim idx = CInt(((i Mod _ring.Length) + _ring.Length) Mod _ring.Length)
+                    If _ring(idx) IsNot Nothing Then
+                        result.Add(_ring(idx))
+                    End If
+                Next
+
+                subscription.LastSequence = _writePos - 1
+                _subscriptions.Add(subscription)
+
+                Return result
+            End SyncLock
+        End Function
+
+        ''' <summary>
+        ''' Legacy non-atomic subscription. Kept available for
+        ''' subscribers that don't want a tail snapshot (no current
+        ''' callers; SubscribeAndGetTail is the right choice when
+        ''' streaming SSE because of the overlap window described
+        ''' there). If a future caller wants subscribe-only without
+        ''' backfill, this still works correctly — there's nothing
+        ''' for the tail to overlap with.
+        ''' </summary>
         Public Sub AddSubscription(subscription As LineSubscription)
             SyncLock _lock
-                ' Set initial read position to current write head
                 subscription.LastSequence = _writePos - 1
                 _subscriptions.Add(subscription)
             End SyncLock

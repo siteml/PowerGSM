@@ -99,8 +99,27 @@ jobs:
       # outcome (CtrlCSender wants win-x64 anyway), but the Linux
       # job legitimately needs the same fix and we want both jobs
       # symmetric.
+      #
+      # SelfContained pinned for the same propagation reason. The
+      # pubxml's <SelfContained>true</SelfContained> doesn't always
+      # take effect on CLI publish; the v0.2.0 release went out
+      # framework-dependent despite all three pubxmls saying
+      # otherwise, prompting users for the .NET 8 runtime on fresh
+      # PCs. Pinning via -p: makes the publish reliably bundle the
+      # runtime so the zips run anywhere with no prerequisites.
+      #
+      # PublishSingleFile + PublishReadyToRun pinned for the same
+      # propagation reason — the pubxml has both set, but CLI
+      # publish doesn't read pubxml values reliably (the same root
+      # cause as the SelfContained issue above). Without these,
+      # GSM.Node ships as a folder of ~200 runtime DLLs instead of
+      # one GSM.Node.exe — still self-contained, still functional,
+      # but a worse deploy shape than intended. The other four
+      # publish steps in this workflow already pin these flags;
+      # Node Windows missing them was an oversight when the v0.2.0
+      # postmortem pinned SelfContained on every step.
       - name: Publish Node (win-x64)
-        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/winx64.pubxml" -p:RuntimeIdentifier=win-x64 -p:PublishDir=publish/node-win-x64/ --no-restore
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/winx64.pubxml" -p:RuntimeIdentifier=win-x64 -p:SelfContained=true -p:PublishSingleFile=true -p:PublishReadyToRun=true -p:PublishDir=publish/node-win-x64/ --no-restore
 
       # NodeSetup is multi-targeted (net8.0;net8.0-windows). The SDK's
       # CrossTargeting check fires BEFORE the pubxml's TargetFramework
@@ -121,8 +140,15 @@ jobs:
       # get copied into the node folder — NodeSetup.exe goes
       # missing without any error. Pinning a project-relative path
       # makes the publish output and the deploy source agree.
+      #
+      # RuntimeIdentifier + SelfContained + PublishSingleFile +
+      # PublishReadyToRun all pinned for the same propagation
+      # reason as the Node step above. Without these, NodeSetup
+      # ships as a multi-file framework-dependent app that won't
+      # run on a fresh box. Pubxml says all four; CLI repeats them
+      # so they actually take effect.
       - name: Publish NodeSetup into Node folder (win-x64)
-        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0-windows -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Win64.pubxml" -p:PublishDir=publish/nodesetup-win-x64/ -p:NodeDeploymentDir=${{ github.workspace }}/GSM.Node/publish/node-win-x64/ --no-restore
+        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0-windows -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Win64.pubxml" -p:RuntimeIdentifier=win-x64 -p:SelfContained=true -p:PublishSingleFile=true -p:PublishReadyToRun=true -p:PublishDir=publish/nodesetup-win-x64/ -p:NodeDeploymentDir=${{ github.workspace }}/GSM.Node/publish/node-win-x64/ --no-restore
 
       # Manager: PublishDir overridden explicitly because the
       # pubxml's <PublishDir>bin\Release\net8.0-windows\publish\win-x64\</PublishDir>
@@ -133,8 +159,18 @@ jobs:
       # we'd rather pin the location explicitly than depend on
       # which one wins. Path is relative to the project, so this
       # lands at GSM.Manager\publish\manager-win-x64\.
+      #
+      # RuntimeIdentifier + SelfContained + PublishSingleFile +
+      # PublishReadyToRun all pinned for the same propagation
+      # reason as the Node and NodeSetup steps above. The v0.2.0
+      # release that went out without these pins prompted users
+      # for the .NET 8 Desktop Runtime on fresh PCs because
+      # Manager came out framework-dependent despite the pubxml
+      # saying otherwise. The pubxml is honored by VS dev publish
+      # but not reliably by CLI publish; CLI repeats the values
+      # so they actually take effect.
       - name: Publish Manager (win-x64)
-        run: dotnet publish GSM.Manager/GSM.Manager.vbproj -p:PublishProfileFullPath="GSM.Manager/My Project/PublishProfiles/FolderProfile.pubxml" -p:PublishDir=publish/manager-win-x64/ --no-restore
+        run: dotnet publish GSM.Manager/GSM.Manager.vbproj -p:PublishProfileFullPath="GSM.Manager/My Project/PublishProfiles/FolderProfile.pubxml" -p:RuntimeIdentifier=win-x64 -p:SelfContained=true -p:PublishSingleFile=true -p:PublishReadyToRun=true -p:PublishDir=publish/manager-win-x64/ --no-restore
 
       # Diagnostic listings before each zip — cheap, and means
       # the next time a path mystery happens we can see what's
@@ -250,8 +286,14 @@ jobs:
       # Windows job: the pubxml's path doesn't reliably win against
       # the SDK's RID-aware default. Lands at
       # GSM.Node/publish/node-linux-x64/ relative to the project.
+      #
+      # SelfContained + PublishSingleFile pinned for the same
+      # propagation reason as the Windows steps. Without these, the
+      # Linux Node zip ships as a multi-file framework-dependent
+      # app that needs ASP.NET Core 8 Runtime preinstalled. Pubxml
+      # says both; CLI repeats them so they actually take effect.
       - name: Publish Node (linux-x64)
-        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" -p:RuntimeIdentifier=linux-x64 -p:EnableWindowsTargeting=true -p:PublishDir=publish/node-linux-x64/ --no-restore
+        run: dotnet publish GSM.Node/GSM.Node.vbproj -p:PublishProfileFullPath="GSM.Node/My Project/PublishProfiles/linux64.pubxml" -p:RuntimeIdentifier=linux-x64 -p:SelfContained=true -p:PublishSingleFile=true -p:EnableWindowsTargeting=true -p:PublishDir=publish/node-linux-x64/ --no-restore
 
       # See build-windows for why -f is explicit. Linux build uses
       # the net8.0 (non-Windows) TFM — the .vbproj's <Compile Remove>
@@ -269,8 +311,14 @@ jobs:
       # mismatch makes DeployToNodeFolder's source glob hit an
       # empty directory. On the Linux job this manifested as zero
       # files deployed and a missing NodeSetup binary in the zip.
+      #
+      # RuntimeIdentifier + SelfContained + PublishSingleFile
+      # pinned for the same propagation reason as the other steps.
+      # No PublishReadyToRun here — Linux64.pubxml doesn't set it
+      # (R2R targets are RID-specific and the dev-time pubxml only
+      # bothers with R2R for Windows builds).
       - name: Publish NodeSetup into Node folder (linux-x64)
-        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0 -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Linux64.pubxml" -p:PublishDir=publish/nodesetup-linux-x64/ -p:NodeDeploymentDir=$GITHUB_WORKSPACE/GSM.Node/publish/node-linux-x64/ --no-restore
+        run: dotnet publish GSM.NodeSetup/GSM.NodeSetup.vbproj -f net8.0 -p:PublishProfileFullPath="GSM.NodeSetup/My Project/PublishProfiles/Linux64.pubxml" -p:RuntimeIdentifier=linux-x64 -p:SelfContained=true -p:PublishSingleFile=true -p:PublishDir=publish/nodesetup-linux-x64/ -p:NodeDeploymentDir=$GITHUB_WORKSPACE/GSM.Node/publish/node-linux-x64/ --no-restore
 
       # Diagnostic listing — same rationale as the Windows job.
       - name: List Node publish output

@@ -116,6 +116,47 @@ Namespace GSM.Manager.UI
         ' tracking when they close.
         Private _automationWindow As AutomationRulesForm
 
+        ' ============================================================
+        '  WS_EX_COMPOSITED — form-level paint flicker fix on resize
+        '
+        '  Without this, every child control inside MainForm paints
+        '  independently as the parent fires WM_SIZE during a
+        '  continuous resize drag. The user sees each panel, tab,
+        '  and listview redraw in sequence — a visible "refreshing
+        '  while resizing" cascade. Per-control double-buffering
+        '  (LVS_EX_DOUBLEBUFFER on listviews etc.) fixes intra-
+        '  control flicker but can't address the inter-control
+        '  paint sequence: each child is a separate HWND and
+        '  Windows repaints them one at a time as they receive
+        '  WM_SIZE.
+        '
+        '  WS_EX_COMPOSITED (0x02000000) tells Windows to composite
+        '  the entire descendant control tree into one off-screen
+        '  back buffer before drawing to the screen. Painting still
+        '  happens bottom-up across the tree, but the result is
+        '  blitted as a single unit. Visible effect during resize
+        '  is a smooth, flicker-free redraw of the whole window
+        '  contents.
+        '
+        '  Trade-off: paint events get a small (≈30–50ms) latency
+        '  added because the system coalesces paints into the
+        '  composite. For a static management UI like PowerGSM
+        '  that's not noticeable. Known failure modes
+        '  (animation-heavy controls, DataGridView in virtual
+        '  mode under certain visual styles) don't apply here.
+        '
+        '  Only on MainForm — child dialogs and forms paint
+        '  independently and would each have to opt in. None of
+        '  them have shown resize-flicker issues so far.
+        ' ============================================================
+        Protected Overrides ReadOnly Property CreateParams As System.Windows.Forms.CreateParams
+            Get
+                Dim cp As System.Windows.Forms.CreateParams = MyBase.CreateParams
+                cp.ExStyle = cp.ExStyle Or &H2000000  ' WS_EX_COMPOSITED
+                Return cp
+            End Get
+        End Property
+
         Public Sub New()
             FormIconHelper.ApplyTo(Me)
             InitializeComponent()
@@ -191,6 +232,8 @@ Namespace GSM.Manager.UI
                 Sub(s, e) OnPluginStatus())
             Dim steamCredsItem As New ToolStripMenuItem("&Steam Credentials...", Nothing,
                 Sub(s, e) OnSteamCredentials())
+            Dim sharedConfigItem As New ToolStripMenuItem("S&hared Resources...", Nothing,
+                Sub(s, e) OnSharedConfigGroups())
             Dim automationItem As New ToolStripMenuItem("&Automation Rules...", Nothing,
                 Sub(s, e) OnAutomationRules())
             Dim notificationsItem As New ToolStripMenuItem("&Notifications...", Nothing,
@@ -208,6 +251,7 @@ Namespace GSM.Manager.UI
             toolsMenu.DropDownItems.Add(openPluginsFolderItem)
             toolsMenu.DropDownItems.Add(New ToolStripSeparator())
             toolsMenu.DropDownItems.Add(steamCredsItem)
+            toolsMenu.DropDownItems.Add(sharedConfigItem)
             toolsMenu.DropDownItems.Add(New ToolStripSeparator())
             toolsMenu.DropDownItems.Add(automationItem)
             toolsMenu.DropDownItems.Add(notificationsItem)
@@ -452,6 +496,20 @@ Namespace GSM.Manager.UI
                     For Each nodeEntity In nodes
                         Dim nodeTreeNode As New TreeNode($"{nodeEntity.DisplayName} ({nodeEntity.HostAddress}:{nodeEntity.Port})")
                         nodeTreeNode.Tag = $"node:{nodeEntity.NodeId}"
+
+                        ' Visual indicator for detached nodes:
+                        ' grey text + " [detached]" suffix. The
+                        ' combination is unambiguous — colour
+                        ' alone reads as "disconnected" or
+                        ' "warning" depending on theme, and
+                        ' suffix alone is easy to miss in a busy
+                        ' tree. Gets reapplied on every
+                        ' RefreshNodeTree call so toggling
+                        ' attach/detach updates immediately.
+                        If Not nodeEntity.IsEnabled Then
+                            nodeTreeNode.Text = nodeTreeNode.Text & "  [detached]"
+                            nodeTreeNode.ForeColor = Color.Gray
+                        End If
 
                         ' Load installations for this node
                         Dim installations = db.Installations.
@@ -802,6 +860,21 @@ Namespace GSM.Manager.UI
         End Sub
 
         ''' <summary>
+        ''' Opens the Shared Resources dialog (Phase 5h) —
+        ''' manages plugin-defined shared-config groups. Modal so
+        ''' edits to a group don't race against an open instance
+        ''' (the merge picks up changes on next StartInstanceAsync
+        ''' regardless, so live-running instances see the new
+        ''' values only after they restart — same semantics as
+        ''' editing an Installation's config today).
+        ''' </summary>
+        Private Sub OnSharedConfigGroups()
+            Using dlg As New SharedConfigGroupsForm()
+                dlg.ShowDialog(Me)
+            End Using
+        End Sub
+
+        ''' <summary>
         ''' Open the Automation Rules window. Public so other forms
         ''' (e.g. EditInstanceForm's drift redirect) can request it
         ''' through MainForm rather than instantiating their own —
@@ -899,10 +972,26 @@ Namespace GSM.Manager.UI
 
             Select Case kind
                 Case "node"
+                    ' Look up the node's attach state so the
+                    ' toggle menu item can label the ACTION
+                    ' (what would happen on click) rather than
+                    ' the current state — "Detach Node" reads
+                    ' as the operation when the node is
+                    ' currently attached, "Attach Node" when
+                    ' detached.
+                    Dim isAttached = True
+                    Using lookupScope = ManagerProgram.Services.CreateScope()
+                        Dim lookupDb = lookupScope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                        Dim nodeEnt = lookupDb.Nodes.Find(entityId)
+                        If nodeEnt IsNot Nothing Then isAttached = nodeEnt.IsEnabled
+                    End Using
+
                     menu.Items.Add("Add Installation...", Nothing,
                         Sub(s, ev) OnNewInstallation(entityId))
                     menu.Items.Add("Edit Node...", Nothing,
                         Sub(s, ev) OnEditNode(entityId))
+                    menu.Items.Add(If(isAttached, "Detach Node", "Attach Node"), Nothing,
+                        Sub(s, ev) OnToggleNodeAttachment(entityId))
                     menu.Items.Add(New ToolStripSeparator())
                     menu.Items.Add("Delete Node", Nothing,
                         Sub(s, ev) OnDeleteNode(entityId))
@@ -983,6 +1072,30 @@ Namespace GSM.Manager.UI
                     RefreshNodeTree()
                 End If
             End Using
+        End Sub
+
+        ''' <summary>
+        ''' Toggle a node between attached (polled in the
+        ''' background) and detached (config retained, no
+        ''' background traffic). Implemented as a simple
+        ''' boolean flip on NodeEntity.IsEnabled — the polling
+        ''' loop's FetchAllInstanceIds and VersionCheckService's
+        ''' RunOnePassAsync both filter on the same flag, so the
+        ''' effect lands on the next poll iteration (within 3
+        ''' seconds). Existing log streams to a now-detached
+        ''' node aren't cancelled here; they continue running
+        ''' until the TCP connection drops or the operator
+        ''' closes the viewer.
+        ''' </summary>
+        Private Sub OnToggleNodeAttachment(nodeId As String)
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim nodeEnt = db.Nodes.Find(nodeId)
+                If nodeEnt Is Nothing Then Return
+                nodeEnt.IsEnabled = Not nodeEnt.IsEnabled
+                db.SaveChanges()
+            End Using
+            RefreshNodeTree()
         End Sub
 
         Private Sub OnDeleteNode(nodeId As String)

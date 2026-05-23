@@ -182,14 +182,14 @@ Namespace GSM.Manager.Core
         ''' </summary>
         Public Async Function CheckInstallationAsync(installationId As String,
                                                       respectThrottle As Boolean,
-                                                      cancellation As CancellationToken) As Task(Of Boolean)
+                                                      cancellation As CancellationToken) As Task(Of VersionCheckResult)
             Try
                 Using scope = _serviceProvider.CreateScope()
                     Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
                     Dim install = db.Installations.Find(installationId)
                     If install Is Nothing Then
                         _logger.LogWarning("VersionCheck: installation {Id} not found", installationId)
-                        Return False
+                        Return VersionCheckResult.Fail("Installation not found in the database.")
                     End If
 
                     ' Throttle check (manual "Check Now" passes
@@ -200,7 +200,7 @@ Namespace GSM.Manager.Core
                             _logger.LogDebug(
                                 "VersionCheck: skipping {Id} — checked {Mins} minutes ago",
                                 installationId, CInt(sinceLast.TotalMinutes))
-                            Return True
+                            Return VersionCheckResult.Ok()
                         End If
                     End If
 
@@ -209,7 +209,8 @@ Namespace GSM.Manager.Core
                         _logger.LogDebug(
                             "VersionCheck: no plugin for game {Game}, skipping {Id}",
                             install.GameId, installationId)
-                        Return False
+                        Return VersionCheckResult.Fail(
+                            $"Plugin '{install.GameId}' is not loaded.")
                     End If
 
                     ' Fetch the latest upstream version. Steam-
@@ -240,7 +241,10 @@ Namespace GSM.Manager.Core
                                 _logger.LogDebug(
                                     "VersionCheck: Steam path failed for {Id}: {Err} — skipping cycle, will retry next interval",
                                     installationId, result.ErrorMessage)
-                                Return False
+                                Return VersionCheckResult.Fail(
+                                    If(String.IsNullOrEmpty(result.ErrorMessage),
+                                        "Steam version check failed (no error message reported).",
+                                        result.ErrorMessage))
                             End If
 
                             usedSteamPath = True
@@ -296,7 +300,7 @@ Namespace GSM.Manager.Core
                             _logger.LogWarning(ex,
                                 "VersionCheck: Steam path threw for {Id} — skipping cycle, will retry next interval",
                                 installationId)
-                            Return False
+                            Return VersionCheckResult.Fail(ex.Message)
                         End Try
                     Else
                         ' Non-Steam install — use IVersionAwarePlugin
@@ -309,7 +313,8 @@ Namespace GSM.Manager.Core
                             _logger.LogDebug(
                                 "VersionCheck: {Id} is non-Steam and plugin doesn't implement IVersionAwarePlugin — no version-check path",
                                 installationId)
-                            Return False
+                            Return VersionCheckResult.Fail(
+                                $"Plugin '{install.GameId}' does not support version checking for non-Steam installs (no IVersionAwarePlugin implementation).")
                         End If
                         Try
                             Dim installConfig As New InstallationConfig With {
@@ -369,7 +374,7 @@ Namespace GSM.Manager.Core
                         Catch ex As Exception
                             _logger.LogWarning(ex,
                                 "VersionCheck: plugin path threw for {Id}", installationId)
-                            Return False
+                            Return VersionCheckResult.Fail(ex.Message)
                         End Try
                     End If
 
@@ -380,7 +385,8 @@ Namespace GSM.Manager.Core
                         _logger.LogDebug(
                             "VersionCheck: {Id} returned no version (transient failure?)",
                             installationId)
-                        Return False
+                        Return VersionCheckResult.Fail(
+                            "Upstream returned no version (transient network failure or unsupported plugin response).")
                     End If
 
                     ' Decision time: do we fire a mismatch event?
@@ -447,11 +453,11 @@ Namespace GSM.Manager.Core
                             installationId, latestVersion, isOutOfDate, isNewlyDetected)
                     End If
 
-                    Return True
+                    Return VersionCheckResult.Ok()
                 End Using
             Catch ex As Exception
                 _logger.LogWarning(ex, "VersionCheck for {Id} threw", installationId)
-                Return False
+                Return VersionCheckResult.Fail(ex.Message)
             End Try
         End Function
 
@@ -492,9 +498,20 @@ Namespace GSM.Manager.Core
             Dim installationIds As List(Of String)
             Using scope = _serviceProvider.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
-                installationIds = db.Installations.
-                    Select(Function(i) i.InstallationId).
-                    ToList()
+                ' Skip installations whose node is detached. Same
+                ' rationale as InstanceManager.FetchAllInstanceIds:
+                ' version polling shouldn't ping-pong a node the
+                ' operator has opted out of background traffic
+                ' for. Manual "Check for Updates" via the
+                ' InstallationPanel goes through
+                ' CheckInstallationAsync directly without this
+                ' filter, so the operator can still force a check
+                ' on a detached install if they really want one.
+                installationIds = (From install In db.Installations
+                                   Join nodeEnt In db.Nodes
+                                       On install.NodeId Equals nodeEnt.NodeId
+                                   Where nodeEnt.IsEnabled
+                                   Select install.InstallationId).ToList()
             End Using
 
             For Each id In installationIds
@@ -533,6 +550,47 @@ Namespace GSM.Manager.Core
             Return InstallMethod.Manual
         End Function
 
+    End Class
+
+    ' ============================================================
+    '  Version-check result type
+    ' ============================================================
+
+    ''' <summary>
+    ''' Result of a single CheckInstallationAsync pass. Replaces
+    ''' the previous Task(Of Boolean) return so callers (most
+    ''' importantly the manual "Check for Updates" button) can
+    ''' surface the actual failure reason instead of falling back
+    ''' to the "see log for details" placeholder the boolean
+    ''' return forced.
+    '''
+    ''' Success = True covers both "fresh latest version fetched
+    ''' and persisted" AND "deliberately skipped this cycle
+    ''' (throttle window not yet elapsed)". The manual button
+    ''' bypasses throttle so it only sees the former; the
+    ''' background poller doesn't inspect the result either way.
+    '''
+    ''' Success = False carries ErrorMessage so the UI can render
+    ''' it. Sources include: SteamCMD-level errors from the node
+    ''' (multi-line distro-tailored library-missing hint, etc.),
+    ''' plugin-side exceptions, and missing-installation /
+    ''' missing-plugin lookups. ErrorMessage is never null on
+    ''' failure but may be empty if no message was available.
+    ''' </summary>
+    Public Class VersionCheckResult
+        Public Property Success As Boolean
+        Public Property ErrorMessage As String
+
+        Public Shared Function Ok() As VersionCheckResult
+            Return New VersionCheckResult With {.Success = True}
+        End Function
+
+        Public Shared Function Fail(message As String) As VersionCheckResult
+            Return New VersionCheckResult With {
+                .Success = False,
+                .ErrorMessage = If(message, "")
+            }
+        End Function
     End Class
 
 End Namespace

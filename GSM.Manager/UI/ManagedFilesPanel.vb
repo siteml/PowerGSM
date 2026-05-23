@@ -56,7 +56,7 @@ Namespace GSM.Manager.UI
         Private _duplicateButton As Button
         Private _renameButton As Button
         Private _deleteButton As Button
-        Private _listView As ListView
+        Private _listView As BufferedListView
         Private _statusLabel As Label
 
         ' True while a file op is in flight; gates Upload/Download/
@@ -207,17 +207,12 @@ Namespace GSM.Manager.UI
             ' ListView fills the rest. Newest-first order applied
             ' in ApplyFiles so a fresh upload lands at the top.
             ' Double-click downloads as a convenience.
-            _listView = New ListView() With {
-                .Dock = DockStyle.Fill,
-                .View = View.Details,
-                .FullRowSelect = True,
-                .GridLines = True,
-                .HideSelection = False,
-                .MultiSelect = False
+            _listView = New BufferedListView() With {
+                .Dock = DockStyle.Fill
             }
-            _listView.Columns.Add("Name", 280)
-            _listView.Columns.Add("Size", 100)
-            _listView.Columns.Add("Modified", 160)
+            _listView.AddColumn("Name", 280)
+            _listView.AddColumn("Size", 100)
+            _listView.AddColumn("Modified", 160)
             AddHandler _listView.DoubleClick, AddressOf OnListDoubleClick
             AddHandler _listView.SelectedIndexChanged, AddressOf OnSelectionChanged
 
@@ -257,7 +252,7 @@ Namespace GSM.Manager.UI
             ' a write-only directory still gets duplication.
             Dim canRename = canWrite AndAlso canDelete
             Dim canDuplicate = canWrite
-            Dim hasSelection = _listView.SelectedItems.Count > 0
+            Dim hasSelection = _listView.HasSelection
 
             _refreshButton.Enabled = notBusy
             ' Generate is gated on Write — a generated map needs
@@ -351,7 +346,7 @@ Namespace GSM.Manager.UI
         Private Sub ApplyFiles(files As IReadOnlyList(Of FileEntry))
             _listView.BeginUpdate()
             Try
-                _listView.Items.Clear()
+                _listView.ClearRows()
                 If files Is Nothing OrElse files.Count = 0 Then
                     SetStatus($"No files in {_directory.DisplayName}.", Color.Gray)
                     Return
@@ -363,11 +358,11 @@ Namespace GSM.Manager.UI
                 Dim ordered = files.OrderByDescending(Function(f) f.ModifiedUtc).ToList()
                 For Each entry In ordered
                     Dim displayName = ShortName(entry.RelativePath)
-                    Dim item As New ListViewItem(displayName)
-                    item.SubItems.Add(FormatSize(entry.SizeBytes))
-                    item.SubItems.Add(entry.ModifiedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"))
-                    item.Tag = entry
-                    _listView.Items.Add(item)
+                    Dim row = _listView.AddRow(
+                        displayName,
+                        FormatSize(entry.SizeBytes),
+                        entry.ModifiedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"))
+                    row.Tag = entry
                 Next
                 Dim noun = If(files.Count = 1, "file", "files")
                 SetStatus($"{files.Count} {noun}.", Color.DarkGreen)
@@ -409,8 +404,9 @@ Namespace GSM.Manager.UI
             ' with this name. Less abrupt than letting the node
             ' silently overwrite or letting the request 409 with
             ' overwrite=false.
-            Dim alreadyExists = _listView.Items.Cast(Of ListViewItem)().
-                Any(Function(it) String.Equals(it.Text, fileName, StringComparison.OrdinalIgnoreCase))
+            Dim alreadyExists = _listView.Rows.
+                Any(Function(r) r.Cells.Length > 0 AndAlso
+                                  String.Equals(r.Cells(0), fileName, StringComparison.OrdinalIgnoreCase))
             If alreadyExists Then
                 Dim resp = MessageBox.Show(Me,
                     $"A file named '{fileName}' already exists in {_directory.DisplayName}. Overwrite?",
@@ -454,8 +450,9 @@ Namespace GSM.Manager.UI
         ' ====================================================
 
         Private Async Sub DownloadClicked()
-            If _listView.SelectedItems.Count = 0 Then Return
-            Dim entry = TryCast(_listView.SelectedItems(0).Tag, FileEntry)
+            Dim selected = _listView.SelectedRow
+            If selected Is Nothing Then Return
+            Dim entry = TryCast(selected.Tag, FileEntry)
             If entry Is Nothing Then Return
 
             Dim suggestedName = ShortName(entry.RelativePath)
@@ -520,8 +517,9 @@ Namespace GSM.Manager.UI
         ' ====================================================
 
         Private Async Sub DeleteClicked()
-            If _listView.SelectedItems.Count = 0 Then Return
-            Dim entry = TryCast(_listView.SelectedItems(0).Tag, FileEntry)
+            Dim selected = _listView.SelectedRow
+            If selected Is Nothing Then Return
+            Dim entry = TryCast(selected.Tag, FileEntry)
             If entry Is Nothing Then Return
 
             Dim displayName = ShortName(entry.RelativePath)
@@ -576,8 +574,9 @@ Namespace GSM.Manager.UI
         ' ====================================================
 
         Private Async Sub RenameClicked()
-            If _listView.SelectedItems.Count = 0 Then Return
-            Dim entry = TryCast(_listView.SelectedItems(0).Tag, FileEntry)
+            Dim selected = _listView.SelectedRow
+            If selected Is Nothing Then Return
+            Dim entry = TryCast(selected.Tag, FileEntry)
             If entry Is Nothing Then Return
 
             Dim oldName = ShortName(entry.RelativePath)
@@ -647,8 +646,9 @@ Namespace GSM.Manager.UI
             ' under the new name. Same UX as upload — explicit yes
             ' beats a node-side 409 and a confused user.
             Dim overwrite As Boolean = False
-            Dim collision = _listView.Items.Cast(Of ListViewItem)().
-                Any(Function(it) String.Equals(it.Text, newName, StringComparison.OrdinalIgnoreCase))
+            Dim collision = _listView.Rows.
+                Any(Function(r) r.Cells.Length > 0 AndAlso
+                                  String.Equals(r.Cells(0), newName, StringComparison.OrdinalIgnoreCase))
             If collision Then
                 Dim resp = MessageBox.Show(Me,
                     $"A file named '{newName}' already exists in {_directory.DisplayName}. Overwrite?",
@@ -687,8 +687,9 @@ Namespace GSM.Manager.UI
         ' ====================================================
 
         Private Async Sub DuplicateClicked()
-            If _listView.SelectedItems.Count = 0 Then Return
-            Dim entry = TryCast(_listView.SelectedItems(0).Tag, FileEntry)
+            Dim selected = _listView.SelectedRow
+            If selected Is Nothing Then Return
+            Dim entry = TryCast(selected.Tag, FileEntry)
             If entry Is Nothing Then Return
 
             Dim oldName = ShortName(entry.RelativePath)
@@ -762,8 +763,9 @@ Namespace GSM.Manager.UI
             ' edited the suggested name to one that collides; better
             ' to ask than to silently obliterate their existing copy.
             Dim overwrite As Boolean = False
-            Dim collision = _listView.Items.Cast(Of ListViewItem)().
-                Any(Function(it) String.Equals(it.Text, newName, StringComparison.OrdinalIgnoreCase))
+            Dim collision = _listView.Rows.
+                Any(Function(r) r.Cells.Length > 0 AndAlso
+                                  String.Equals(r.Cells(0), newName, StringComparison.OrdinalIgnoreCase))
             If collision Then
                 Dim resp = MessageBox.Show(Me,
                     $"A file named '{newName}' already exists in {_directory.DisplayName}. Overwrite?",
@@ -995,8 +997,8 @@ Namespace GSM.Manager.UI
             Dim ext = Path.GetExtension(oldName)
 
             Dim existing As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
-            For Each item As ListViewItem In _listView.Items
-                existing.Add(item.Text)
+            For Each row In _listView.Rows
+                If row.Cells.Length > 0 Then existing.Add(row.Cells(0))
             Next
 
             Dim candidate = $"{baseName} - Copy{ext}"

@@ -106,6 +106,7 @@ Namespace GSM.Manager
             ' ---- Phase 4 Core services ----
             serviceCollection.AddSingleton(Of NodeHttpClientFactory)()
             serviceCollection.AddSingleton(Of CredentialService)()
+            serviceCollection.AddSingleton(Of SharedConfigService)()
             serviceCollection.AddSingleton(Of PluginRegistry)()
             serviceCollection.AddSingleton(Of InstanceManager)()
             serviceCollection.AddSingleton(Of InstallationManager)()

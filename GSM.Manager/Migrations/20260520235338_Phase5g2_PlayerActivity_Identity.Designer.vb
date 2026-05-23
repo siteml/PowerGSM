@@ -9,10 +9,10 @@ Imports Microsoft.VisualBasic
 
 Namespace Global.Migrations
     <DbContext(GetType(GsmDbContext))>
-    Partial Class GsmDbContextModelSnapshot
-        Inherits ModelSnapshot
-
-        Protected Overrides Sub BuildModel(modelBuilder As ModelBuilder)
+    <Migration("20260520235338_Phase5g2_PlayerActivity_Identity")>
+    Partial Class Phase5g2_PlayerActivity_Identity
+        ''' <inheritdoc />
+        Protected Overrides Sub BuildTargetModel(modelBuilder As ModelBuilder)
             modelBuilder.HasAnnotation("ProductVersion", "8.0.2")
 
             modelBuilder.Entity("GSM.Manager.Data.AppSettingEntity",
@@ -292,9 +292,6 @@ Namespace Global.Migrations
                     b.Property(Of Boolean)("RunCommonRedist").
                         HasColumnType("INTEGER")
 
-                    b.Property(Of String)("SharedConfigGroupId").
-                        HasColumnType("TEXT")
-
                     b.Property(Of String)("SteamCredentialId").
                         HasColumnType("TEXT")
 
@@ -304,8 +301,6 @@ Namespace Global.Migrations
                     b.HasKey("InstallationId")
 
                     b.HasIndex("NodeId")
-
-                    b.HasIndex("SharedConfigGroupId")
 
                     b.ToTable("Installations")
                 End Sub)
@@ -672,43 +667,6 @@ Namespace Global.Migrations
                     b.ToTable("SessionHosts")
                 End Sub)
 
-            modelBuilder.Entity("GSM.Manager.Data.SharedConfigGroupEntity",
-                Sub(b)
-                    b.Property(Of String)("GroupId").
-                        HasColumnType("TEXT")
-
-                    b.Property(Of String)("ConfigJson").
-                        IsRequired().
-                        HasColumnType("TEXT")
-
-                    b.Property(Of Date)("CreatedUtc").
-                        HasColumnType("TEXT")
-
-                    b.Property(Of String)("DisplayName").
-                        IsRequired().
-                        HasMaxLength(200).
-                        HasColumnType("TEXT")
-
-                    b.Property(Of String)("GroupType").
-                        IsRequired().
-                        HasMaxLength(50).
-                        HasColumnType("TEXT")
-
-                    b.Property(Of String)("PluginId").
-                        IsRequired().
-                        HasMaxLength(100).
-                        HasColumnType("TEXT")
-
-                    b.Property(Of Date)("UpdatedUtc").
-                        HasColumnType("TEXT")
-
-                    b.HasKey("GroupId")
-
-                    b.HasIndex("PluginId", "GroupType")
-
-                    b.ToTable("SharedConfigGroups")
-                End Sub)
-
             modelBuilder.Entity("GSM.Manager.Data.SteamCredentialEntity",
                 Sub(b)
                     b.Property(Of String)("CredentialId").
@@ -765,13 +723,7 @@ Namespace Global.Migrations
                     b.HasOne("GSM.Manager.Data.NodeEntity", "Node").
                         WithMany("Installations").
                         HasForeignKey("NodeId")
-
-                    b.HasOne("GSM.Manager.Data.SharedConfigGroupEntity", "SharedConfigGroup").
-                        WithMany("Installations").
-                        HasForeignKey("SharedConfigGroupId")
                     b.Navigation("Node")
-
-                    b.Navigation("SharedConfigGroup")
                 End Sub)
 
             modelBuilder.Entity("GSM.Manager.Data.InstanceEntity",
@@ -788,11 +740,6 @@ Namespace Global.Migrations
                 End Sub)
 
             modelBuilder.Entity("GSM.Manager.Data.NodeEntity",
-                Sub(b)
-                    b.Navigation("Installations")
-                End Sub)
-
-            modelBuilder.Entity("GSM.Manager.Data.SharedConfigGroupEntity",
                 Sub(b)
                     b.Navigation("Installations")
                 End Sub)

@@ -11,6 +11,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Update="ConanExilesPlugin.vb">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </Compile>
     <Compile Update="FactorioPlugin.vb">
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </Compile>

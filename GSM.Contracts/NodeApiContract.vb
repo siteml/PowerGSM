@@ -549,7 +549,28 @@ Namespace GSM.Node.Api
     ' ============================================================
 
     Public Class PlayerSession
-        Public Property Name As String
+        ''' <summary>
+        ''' Steam handle / Xbox gamertag — what the platform reports
+        ''' for this account. Known immediately on join from the
+        ''' login URL's Name parameter. For Factorio this also matches
+        ''' the in-game name (no separate character identity); for
+        ''' Last Oasis it's the Steam persona which may differ from
+        ''' the renamed in-game character (see DisplayName below).
+        ''' </summary>
+        Public Property PlatformPersona As String
+
+        ''' <summary>
+        ''' In-game character display name — what shows in chat and
+        ''' on join/leave messages. For Last Oasis this comes from
+        ''' the LogPersistence "Persisting &lt;name&gt;" line and may
+        ''' differ from PlatformPersona if the player renamed their
+        ''' character via myrealm. Nothing until the first persistence
+        ''' tick lands (~2 min from join). UIs default to
+        ''' DisplayName ?? PlatformPersona when surfacing
+        ''' "who is this player".
+        ''' </summary>
+        Public Property DisplayName As String
+
         Public Property Platform As String
         Public Property PlatformUserId As String   ' SteamID64, Xbox GUID, etc.
         Public Property CharacterId As String
@@ -580,7 +601,31 @@ Namespace GSM.Node.Api
 
     Public Class ChatMessage
         Public Property TimestampUtc As DateTime
-        Public Property PlayerName As String
+
+        ''' <summary>
+        ''' In-game character name as it appeared in the chat line.
+        ''' Stored as-text per message — historical entries retain
+        ''' the name the player was using when they spoke, even if
+        ''' they've renamed their character since. Always populated.
+        ''' </summary>
+        Public Property DisplayName As String
+
+        ''' <summary>
+        ''' Resolved Steam/Xbox/etc. ID for the speaker, attached via
+        ''' EventStore lookup by DisplayName at the moment the chat
+        ''' line was parsed. Nothing for messages whose speaker had
+        ''' not yet been identity-resolved (chat arriving before the
+        ''' first Persisting tick on a new join). Historical messages
+        ''' written before this contract addition will be Nothing.
+        ''' </summary>
+        Public Property PlatformUserId As String
+
+        ''' <summary>
+        ''' Resolved CharacterId for the speaker, same provenance as
+        ''' PlatformUserId. Same Nothing-on-race-or-old-history caveat.
+        ''' </summary>
+        Public Property CharacterId As String
+
         Public Property Text As String
     End Class
 
@@ -730,6 +775,73 @@ Namespace GSM.Node.Api
         Public Property Output As String
     End Class
 
+    ' ============================================================
+    '  Prerequisite checks (Phase 5g side-feature)
+    '
+    '  Host-side runtime-dependency probing: the Manager declares
+    '  named prereqs via the plugin's IPrerequisiteProvider, the
+    '  node returns whether each is installed plus user-facing
+    '  display fields. The node owns the catalog so adding new
+    '  prereqs doesn't bump the plugin-contracts version.
+    ' ============================================================
+
+    ''' <summary>
+    ''' One entry in a PrerequisiteCheckResponse — the node returns
+    ''' one of these per name in the request, in the same order.
+    '''
+    ''' Recognized=False means the node's catalog doesn't know this
+    ''' name (older node, newer plugin); Installed and the display
+    ''' fields are meaningless in that case and the Manager silently
+    ''' skips the result.
+    '''
+    ''' Recognized=True + Installed=True means the runtime is present;
+    ''' Manager renders nothing. Recognized=True + Installed=False is
+    ''' the case that drives a pre-install Warning notice; Manager
+    ''' renders it using DisplayName / DownloadUrl / Instructions.
+    ''' </summary>
+    Public Class PrerequisiteCheckResult
+        Public Property Name As String
+        Public Property Recognized As Boolean
+        Public Property Installed As Boolean
+
+        ''' <summary>
+        ''' Detected version string when known (e.g. "14.38.33135.0"
+        ''' for VC++). Empty when not detected or not applicable.
+        ''' Currently surfaces only in diagnostics; the notice fires
+        ''' off Installed alone.
+        ''' </summary>
+        Public Property Version As String
+
+        ''' <summary>
+        ''' Human-readable name suitable for a notice title, e.g.
+        ''' "Microsoft Visual C++ 2015-2022 Redistributable (x64)".
+        ''' </summary>
+        Public Property DisplayName As String
+
+        ''' <summary>
+        ''' Direct download URL for the missing runtime. Typically
+        ''' an aka.ms short link that resolves to Microsoft's latest
+        ''' installer for that runtime line.
+        ''' </summary>
+        Public Property DownloadUrl As String
+
+        ''' <summary>
+        ''' Body text for the pre-install notice. Plain prose; the
+        ''' Manager appends the DownloadUrl on its own line when
+        ''' rendering, so this string should NOT include the URL.
+        ''' </summary>
+        Public Property Instructions As String
+    End Class
+
+    ''' <summary>
+    ''' Response from GET /api/system/prerequisites. Results list
+    ''' is parallel to the request's names list — same count, same
+    ''' order, one Result per name.
+    ''' </summary>
+    Public Class PrerequisiteCheckResponse
+        Public Property Results As List(Of PrerequisiteCheckResult)
+    End Class
+
     ''' <summary>
     ''' Interface for communicating with a GSM Node. The manager
     ''' resolves all game-specific logic via IGamePlugin, builds
@@ -739,6 +851,27 @@ Namespace GSM.Node.Api
     ''' retry logic, and connection pooling.
     ''' </summary>
     Public Interface INodeClient
+
+        ' ---- Host-side prerequisite checks (Phase 5g side-feature) ----
+
+        ''' <summary>
+        ''' Query the node for the install state of named host-side
+        ''' runtime dependencies (Microsoft VC++ redistributable,
+        ''' DirectX runtimes, etc). Used by the new-installation
+        ''' flow to surface missing prereqs as pre-install notices
+        ''' before the install attempt actually starts.
+        '''
+        ''' Names are opaque strings owned by the node's catalog;
+        ''' the node returns Recognized=False for any it doesn't
+        ''' know about (older node + newer plugin) and the Manager
+        ''' silently skips those. Endpoint may 404 on pre-feature
+        ''' nodes; callers should treat that as "no prereq info
+        ''' available" (silently proceed without notices) rather
+        ''' than failure — the prereq check is a quality-of-life
+        ''' enhancement, not a gate.
+        ''' </summary>
+        Function CheckPrerequisitesAsync(names As IReadOnlyList(Of String),
+                                          cancellation As CancellationToken) As Task(Of PrerequisiteCheckResponse)
 
         ' ---- Node ----
         Function GetStatusAsync(cancellation As CancellationToken) As Task(Of NodeStatusResponse)
@@ -796,6 +929,24 @@ Namespace GSM.Node.Api
                                     cancellation As CancellationToken) As Task(Of IReadOnlyList(Of LogLine))
 
         ' ---- Parsed events: players, server state, chat ----
+
+        ''' <summary>
+        ''' Re-pushes the declarative parse rule set to the node
+        ''' for an instance that is already running. The node
+        ''' replaces the compiled rule list atomically while
+        ''' preserving the in-memory player/server-state caches
+        ''' for that instance — used by the Manager on reconnect
+        ''' (after a node binary update or a Manager restart) so
+        ''' running game processes don't need to be stopped and
+        ''' restarted just to refresh rules. Returns silently on
+        ''' nodes older than this contract (HTTP 404 surfaces as
+        ''' NodeApiException with StatusCode = NotFound; callers
+        ''' that want to support older nodes catch that
+        ''' specifically and proceed).
+        ''' </summary>
+        Function UpdateParseRulesAsync(instanceId As String,
+                                        rules As IList(Of LogParseRule),
+                                        cancellation As CancellationToken) As Task
 
         ''' <summary>
         ''' Returns the list of players the node currently believes

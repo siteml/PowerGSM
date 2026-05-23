@@ -1,9 +1,11 @@
 Imports System
+Imports System.Collections.Generic
 Imports System.Threading
 Imports Microsoft.AspNetCore.Builder
 Imports Microsoft.AspNetCore.Http
 Imports GSM.Node.Api
 Imports GSM.Node
+Imports GSM.Plugin
 
 ' ============================================================
 '  Instance endpoints — start/stop/status, RCON, log streaming
@@ -183,6 +185,35 @@ Namespace GSM.Node.Endpoints
                         End If
                     End If
                     Return Results.Ok(eventStore.GetChatHistory(instanceId, sinceUtc, limit))
+                End Function)
+
+            ' Re-push declarative parse rules to a running instance
+            ' without resetting the EventStore's in-memory state.
+            ' Used by the Manager on reconnect after a node binary
+            ' update or Manager restart — replaces the older
+            ' "stop+start every instance to refresh rules" workflow,
+            ' which kicked all players off as a side effect.
+            ' EventStore.UpdateParseRules logs a warning and no-ops
+            ' if the instance isn't currently registered (which
+            ' surfaces here as 200 OK with updated=true, count=0 —
+            ' rules-by-themselves can't bootstrap state, only
+            ' StartInstance can, so there's nothing useful for the
+            ' Manager to do with a distinguished response).
+            app.MapPost("/api/instances/{instanceId}/parse-rules",
+                Async Function(instanceId As String,
+                               context As HttpContext,
+                               eventStore As EventStore) As Task(Of IResult)
+                    Dim rules As List(Of LogParseRule) = Nothing
+                    Try
+                        rules = Await context.Request.ReadFromJsonAsync(Of List(Of LogParseRule))()
+                    Catch ex As Exception
+                        Return Results.BadRequest(New With {.error = "Invalid request body: " & ex.Message})
+                    End Try
+                    If rules Is Nothing Then
+                        Return Results.BadRequest(New With {.error = "Request body missing or not a JSON array"})
+                    End If
+                    eventStore.UpdateParseRules(instanceId, rules)
+                    Return Results.Ok(New With {.updated = True, .count = rules.Count})
                 End Function)
 
         End Sub

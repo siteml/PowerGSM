@@ -1,5 +1,6 @@
 Imports System
 Imports System.Collections.Generic
+Imports System.ComponentModel
 Imports System.Drawing
 Imports System.Linq
 Imports System.Threading
@@ -59,6 +60,15 @@ Namespace GSM.Manager.UI
         Private _statusStrip As StatusStrip
         Private _statusLabel As ToolStripStatusLabel
         Private _progressBar As ToolStripProgressBar
+
+        ' Phase 5h-6 — right-click context menu on result rows.
+        ' Two items: copy the row's InstanceId, or copy the raw
+        ' SessionIdentity. Both source from the ListViewItem's
+        ' Tag (set to the underlying TimelineRow / SnapshotRow
+        ' during render).
+        Private _rowContextMenu As ContextMenuStrip
+        Private _copyInstanceIdItem As ToolStripMenuItem
+        Private _copySessionIdentityItem As ToolStripMenuItem
 
         ' ---- Query lifecycle ----
         Private _queryCts As CancellationTokenSource
@@ -288,9 +298,25 @@ Namespace GSM.Manager.UI
                 .View = View.Details,
                 .FullRowSelect = True,
                 .GridLines = True,
-                .Font = New Font("Segoe UI", 9)
+                .Font = New Font("Segoe UI", 9),
+                .ShowItemToolTips = True
             }
             BuildTimelineColumns()
+
+            ' Phase 5h-6 — right-click context menu. Built once,
+            ' assigned to the ListView; the Opening handler
+            ' enables/disables items based on selection so the
+            ' user can't pick "Copy…" when nothing is selected.
+            _rowContextMenu = New ContextMenuStrip()
+            _copyInstanceIdItem = New ToolStripMenuItem("Copy &instance ID")
+            AddHandler _copyInstanceIdItem.Click, AddressOf OnCopyInstanceId
+            _rowContextMenu.Items.Add(_copyInstanceIdItem)
+            _copySessionIdentityItem = New ToolStripMenuItem("Copy &session identity")
+            AddHandler _copySessionIdentityItem.Click, AddressOf OnCopySessionIdentity
+            _rowContextMenu.Items.Add(_copySessionIdentityItem)
+            AddHandler _rowContextMenu.Opening, AddressOf OnRowContextMenuOpening
+            _resultsList.ContextMenuStrip = _rowContextMenu
+
             Me.Controls.Add(_resultsList)
             _resultsList.BringToFront()
 
@@ -301,7 +327,15 @@ Namespace GSM.Manager.UI
             _resultsList.Columns.Clear()
             _resultsList.Columns.Add("Time", 160)
             _resultsList.Columns.Add("Kind", 70)
-            _resultsList.Columns.Add("Tile / Session", 260)
+            ' Phase 5h-6 — Source column replaces the old
+            ' "Tile / Session" and "Instance" columns. The label
+            ' is plugin-formatted via ISourceLabelProvider; for
+            ' LO it reads "{TileName} — {RealmName} —
+            ' {Node}/{Install}" so the operator gets all the
+            ' "where did this come from" context in one cell.
+            ' Plugins that don't opt in get a default
+            ' "{Node}/{Install}/{Instance}" label.
+            _resultsList.Columns.Add("Source", 540)
             _resultsList.Columns.Add("Player", 150)
             _resultsList.Columns.Add("Message", 400)
         End Sub
@@ -310,7 +344,9 @@ Namespace GSM.Manager.UI
             _resultsList.Columns.Clear()
             _resultsList.Columns.Add("Player", 180)
             _resultsList.Columns.Add("Joined", 160)
-            _resultsList.Columns.Add("Tile / Session", 260)
+            ' Phase 5h-6 — same plugin-formatted Source label as
+            ' the timeline view (see BuildTimelineColumns).
+            _resultsList.Columns.Add("Source", 400)
             _resultsList.Columns.Add("Last chat", 400)
             _resultsList.Columns.Add("Last chat time", 160)
         End Sub
@@ -613,9 +649,11 @@ Namespace GSM.Manager.UI
                 For Each r In result.Rows
                     Dim item As New ListViewItem(FormatDisplayTime(r.TimestampUtc))
                     item.SubItems.Add(RowKindLabel(r.Kind))
-                    item.SubItems.Add(r.TileDisplayName)
+                    item.SubItems.Add(If(r.SourceLabel, ""))
                     item.SubItems.Add(If(r.PlayerName, ""))
                     item.SubItems.Add(If(r.Text, ""))
+                    item.Tag = r
+                    item.ToolTipText = BuildRowTooltip(r.SessionIdentity, r.InstanceId)
                     ColorCodeRow(item, r.Kind)
                     _resultsList.Items.Add(item)
                 Next
@@ -643,11 +681,13 @@ Namespace GSM.Manager.UI
                 For Each r In rows
                     Dim item As New ListViewItem(r.PlayerName)
                     item.SubItems.Add(FormatDisplayTime(r.JoinedAtUtc))
-                    item.SubItems.Add(r.TileDisplayName)
+                    item.SubItems.Add(If(r.SourceLabel, ""))
                     item.SubItems.Add(If(r.LastChatText, ""))
                     item.SubItems.Add(If(r.LastChatTimeUtc.HasValue,
                                           FormatDisplayTime(r.LastChatTimeUtc.Value),
                                           ""))
+                    item.Tag = r
+                    item.ToolTipText = BuildRowTooltip(r.SessionIdentity, r.InstanceId)
                     _resultsList.Items.Add(item)
                 Next
             Finally
@@ -686,6 +726,91 @@ Namespace GSM.Manager.UI
                 Case TimelineRow.RowKind.Chat
                     ' Leave default — chat is the common case, no tint.
             End Select
+        End Sub
+
+        ' ============================================================
+        '  Phase 5h-6 — row tooltip + context menu plumbing.
+        '
+        '  Both renderers (RenderTimeline, RenderSnapshot) stash the
+        '  underlying row object on ListViewItem.Tag and set
+        '  ToolTipText via BuildRowTooltip. The two copy actions
+        '  pull the data back via ExtractRowIdentifiers; the
+        '  Opening handler enables the menu items only when a row
+        '  is selected so the user can't trigger a copy that
+        '  silently does nothing.
+        ' ============================================================
+
+        ''' <summary>
+        ''' Format the hover tooltip shown on each result row.
+        ''' Skips lines that have no value rather than emit
+        ''' "Session: " with an empty body — a row with no
+        ''' SessionIdentity (rare, but possible for rows from
+        ''' games that don't have a session concept) just shows
+        ''' the InstanceId line. Empty inputs yield an empty
+        ''' tooltip; ListView treats empty ToolTipText as
+        ''' "no tooltip".
+        ''' </summary>
+        Private Shared Function BuildRowTooltip(sessionIdentity As String, instanceId As String) As String
+            Dim parts As New List(Of String)
+            If Not String.IsNullOrEmpty(sessionIdentity) Then
+                parts.Add("Session: " & sessionIdentity)
+            End If
+            If Not String.IsNullOrEmpty(instanceId) Then
+                parts.Add("Instance: " & instanceId)
+            End If
+            If parts.Count = 0 Then Return ""
+            Return String.Join(Environment.NewLine, parts)
+        End Function
+
+        ''' <summary>
+        ''' Pull SessionIdentity + InstanceId off whichever row
+        ''' type is stashed on the ListViewItem.Tag. Both
+        ''' TimelineRow (timeline mode) and SnapshotRow (snapshot
+        ''' mode) carry the same field names; we just have to
+        ''' know which type we're holding to read them out.
+        ''' </summary>
+        Private Shared Function ExtractRowIdentifiers(item As ListViewItem) _
+                As (SessionIdentity As String, InstanceId As String)
+            If item Is Nothing Then Return (Nothing, Nothing)
+            Dim t = TryCast(item.Tag, TimelineRow)
+            If t IsNot Nothing Then Return (t.SessionIdentity, t.InstanceId)
+            Dim s = TryCast(item.Tag, SnapshotRow)
+            If s IsNot Nothing Then Return (s.SessionIdentity, s.InstanceId)
+            Return (Nothing, Nothing)
+        End Function
+
+        Private Sub OnRowContextMenuOpening(sender As Object, e As CancelEventArgs)
+            Dim hasSelection = _resultsList.SelectedItems.Count > 0
+            Dim ids = (SessionIdentity:=CStr(Nothing), InstanceId:=CStr(Nothing))
+            If hasSelection Then ids = ExtractRowIdentifiers(_resultsList.SelectedItems(0))
+            _copyInstanceIdItem.Enabled = hasSelection AndAlso Not String.IsNullOrEmpty(ids.InstanceId)
+            _copySessionIdentityItem.Enabled = hasSelection AndAlso Not String.IsNullOrEmpty(ids.SessionIdentity)
+        End Sub
+
+        Private Sub OnCopyInstanceId(sender As Object, e As EventArgs)
+            If _resultsList.SelectedItems.Count = 0 Then Return
+            Dim ids = ExtractRowIdentifiers(_resultsList.SelectedItems(0))
+            If String.IsNullOrEmpty(ids.InstanceId) Then Return
+            Try
+                Clipboard.SetText(ids.InstanceId)
+                _statusLabel.Text = $"Copied instance ID: {ids.InstanceId}"
+            Catch
+                ' Clipboard.SetText can throw if another process is
+                ' holding the clipboard open. Silent fallback — the
+                ' user can retry, or copy-from-tooltip-by-eye.
+            End Try
+        End Sub
+
+        Private Sub OnCopySessionIdentity(sender As Object, e As EventArgs)
+            If _resultsList.SelectedItems.Count = 0 Then Return
+            Dim ids = ExtractRowIdentifiers(_resultsList.SelectedItems(0))
+            If String.IsNullOrEmpty(ids.SessionIdentity) Then Return
+            Try
+                Clipboard.SetText(ids.SessionIdentity)
+                _statusLabel.Text = $"Copied session identity: {ids.SessionIdentity}"
+            Catch
+                ' Same defensive stance as OnCopyInstanceId.
+            End Try
         End Sub
 
         Protected Overrides Sub Dispose(disposing As Boolean)

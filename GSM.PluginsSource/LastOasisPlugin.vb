@@ -14,9 +14,20 @@ Imports GSM.Plugin
 '  RCON: Source RCON protocol
 '  Mods: None (client-side only)
 '
-'  Key config fields (installation-level):
+'  Key config fields (realm-level, since Phase 5h — stored on
+'  a SharedConfigGroup row, shared across all installations
+'  on the same realm):
 '    CustomerKey  — realm-wide auth key from MyRealm dashboard
 '    ProviderKey  — provider auth key (revocable per provider)
+'    RealmName    — human-readable name ("Site's World"); used
+'                   in History Source column instead of the
+'                   raw numeric realm_id from logs
+'
+'  Key config fields (installation-level):
+'    CustomerKey  — (legacy, still readable for backwards-compat
+'                   with pre-5h installs; new installs leave
+'                   blank and use the Realm group instead)
+'    ProviderKey  — (legacy, same as above)
 '    SteamBranch  — beta branch name (blank = default)
 '
 '  Key config fields (instance-level):
@@ -32,6 +43,8 @@ Imports GSM.Plugin
 Public Class LastOasisPlugin
     Implements IGamePlugin
     Implements IReadySignalProvider
+    Implements ISharedConfigProvider
+    Implements ISourceLabelProvider
 
     Public ReadOnly Property GameId As String = "lastoasis" Implements IGamePlugin.GameId
     Public ReadOnly Property DisplayName As String = "Last Oasis" Implements IGamePlugin.DisplayName
@@ -109,29 +122,46 @@ Public Class LastOasisPlugin
         ' binary needs to authenticate as the game (903950) so
         ' Steamworks calls (presence, EOS auth, telemetry) align
         ' with the game's app identity rather than the server
-        ' tool's. Steam's SDK reads steam_appid.txt from the
-        ' process working directory at SteamAPI_Init time —
-        ' PowerGSM spawns instances with WorkingDirectory set to
-        ' the install root, so writing the file there is what
-        ' Steamworks finds.
+        ' tool's. On Windows the server picks up the right
+        ' identity through some other mechanism (Steam client /
+        ' installed-app registry) and the file isn't required;
+        ' per LO's Linux dedicated-server documentation, on Linux
+        ' the file IS required — without it the server fails
+        ' Steamworks init and never registers with the backend.
         '
-        ' On Windows the server picks up the right identity
-        ' through some other mechanism (Steam client / installed-
-        ' app registry) and the file isn't required. Per LO's
-        ' Linux dedicated-server documentation, the file IS
-        ' required there — without it the server fails Steamworks
-        ' init and never registers with the backend.
+        ' Location: NEXT TO THE BINARY, not at the install root.
+        ' Last Oasis's official Linux docs say:
+        '
+        '   "navigate to Mist/Binaries/Linux/ (in the dedicated
+        '    server app root folder), and create a file called
+        '    steam_appid.txt [...] paste 903950. Save and close."
+        '
+        ' The Steamworks SDK on Linux resolves steam_appid.txt
+        ' relative to the CALLING BINARY's directory (effectively
+        ' /proc/self/exe's dirname), not the process working
+        ' directory — a Linux-specific divergence from the
+        ' SDK's Windows behaviour, where cwd is honoured. An
+        ' earlier version of this plugin wrote the file at the
+        ' install root assuming cwd-based lookup; the binary
+        ' never saw it and reported [AppId: 0] regardless. Even
+        ' though the rest of LO's install layout (steamclient.so
+        ' at the install root) suggested otherwise, the SDK is
+        ' doing two different lookups for two different files.
         '
         ' Skip explicitly on Windows. Unknown platform falls
         ' through to the write branch as a safe default — better
         ' to drop a harmless 6-byte file on an old Windows node
         ' than to leave a Linux node broken because we couldn't
         ' read its platform.
+        '
+        ' SteamCMD's install order guarantees the parent dir
+        ' (Mist/Binaries/Linux/) exists by the time this step
+        ' runs — it's where the binary itself was just downloaded.
         If config.Platform <> NodePlatform.Windows Then
             steps.Add(New WriteFileStep With {
                 .StepName = "Write steam_appid.txt",
                 .Description = "Steamworks identity (903950 = LO game; required on Linux)",
-                .RelativePath = "steam_appid.txt",
+                .RelativePath = "Mist/Binaries/Linux/steam_appid.txt",
                 .Content = "903950",
                 .OverwriteExisting = True
             })
@@ -196,11 +226,60 @@ Public Class LastOasisPlugin
     Public Function BuildLaunchArguments(config As InstanceConfig) As String Implements IGamePlugin.BuildLaunchArguments
         Dim args As New List(Of String)
 
+        ' Project name as positional arg 0 — Linux only.
+        '
+        ' UE4 dedicated servers take the project name as their
+        ' first positional argument. On Windows the binary name
+        ' itself encodes it (MistServer-Win64-Shipping.exe → UE4's
+        ' loader derives "Mist" from the prefix), so passing it on
+        ' the command line is redundant. On Linux, the build's
+        ' command-line parser does NOT do that name-derived lookup
+        ' and falls through to "no project loaded" if the argument
+        ' is missing. Visible symptom: Mist/Config/DefaultEngine.ini
+        ' is never read, so the
+        '   [OnlineSubsystemSteam]
+        '   SteamDedicatedServerGameAppId=903950
+        ' entry is invisible to UE4's OnlineSubsystemSteam. UE4
+        ' then logs "[AppId: 0] Game Server API initialized 0",
+        ' Steamworks Game Server init fails, and connecting clients
+        ' see "authentication failed" because there's no live Game
+        ' Server session for Steam to authenticate them against.
+        '
+        ' LO's own MistServer.sh launcher passes "Mist" the same
+        ' way (line 5 of the script):
+        '   "$UE4_PROJECT_ROOT/Mist/Binaries/Linux/MistServer-Linux-Shipping" Mist "$@"
+        ' so we're matching what their docs assume.
+        '
+        ' Must come BEFORE any flag args — UE4's parser treats the
+        ' first non-dash token as the project name and everything
+        ' after it as switches/options. Putting -force_steamclient_link
+        ' first and Mist second would parse Mist as a value for the
+        ' previous flag instead.
+        '
+        ' Note that steam_appid.txt (written by the install step
+        ' above) and this argument feed two DIFFERENT Steam-AppId
+        ' mechanisms: steam_appid.txt is what the underlying
+        ' Steamworks C SDK reads at SteamAPI_Init time;
+        ' SteamDedicatedServerGameAppId is what UE4's
+        ' OnlineSubsystemSteam reads from the loaded project's
+        ' DefaultEngine.ini. Both have to work for clients to
+        ' authenticate, which is why dropping just the .txt file
+        ' wasn't enough.
+        If config.Platform = NodePlatform.Linux Then
+            args.Add("Mist")
+        End If
+
         ' Required backend flags
         args.Add("-force_steamclient_link")
         args.Add("-messaging")
         args.Add("-NoLiveServer")
         args.Add("-backendapiurloverride=""backend-production.last-oasis.com""")
+
+        ' Admin chat commands (cheats). Required for in-game admin
+        ' operations issued through chat — kick, ban, give, teleport,
+        ' etc. Without this flag the command parser is disabled and
+        ' admin chat lines are silently ignored.
+        args.Add("-EnableCheats")
 
         ' Realm authentication (installation-level, shared across instances)
         Dim customerKey = GetField(config.CustomFields, "CustomerKey")
@@ -430,6 +509,143 @@ Public Class LastOasisPlugin
     End Function
 
     ' ============================================================
+    '  ISharedConfigProvider (Phase 5h)
+    '
+    '  Declares Last Oasis's "Realm" concept. A Realm holds the
+    '  fields that are realm-scoped rather than per-install:
+    '  CustomerKey + ProviderKey (Funcom-issued realm auth
+    '  credentials) and the human-readable RealmName used by
+    '  the History Source column. One realm typically backs
+    '  multiple installations (each install hosting a different
+    '  tile-pool on different nodes); the SharedConfigGroup row
+    '  stores those credentials once and all linked installs
+    '  inherit them via the three-layer merge in
+    '  InstanceManager.MergeConfigLayers.
+    '
+    '  DURING TRANSITION: CustomerKey + ProviderKey still appear
+    '  in GetInstallConfigSchema too, so existing installations
+    '  (which have those values stored at install level) keep
+    '  working unchanged — the merge favours install over group
+    '  on key collision. The Phase 5h-5 migration UI walks the
+    '  user through promoting per-install values into a Realm
+    '  group, after which the install-level entries become
+    '  redundant and can be cleared. A future cleanup will drop
+    '  these from GetInstallConfigSchema once all known users
+    '  have migrated; for now leaving them in keeps the install
+    '  editor familiar to anyone who hasn't migrated yet.
+    ' ============================================================
+
+    Public ReadOnly Property SharedConfigKey As String = "realm" _
+        Implements ISharedConfigProvider.SharedConfigKey
+
+    Public ReadOnly Property SharedConfigLabel As String = "Realm" _
+        Implements ISharedConfigProvider.SharedConfigLabel
+
+    ' Discriminator for auto-migration: two installations sharing
+    ' the same CustomerKey value belong to the same realm. This
+    ' is reliable because MyRealm issues one CustomerKey per
+    ' realm — if the user pasted the same string into multiple
+    ' installs, those installs really are on the same realm.
+    Public ReadOnly Property DiscriminatorFieldKey As String = "CustomerKey" _
+        Implements ISharedConfigProvider.DiscriminatorFieldKey
+
+    Public Function GetSharedConfigSchema() As IReadOnlyList(Of ConfigFieldDescriptor) _
+            Implements ISharedConfigProvider.GetSharedConfigSchema
+        Return New ConfigFieldDescriptor() {
+            New ConfigFieldDescriptor With {
+                .Key = "CustomerKey",
+                .Label = "Customer Key",
+                .Description = "Realm-wide authentication key from the MyRealm dashboard. Encrypted at rest.",
+                .FieldType = ConfigFieldType.Text,
+                .IsRequired = True,
+                .IsSensitive = True
+            },
+            New ConfigFieldDescriptor With {
+                .Key = "ProviderKey",
+                .Label = "Provider Key",
+                .Description = "Provider authentication key. Revoking this on MyRealm locks out every server using it. Encrypted at rest.",
+                .FieldType = ConfigFieldType.Text,
+                .IsRequired = True,
+                .IsSensitive = True
+            },
+            New ConfigFieldDescriptor With {
+                .Key = "RealmName",
+                .Label = "Realm name",
+                .Description = "Human-readable realm name as it appears on the MyRealm dashboard (e.g. ""Site's World""). Used wherever PowerGSM would otherwise show the raw numeric realm_id from logs — most visibly in the History window's Source column. Cosmetic only; leave blank and you'll just see the realm_id instead.",
+                .FieldType = ConfigFieldType.Text,
+                .IsRequired = False
+            }
+        }
+    End Function
+
+    ' ============================================================
+    '  ISourceLabelProvider (Phase 5h)
+    '
+    '  Renders the History window's "Source" column. Format is
+    '  three em-dash-separated segments, dropping any segment
+    '  that has no data:
+    '
+    '    {TileName} — {RealmDisplay} — {NodeName}/{InstallationName}
+    '
+    '  RealmDisplay prefers the linked SharedConfigGroup's
+    '  DisplayName (the user-friendly realm name picked from the
+    '  realm picker) and falls back to "realm {first-8-chars-of-
+    '  realm_id}…" parsed out of SessionIdentity when no group is
+    '  linked. The fallback matches what FormatSessionLabel used
+    '  to render before 5h-6 so the visual experience for
+    '  un-linked installs is unchanged — the upgrade is that
+    '  linked installs now show the realm by name.
+    '
+    '  The instance-path segment is intentionally Node /
+    '  Installation — NOT Node / Installation / Instance —
+    '  because LO's backend reassigns tiles across instances
+    '  within an installation freely; the disambiguation that
+    '  matters at the History level is which on-disk install
+    '  the row's logs live in, not which specific child
+    '  process. The full InstanceId is reachable via the
+    '  History window's right-click "Copy instance ID" action
+    '  for grep flows.
+    ' ============================================================
+
+    Public Function FormatSourceLabel(context As SourceLabelContext) As String _
+            Implements ISourceLabelProvider.FormatSourceLabel
+        If context Is Nothing Then Return Nothing
+
+        ' --- Realm-display segment ---
+        Dim realmDisplay As String = Nothing
+        If Not String.IsNullOrEmpty(context.SharedConfigGroupName) Then
+            realmDisplay = context.SharedConfigGroupName
+        ElseIf Not String.IsNullOrEmpty(context.SessionIdentity) Then
+            ' SessionIdentity shape: "lastoasis:{realm_id}:{tile_id}".
+            ' parts(1) is realm_id; truncate to 8 chars + ellipsis
+            ' for readability, matching pre-5h FormatSessionLabel.
+            Dim parts = context.SessionIdentity.Split(":"c)
+            If parts.Length >= 2 Then
+                Dim rid = parts(1)
+                Dim ridShort = If(rid.Length > 8, rid.Substring(0, 8) & "…", rid)
+                realmDisplay = "realm " & ridShort
+            End If
+        End If
+
+        ' --- Instance-path segment (Node/Install) ---
+        Dim pathParts As New List(Of String)
+        If Not String.IsNullOrEmpty(context.NodeName) Then pathParts.Add(context.NodeName)
+        If Not String.IsNullOrEmpty(context.InstallationName) Then pathParts.Add(context.InstallationName)
+        Dim instancePath = String.Join("/", pathParts)
+
+        ' --- Compose. Skip empty segments so a partial context
+        ' (e.g. no tile yet, no realm group set) still produces
+        ' a clean label rather than awkward em-dash gaps. ---
+        Dim segments As New List(Of String)
+        If Not String.IsNullOrEmpty(context.TileName) Then segments.Add(context.TileName)
+        If Not String.IsNullOrEmpty(realmDisplay) Then segments.Add(realmDisplay)
+        If Not String.IsNullOrEmpty(instancePath) Then segments.Add(instancePath)
+
+        If segments.Count = 0 Then Return Nothing
+        Return String.Join(" — ", segments)
+    End Function
+
+    ' ============================================================
     '  Crash handling
     ' ============================================================
 
@@ -493,20 +709,106 @@ Public Class LastOasisPlugin
     End Function
 
     Public Function GetLogParseRules() As IReadOnlyList(Of LogParseRule) Implements IGamePlugin.GetLogParseRules
-        ' UE4 login flow across multiple log lines:
-        '   1. NotifyAcceptingConnection gives RemoteAddress only
-        '   2. Login request gives CharacterId + Name + Platform (but
-        '      PlatformUserId is "UNKNOWN" at this point — Steam auth
-        '      hasn't finished). The EventStore's pending-IP buffer
-        '      claims the IP from step 1 automatically.
-        '   3. LogPersistence Processing character update gives the real
-        '      SteamID64 paired with the CharacterId we already have.
-        '   4. UNetConnection::Close on disconnect gives RemoteAddress
+        ' UE4 login flow across multiple log lines. The ordering
+        ' is NOT fixed — different join paths interleave them
+        ' differently:
+        '
+        '   Fresh connect (player launches game, joins this tile
+        '   for the first time in the current session):
+        '     1. NotifyAcceptingConnection — RemoteAddress only.
+        '     2. Login request — CharacterId + PlatformPersona (Steam
+        '        handle / Xbox gamertag from the URL's Name parameter)
+        '        + Platform. PlatformUserId is "UNKNOWN" here because
+        '        Steam/Xbox auth hasn't finished yet.
+        '     3. Processing character update — the real PlatformUserId
+        '        (SteamID64 / Xbox ID) paired with the CharacterId
+        '        from step 2. Fires after persistence subsystem loads
+        '        the character into memory.
+        '
+        '   World-travel arrival (player tiles in from another tile
+        '   on the same realm; their session was already alive on the
+        '   originating tile):
+        '     1. Processing character update — fires FIRST, several
+        '        seconds before the network connection arrives.
+        '        Persistence loads the character data as soon as the
+        '        cross-tile handoff packet hits the destination server.
+        '     2. NotifyAcceptingConnection — RemoteAddress only,
+        '        firing seconds AFTER (1).
+        '     3. Login request — CharacterId + PlatformPersona.
+        '
+        ' We can't predict which path a given player is on, but we
+        ' don't have to: the Processing-character-update rule is
+        ' registered as Kind=PlayerIdentity (enrichment-only) and
+        ' the node's EventStore carries a cid-keyed pending-identity
+        ' stash for the cross-event correlation.
+        '
+        '   World-travel arrivals: Processing-character-update fires
+        '   first with (cid, pid). No session exists yet, so the
+        '   (pid, Platform) pair stashes under cid in
+        '   PendingIdentitiesByCharacterId. The subsequent Login
+        '   line creates the session (cid + persona) via
+        '   FindOrCreateSession; DrainPendingCidIdentity then
+        '   applies the stashed pid to the session, and the
+        '   pid-keyed Persisting stash (if any) drains in turn.
+        '
+        '   Fresh connects: Login fires first and creates the
+        '   session. Processing-character-update arrives next,
+        '   FindExistingSession by cid hits the existing session,
+        '   and the pid is applied directly via the enrichment
+        '   branch.
+        '
+        '   Offline-but-on-tile characters: Processing-character-
+        '   update fires on server boot or autosave for every
+        '   persisted character on the tile, even ones whose
+        '   players aren't connected. With PlayerIdentity
+        '   classification this stashes by cid and produces no
+        '   visible session in the player list — unlike the
+        '   PlayerJoin classification we tried first in 5g-2,
+        '   which materialised a ghost "Unknown" entry for every
+        '   such character.
+        '
+        ' PlayerJoin classification was the initial 5g-2 design;
+        ' it closed the world-travel race correctly but
+        ' over-materialised sessions for every persistence-system
+        ' line that mentioned a CharacterId. The cid-keyed stash
+        ' added in EventStore closes the same race without that
+        ' side effect.
+        '
+        '   4. LogPersistence Persisting fires every ~2 minutes per
+        '      active player as part of the autosave tick. Format is
+        '      `Persisting <CharacterName>, UniqueNetId =
+        '      <Platform>:<PlatformUserId>` — CharacterName is the
+        '      literal in-game character name, no suffix appended
+        '      by UE4. Two distinct shapes share the `Persisting `
+        '      prefix: actor lines (`Persisting <ActorClass>,
+        '      ActorGuid = {GUID}`, used for inventory and world
+        '      actors), and character lines (`Persisting <Name>,
+        '      UniqueNetId = <Platform>:<UID>`). The `, UniqueNetId`
+        '      literal in the pattern below is what discriminates
+        '      the character line from the actor line.
+        '      An earlier version of this regex assumed UE4
+        '      appended a literal `'s character` to character
+        '      names and stopped the capture at that literal. That
+        '      worked for typical names like "andrekop" but
+        '      silently chopped any name actually ending in `'s
+        '      character` — a user with the in-game name
+        '      `site's character` got captured as just `site`. The
+        '      current pattern stops at `, UniqueNetId` instead so
+        '      the full literal name is captured regardless of
+        '      what punctuation it contains, including names
+        '      with embedded commas (the regex engine backtracks
+        '      through commas in the name until the `, UniqueNetId`
+        '      anchor matches).
+        '      This is the canonical source for the renamed-
+        '      character display name that shows in chat (e.g.
+        '      "andre(qc)" vs the Steam persona "andrekop").
+        '   5. UNetConnection::Close on disconnect gives RemoteAddress
         '      which correlates back to the session.
         '
         ' Named capture groups are built via string concat to defeat
         ' an editor-tooling issue that lowercases `(?<Name>` → `(?<n>`.
-        Dim gName = "(?<" & "Name" & ">"
+        Dim gPlatformPersona = "(?<" & "PlatformPersona" & ">"
+        Dim gDisplayName = "(?<" & "DisplayName" & ">"
         Dim gPlatform = "(?<" & "Platform" & ">"
         Dim gPlatformUserId = "(?<" & "PlatformUserId" & ">"
         Dim gCharacterId = "(?<" & "CharacterId" & ">"
@@ -525,24 +827,29 @@ Public Class LastOasisPlugin
                 .Pattern = "LogNet: NotifyAcceptingConnection accepted from: " & gRemoteAddress & "[0-9.]+:\d+)"
             },
             New LogParseRule With {
-                .Name = "Login request (Name + CharacterId)",
+                .Name = "Login request (PlatformPersona + CharacterId)",
                 .Kind = ParsedEventKind.PlayerJoin,
-                .Pattern = "LogNet: Login request: \?CharacterId=" & gCharacterId & "\d+).*?\?Name=" & gName & "[^?]+?) userId: " & gPlatform & "\w+):"
+                .Pattern = "LogNet: Login request: \?CharacterId=" & gCharacterId & "\d+).*?\?Name=" & gPlatformPersona & "[^?]+?) userId: " & gPlatform & "\w+):"
             },
             New LogParseRule With {
-                .Name = "Character update (Name to SteamID pairing)",
+                .Name = "Character update (PlatformUserId to CharacterId pairing)",
                 .Kind = ParsedEventKind.PlayerIdentity,
                 .Pattern = "LogPersistence: .*Processing character update.*UniqueId = " & gPlatformUserId & "\d+), CharacterId = " & gCharacterId & "\d+)"
             },
             New LogParseRule With {
-                .Name = "Player Disconnect (by RemoteAddress)",
+                .Name = "Persisting (DisplayName to PlatformUserId pairing)",
+                .Kind = ParsedEventKind.PlayerIdentity,
+                .Pattern = "LogPersistence: .*Persisting " & gDisplayName & ".+?), UniqueNetId = " & gPlatform & "\w+):" & gPlatformUserId & "\d+)"
+            },
+            New LogParseRule With {
+                .Name = "Player Disconnect (control channel close or NetConnection close)",
                 .Kind = ParsedEventKind.PlayerLeave,
-                .Pattern = "LogNet: UNetConnection::Close:.*?RemoteAddr: " & gRemoteAddress & "[0-9.]+:\d+),"
+                .Pattern = "LogNet: U(?:Channel::Close:.*?ChIndex == 0|NetConnection::Close).*?RemoteAddr: " & gRemoteAddress & "[0-9.]+:\d+),"
             },
             New LogParseRule With {
                 .Name = "Chat Message",
                 .Kind = ParsedEventKind.ChatMessage,
-                .Pattern = "LogGame: Chat message from " & gName & "[^:]+): " & gMessage & ".+)$"
+                .Pattern = "LogGame: Chat message from " & gDisplayName & "[^:]+): " & gMessage & ".+)$"
             },
             New LogParseRule With {
                 .Name = "Match State Transition",

@@ -2,6 +2,7 @@ Imports System
 Imports System.Collections.Concurrent
 Imports System.Collections.Generic
 Imports System.Linq
+Imports System.Net
 Imports System.Text.Json
 Imports System.Threading
 Imports System.Threading.Tasks
@@ -34,11 +35,31 @@ Namespace GSM.Manager.Core
         Private ReadOnly _clientFactory As NodeHttpClientFactory
         Private ReadOnly _pluginRegistry As PluginRegistry
         Private ReadOnly _credentialService As CredentialService
+        Private ReadOnly _sharedConfigService As SharedConfigService
         Private ReadOnly _emitter As NotificationEmitter
         Private ReadOnly _logger As ILogger(Of InstanceManager)
         Private ReadOnly _logParsers As New ConcurrentDictionary(Of String, ActiveLogParser)
         Private ReadOnly _logStreamCancellations As New ConcurrentDictionary(Of String, CancellationTokenSource)
         Private ReadOnly _liveStates As New ConcurrentDictionary(Of String, InstanceStatusResponse)
+
+        ' Guards the cancel-old / install-new transition inside
+        ' StartLogStream so two concurrent callers (typically
+        ' StartInstanceAsync's success path racing with
+        ' BackgroundPollLoopAsync's stream-health check) can't
+        ' both end up with a live background task. The dict-set
+        ' is technically atomic on its own, but "cancel previous,
+        ' then install new" is two operations and needs to be one.
+        ' Without this, the previous task keeps streaming SSE
+        ' indefinitely — its cts is no longer referenced by the
+        ' dict, but nothing has called Cancel() on it, so the
+        ' task just runs forever. Every log line then arrives via
+        ' two independent SSE subscribers, both write to the
+        ' manager ring buffer, and the manager UI sees every
+        ' line twice for the rest of the instance's lifetime.
+        ' Symptom is uniform per-line doubling that persists
+        ' across slow steady-state lines (not just startup
+        ' bursts), starting right after an instance restart.
+        Private ReadOnly _logStreamLock As New Object()
 
         ' Per-instance gate so that concurrent RefreshInstanceStateAsync
         ' calls (the UI panel + the background poller) can't both
@@ -118,6 +139,34 @@ Namespace GSM.Manager.Core
         Private Const ChatMirrorIntervalMs As Integer = 5000
         Private Const ChatMirrorBatchLimit As Integer = 500
 
+        ' Adoption fallback cache for ResolveSessionIdentity.
+        '
+        ' Filled from an open SessionHost row when the in-memory
+        ' parser hasn't (yet) observed the 4-line tile-load sequence
+        ' that drives CurrentSessionIdentity. Typical trigger: the
+        ' manager creates a fresh parser when reconnecting to a
+        ' running instance (adoption, or manager restart against a
+        ' long-lived game), and UE4 won't re-emit "Started hosting
+        ' tile" / realm_id / tile_name / tile_id because the tile
+        ' was loaded hours ago. The lines exist in the node's log
+        ' file but get rotated out of the SSE ring buffer (4096
+        ' lines) by the time the manager subscribes — so the
+        ' parser never sees them.
+        '
+        ' Without this cache, every chat row, join, and leave
+        ' persisted post-reconnect gets stamped with the
+        ' {gameId}:{instanceId} fallback, orphaning them from the
+        ' original session's History timeline. With it, we look
+        ' up the SessionHost row left over from the original tile
+        ' load — it carries the real lastoasis:realm:tile identity
+        ' — and keep using it until the parser produces its own.
+        '
+        ' Invalidated automatically the moment the parser's
+        ' CurrentSessionIdentity becomes non-empty (parser has
+        ' caught up and is authoritative again) and explicitly on
+        ' instance stop via ClearPlayerTracking.
+        Private ReadOnly _adoptedSessionIdentities As New ConcurrentDictionary(Of String, String)
+
         ' Restart coordinator handle — late-bound by ManagerProgram
         ' after both singletons exist, to break the construction
         ' cycle documented on RestartCoordinator itself. Nothing
@@ -127,11 +176,13 @@ Namespace GSM.Manager.Core
         Public Sub New(clientFactory As NodeHttpClientFactory,
                        pluginRegistry As PluginRegistry,
                        credentialService As CredentialService,
+                       sharedConfigService As SharedConfigService,
                        emitter As NotificationEmitter,
                        logger As ILogger(Of InstanceManager))
             _clientFactory = clientFactory
             _pluginRegistry = pluginRegistry
             _credentialService = credentialService
+            _sharedConfigService = sharedConfigService
             _emitter = emitter
             _logger = logger
         End Sub
@@ -193,27 +244,17 @@ Namespace GSM.Manager.Core
                 ' Resolve plugin
                 Dim plugin = _pluginRegistry.GetPlugin(instanceEntity.GameId)
 
-                ' Merge installation-level config (shared — e.g. realm credentials)
-                ' with instance-level config (per-server — e.g. port, identifier).
-                ' Instance values win on key collision so overrides work —
-                ' BUT empty strings at instance level do NOT override non-empty
-                ' install-level values, otherwise a blank override field in
-                ' the Edit Instance form would wipe the shared install value.
-                Dim installFields = DeserializeConfig(installEntity.ConfigJson)
-                Dim instanceFields = DeserializeConfig(instanceEntity.ConfigJson)
-                Dim customFields As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
-                For Each kvp In installFields
-                    customFields(kvp.Key) = kvp.Value
-                Next
-                For Each kvp In instanceFields
-                    If String.IsNullOrEmpty(kvp.Value) AndAlso
-                       customFields.ContainsKey(kvp.Key) AndAlso
-                       Not String.IsNullOrEmpty(customFields(kvp.Key)) Then
-                        ' Instance has a blank value but install has one — keep install's.
-                        Continue For
-                    End If
-                    customFields(kvp.Key) = kvp.Value
-                Next
+                ' Phase 5h three-layer merge: shared-config group
+                ' (e.g. LO Realm — when plugin implements
+                ' ISharedConfigProvider and the installation links
+                ' to a group) → installation → instance. Higher
+                ' layers override lower ones on key collision, but
+                ' an empty value at an upper layer doesn't wipe
+                ' a non-empty value already set by a lower one —
+                ' otherwise a blank field in the Edit Instance
+                ' form would clobber the shared install / group
+                ' value the operator carefully set elsewhere.
+                Dim customFields = MergeConfigLayers(db, installEntity, instanceEntity)
 
                 ' Build instance config
                 Dim instanceConfig As New InstanceConfig With {
@@ -377,6 +418,33 @@ Namespace GSM.Manager.Core
 
                 ' Try each candidate until one succeeds.
                 ' Remember winner in ExeOverride so next start goes straight to it.
+                '
+                ' On MinRestartDelayMs default (5000 below): floors
+                ' the post-crash respawn delay so the manager's
+                ' 3-second background poller (BackgroundPollIntervalMs)
+                ' reliably observes the Running → Crashed transition
+                ' and fires the InstanceCrashed notification BEFORE
+                ' the node respawns the process. Worst case the
+                ' previous poll happened immediately before the
+                ' crash, so the next poll is up to 3000ms away —
+                ' 5000ms gives a 2000ms safety margin for that poll
+                ' plus the automation engine's dispatch latency. The
+                ' same margin covers the Running → Crashed → CrashLoopHalted
+                ' fast path: each Crashed visit must outlast one poll
+                ' interval so the per-crash notifications fire
+                ' individually instead of collapsing into just the
+                ' terminal CrashLoopDetected event.
+                '
+                ' Without this floor, RestartImmediately is essentially
+                ' instantaneous and even RestartWithBackoff has only
+                ' 2^0 = 1s on the first crash — under the 3s poll
+                ' cadence, the poller often never sees the Crashed
+                ' state at all and the notification is lost.
+                '
+                ' Users who want different timing (a game that should
+                ' respawn instantly because crashes are expected, or
+                ' a game that needs longer settle time) override via
+                ' customFields["MinRestartDelayMs"] on the instance.
                 For i = 0 To candidates.Count - 1
                     Dim candidate = candidates(i)
 
@@ -394,7 +462,7 @@ Namespace GSM.Manager.Core
                         .CrashCountResetAfterSeconds = GetIntField(customFields,
                             "CrashCountResetAfterSeconds", 300),
                         .MinRestartDelayMs = GetIntField(customFields,
-                            "MinRestartDelayMs", 0),
+                            "MinRestartDelayMs", 5000),
                         .RconPort = rconPort,
                         .RconPassword = rconPassword,
                         .RconProtocol = rconProtocol,
@@ -490,8 +558,24 @@ Namespace GSM.Manager.Core
         ''' <summary>
         ''' Stops an instance on its node. If gracefulTimeoutMs is not
         ''' explicitly supplied (left at the default -1), the value is
-        ''' looked up from the instance's merged config via the
-        ''' "GracefulTimeoutMs" custom field, falling back to 25000.
+        ''' resolved in priority order:
+        '''
+        '''   1. Instance-level "GracefulTimeoutMs" custom field. Lets
+        '''      operators override per-instance without changing the
+        '''      plugin (e.g. a Conan realm with a small world that
+        '''      doesn't need the plugin's default 90s).
+        '''
+        '''   2. Plugin's ILaunchOptionsProvider.GracefulShutdownTimeoutMs.
+        '''      Engine-specific default the plugin set in its
+        '''      LaunchOptions — e.g. Conan returns 90000 because
+        '''      UE5 shutdown with persistent world state has a
+        '''      30–60-second productive ceiling and Conan
+        '''      frequently hangs requiring force-kill anyway,
+        '''      so a too-long timeout just delays the inevitable.
+        '''
+        '''   3. Universal 25000ms fallback. Matches what every
+        '''      pre-LaunchOptions plugin gets and what the contract's
+        '''      StopInstanceRequest documents.
         ''' </summary>
         Public Async Function StopInstanceAsync(instanceId As String,
                                                 Optional gracefulTimeoutMs As Integer = -1) As Task(Of Boolean)
@@ -507,8 +591,29 @@ Namespace GSM.Manager.Core
 
             Dim effectiveTimeoutMs = gracefulTimeoutMs
             If effectiveTimeoutMs < 0 Then
-                effectiveTimeoutMs = GetIntField(GetMergedCustomFields(instanceId),
-                                                  "GracefulTimeoutMs", 25000)
+                ' Look up the per-instance custom override first.
+                ' Distinguish "field unset" from "field set to a
+                ' parseable value" so the plugin fallback only fires
+                ' when the user genuinely hasn't expressed a
+                ' preference. GetIntField conflates both into its
+                ' default-value return, which is fine when the
+                ' default IS the fallback you want, but wrong here
+                ' because we want a different fallback (plugin) when
+                ' the field is missing.
+                Dim fields = GetMergedCustomFields(instanceId)
+                Dim raw As String = Nothing
+                Dim userOverride As Integer = 0
+                Dim hasUserOverride = fields IsNot Nothing AndAlso
+                                       fields.TryGetValue("GracefulTimeoutMs", raw) AndAlso
+                                       Not String.IsNullOrWhiteSpace(raw) AndAlso
+                                       Integer.TryParse(raw.Trim(), userOverride) AndAlso
+                                       userOverride > 0
+
+                If hasUserOverride Then
+                    effectiveTimeoutMs = userOverride
+                Else
+                    effectiveTimeoutMs = ResolvePluginGracefulTimeoutMs(instanceId, 25000)
+                End If
             End If
 
             Dim succeeded = False
@@ -615,11 +720,91 @@ Namespace GSM.Manager.Core
                 If state Is Nothing Then Return
                 If state.CurrentState = GSM.Plugin.InstanceState.Running OrElse
                    state.CurrentState = GSM.Plugin.InstanceState.Starting Then
+                    ' Refresh the node's parse rule set before
+                    ' streaming. The node's EventStore is in-memory
+                    ' only; a node binary update or restart between
+                    ' the original StartInstance call and this
+                    ' reconnect wiped the rule list, so without this
+                    ' push the instance would keep running with zero
+                    ' rules registered — players would appear to
+                    ' vanish, chat wouldn't persist, server-state
+                    ' transitions wouldn't be detected. Failure is
+                    ' silent on nodes older than the parse-rules
+                    ' endpoint (logged at Debug, reconnect proceeds).
+                    Await ReregisterParseRulesAsync(client, instanceId)
                     StartLogStream(instanceId, client)
                     _logger.LogInformation("Reconnected log stream for {Id}", instanceId)
                 End If
             Catch ex As Exception
                 _logger.LogWarning(ex, "Failed to ensure log stream for {Id}", instanceId)
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Push the plugin-derived parse rule set to the node for
+        ''' an instance that's already running on it. Used by the
+        ''' reconnect path in EnsureLogStreamAsync so a node binary
+        ''' update or Manager restart doesn't strand running game
+        ''' processes with an empty EventStore rule list. Replaces
+        ''' the older operator-facing workflow of stopping and
+        ''' restarting every instance just to refresh rules — a
+        ''' game-server restart kicks every player off, and the
+        ''' new path doesn't.
+        '''
+        ''' Silently no-ops in three cases:
+        '''   1. Plugin unavailable or its GetLogParseRules throws.
+        '''   2. Node returns 404 from the parse-rules endpoint —
+        '''      older node binaries don't have it. The manager
+        '''      treats this as "this older node needs an instance
+        '''      restart to refresh rules" and proceeds with the
+        '''      reconnect; rules already on the node from the
+        '''      previous StartInstance keep applying.
+        '''   3. Any other exception — logged at Warning and
+        '''      swallowed so reconnect can still complete.
+        ''' </summary>
+        Private Async Function ReregisterParseRulesAsync(client As INodeClient,
+                                                          instanceId As String) As Task
+            Try
+                Dim gameId = GetGameIdForInstance(instanceId)
+                If String.IsNullOrEmpty(gameId) Then Return
+                Dim plugin = _pluginRegistry.GetPlugin(gameId)
+                If plugin Is Nothing Then Return
+
+                Dim rules As New List(Of LogParseRule)
+                Try
+                    Dim pluginRules = plugin.GetLogParseRules()
+                    If pluginRules IsNot Nothing Then
+                        For Each r In pluginRules
+                            rules.Add(r)
+                        Next
+                    End If
+                Catch ex As Exception
+                    _logger.LogWarning(ex, "Plugin failed to report parse rules for {Id}", instanceId)
+                    Return
+                End Try
+
+                ' Empty rule set is meaningless to push — cheaper
+                ' to skip than to risk wiping whatever the node
+                ' currently has registered, which on a normal
+                ' Manager-restart scenario could still be the right
+                ' set from a previous (now-reloaded) plugin version.
+                If rules.Count = 0 Then Return
+
+                Await client.UpdateParseRulesAsync(instanceId, rules, CancellationToken.None)
+                _logger.LogDebug("Re-pushed {Count} parse rule(s) to node for {Id}",
+                                 rules.Count, instanceId)
+            Catch ex As NodeApiException When ex.StatusCode.HasValue AndAlso
+                                              ex.StatusCode.Value = HttpStatusCode.NotFound
+                ' Older node without the parse-rules endpoint.
+                ' Non-fatal: reconnect proceeds, instance keeps
+                ' using whatever rules the node had at last
+                ' StartInstance. Operator's fix is to upgrade the
+                ' node binary or restart the instance manually.
+                _logger.LogDebug(
+                    "Parse-rules endpoint not available on node for {Id} — older node, skipping rule refresh",
+                    instanceId)
+            Catch ex As Exception
+                _logger.LogWarning(ex, "Failed to re-push parse rules for {Id}", instanceId)
             End Try
         End Function
 
@@ -870,6 +1055,33 @@ Namespace GSM.Manager.Core
                         If token.IsCancellationRequested Then Return
                         Try
                             Await RefreshInstanceStateAsync(id)
+
+                            ' Stream-health reconnect. If the state
+                            ' poll just returned Running but we have
+                            ' no active log stream for this instance,
+                            ' the previous stream died (typically
+                            ' because the node restarted out from
+                            ' under us) and the StreamLogsInBackgroundAsync
+                            ' Finally already cleaned up its dict
+                            ' entry. Trigger a reconnect attempt now
+                            ' so the manager catches back up to a
+                            ' live stream without waiting for the
+                            ' user to manually reopen the log viewer.
+                            ' EnsureLogStreamAsync is idempotent —
+                            ' if a stream is already active it returns
+                            ' immediately, so calling it every poll
+                            ' tick for healthy instances is cheap.
+                            Try
+                                Dim live = GetLiveState(id)
+                                If live IsNot Nothing AndAlso
+                                   live.CurrentState = GSM.Plugin.InstanceState.Running AndAlso
+                                   Not _logStreamCancellations.ContainsKey(id) Then
+                                    Await EnsureLogStreamAsync(id)
+                                End If
+                            Catch ex As Exception
+                                _logger.LogDebug(ex,
+                                    "Stream-health reconnect check failed for {Id}", id)
+                            End Try
                         Catch ex As Exception
                             _logger.LogDebug(ex, "Background poll failed for {Id}", id)
                         End Try
@@ -963,7 +1175,9 @@ Namespace GSM.Manager.Core
                         .NodeId = nodeId,
                         .InstanceId = instanceId,
                         .TimestampUtc = msg.TimestampUtc,
-                        .PlayerName = msg.PlayerName,
+                        .DisplayName = msg.DisplayName,
+                        .PlatformUserId = msg.PlatformUserId,
+                        .CharacterId = msg.CharacterId,
                         .Text = msg.Text
                     })
                     added += 1
@@ -1048,8 +1262,26 @@ Namespace GSM.Manager.Core
             Dim ids As New List(Of String)
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
-                For Each inst In db.Instances.ToList()
-                    ids.Add(inst.InstanceId)
+                ' Skip instances whose node is detached — a
+                ' detached node has explicitly opted out of the
+                ' background polling cycle. Existing log streams
+                ' to a detached node continue independently; this
+                ' only suppresses the 3-second status refresh
+                ' loop that would otherwise spam disconnect
+                ' banners when the operator points the manager
+                ' at a remote node that's offline. Explicit
+                ' navigation to an InstancePanel still triggers
+                ' on-demand refresh — the gate only applies here
+                ' in the background loop.
+                Dim pollable = From inst In db.Instances
+                               Join install In db.Installations
+                                   On inst.InstallationId Equals install.InstallationId
+                               Join nodeEnt In db.Nodes
+                                   On install.NodeId Equals nodeEnt.NodeId
+                               Where nodeEnt.IsEnabled
+                               Select inst.InstanceId
+                For Each id In pollable.ToList()
+                    ids.Add(id)
                 Next
             End Using
             Return ids
@@ -1105,32 +1337,89 @@ Namespace GSM.Manager.Core
         '  Log streaming
         ' ============================================================
 
+        ''' <summary>
+        ''' Establish a new SSE log stream for an instance, atomically
+        ''' cancelling any previous stream first. Idempotent: redundant
+        ''' calls (e.g. StartInstanceAsync's success path racing with
+        ''' BackgroundPollLoopAsync's stream-health check) collapse into
+        ''' a single live task instead of leaking the previous one.
+        '''
+        ''' Concurrency model: the cancel-and-replace transition is
+        ''' wrapped in SyncLock(_logStreamLock) so concurrent callers
+        ''' serialise on the same lock. Whichever caller enters second
+        ''' sees the first caller's cts in the dict, cancels it, and
+        ''' installs its own. The first caller's task receives the
+        ''' cancellation, exits, and its Finally block's compare-and-
+        ''' remove finds a mismatched cts (the second caller's now in
+        ''' the dict) and bails — exactly the right semantics.
+        '''
+        ''' Task.Run is INSIDE the lock so the parser registration in
+        ''' _logParsers happens before the task starts streaming.
+        ''' Otherwise the task could start reading lines while parser
+        ''' state from a previous run is still in the dict, producing
+        ''' transient mis-classification of the first few lines.
+        ''' </summary>
         Private Sub StartLogStream(instanceId As String, client As INodeClient)
-            Dim cts As New CancellationTokenSource()
-            _logStreamCancellations(instanceId) = cts
+            SyncLock _logStreamLock
+                ' Cancel any existing stream BEFORE installing the
+                ' new one. TryRemove + Cancel + Dispose explicitly,
+                ' rather than just overwriting the dict and hoping
+                ' GC closes the previous cts — the previous task is
+                ' awaiting a cancellation that will never come if
+                ' we don't Cancel(), and would stream forever.
+                Dim existingCts As CancellationTokenSource = Nothing
+                If _logStreamCancellations.TryRemove(instanceId, existingCts) Then
+                    Try
+                        existingCts.Cancel()
+                    Catch
+                    End Try
+                    Try
+                        existingCts.Dispose()
+                    Catch
+                    End Try
+                    _logger.LogDebug(
+                        "StartLogStream replaced an existing stream for {Id}", instanceId)
+                End If
 
-            ' Create a log parser for this instance's game
-            Dim gameId = GetGameIdForInstance(instanceId)
-            Dim parser As ILogParser = Nothing
-            If gameId IsNot Nothing Then
-                parser = _pluginRegistry.CreateParser(gameId)
-            End If
+                ' Drop any stale parser entry too. A previous run's
+                ' parser may still be in _logParsers if the previous
+                ' task hadn't yet reached its Finally — explicit
+                ' removal here keeps the parser slot in sync with
+                ' the cts slot. CreateParser below installs the
+                ' fresh one.
+                Dim staleParser As ActiveLogParser = Nothing
+                _logParsers.TryRemove(instanceId, staleParser)
 
-            If parser IsNot Nothing Then
-                _logParsers(instanceId) = New ActiveLogParser With {
-                    .Parser = parser,
-                    .InstanceId = instanceId
-                }
-            End If
+                Dim cts As New CancellationTokenSource()
+                _logStreamCancellations(instanceId) = cts
 
-            ' Stream in background
-            Task.Run(Function() StreamLogsInBackgroundAsync(instanceId, client, parser, cts.Token))
+                ' Create a log parser for this instance's game
+                Dim gameId = GetGameIdForInstance(instanceId)
+                Dim parser As ILogParser = Nothing
+                If gameId IsNot Nothing Then
+                    parser = _pluginRegistry.CreateParser(gameId)
+                End If
+
+                If parser IsNot Nothing Then
+                    _logParsers(instanceId) = New ActiveLogParser With {
+                        .Parser = parser,
+                        .InstanceId = instanceId
+                    }
+                End If
+
+                ' Stream in background. Pass the cts itself (not just its
+                ' token) so the background task can clean up its OWN entry
+                ' from _logStreamCancellations when the stream ends — see
+                ' the Finally block in StreamLogsInBackgroundAsync for why
+                ' the compare-and-remove pattern matters.
+                Task.Run(Function() StreamLogsInBackgroundAsync(instanceId, client, parser, cts))
+            End SyncLock
         End Sub
 
         Private Async Function StreamLogsInBackgroundAsync(instanceId As String,
                                                             client As INodeClient,
                                                             parser As ILogParser,
-                                                            cancellation As CancellationToken) As Task
+                                                            ourCts As CancellationTokenSource) As Task
             Try
                 Await client.StreamLogsAsync(instanceId,
                     Sub(line)
@@ -1184,11 +1473,40 @@ Namespace GSM.Manager.Core
                                 ' the log stream — swallow and move on.
                             End Try
                         End If
-                    End Sub, cancellation)
+                    End Sub, ourCts.Token)
             Catch ex As OperationCanceledException
                 ' Normal
             Catch ex As Exception
                 _logger.LogWarning(ex, "Log stream ended for {Id}", instanceId)
+            Finally
+                ' Clean up our entry from _logStreamCancellations so a
+                ' subsequent EnsureLogStreamAsync call (from the
+                ' background poll-loop's stream-health check, or from
+                ' a user reopening the log viewer) can establish a
+                ' fresh stream. Without this, the dict still holds
+                ' the dead cts after the stream task terminates,
+                ' EnsureLogStreamAsync's "already-streaming" guard
+                ' returns early, and the manager silently never
+                ' reconnects — visible symptom: node restart → logs
+                ' freeze → stay frozen forever even after the node is
+                ' fully back up.
+                '
+                ' Compare-and-remove: only remove if the entry in the
+                ' dict is still OUR cts. If a concurrent reconnect
+                ' (e.g. background poll noticed the stream gap and
+                ' already called EnsureLogStreamAsync) has already
+                ' swapped in a fresh cts, leave that fresh one alone.
+                ' Without this guard the new stream would inherit a
+                ' missing-entry state on the very first poll cycle.
+                Try
+                    Dim current As CancellationTokenSource = Nothing
+                    If _logStreamCancellations.TryGetValue(instanceId, current) AndAlso
+                       ReferenceEquals(current, ourCts) Then
+                        _logStreamCancellations.TryRemove(instanceId, current)
+                        Try : current.Dispose() : Catch : End Try
+                    End If
+                Catch
+                End Try
             End Try
         End Function
 
@@ -1360,6 +1678,13 @@ Namespace GSM.Manager.Core
             Dim removedTs As DateTime
             _lastEmptyLeaveAt.TryRemove(instanceId, removedTs)
 
+            ' Also drop the adoption-fallback session-identity cache
+            ' so a subsequent start (fresh tile load) doesn't pick
+            ' up the stale identity from the previous run before
+            ' the new parser commits its own.
+            Dim removedAdoptedIdentity As String = Nothing
+            _adoptedSessionIdentities.TryRemove(instanceId, removedAdoptedIdentity)
+
             ' Also close any open session-host row for this instance.
             ' A stop that happens while actively hosting a tile (rare
             ' but possible — e.g. user clicks Stop during gameplay)
@@ -1383,23 +1708,91 @@ Namespace GSM.Manager.Core
         ''' session keys and all downstream queries (chat history by
         ''' session, player history by session) work uniformly.
         '''
+        ''' Between those two there's a third source: an open
+        ''' SessionHost row from a previous parser instance. Used
+        ''' when the current parser hasn't observed the tile-load
+        ''' sequence — typical on reconnect/adoption since UE4 only
+        ''' emits "Started hosting tile" once per tile and that line
+        ''' has long since rotated out of the SSE ring buffer. This
+        ''' lookup keeps post-reconnect persistence stamped with the
+        ''' same identity the original session used, so History
+        ''' timeline rows for one logical session stay grouped.
+        '''
         ''' Returns Nothing ONLY when we can't determine the gameId —
         ''' shouldn't happen in practice because every running
         ''' instance has a parser registered, but defensive nulls
         ''' mean persistence silently no-ops rather than crashing.
         ''' </summary>
         Private Function ResolveSessionIdentity(instanceId As String) As String
+            ' Primary: in-memory parser state (set live by observing
+            ' the plugin-specific tile-load sequence).
             Dim activeParser As ActiveLogParser = Nothing
             _logParsers.TryGetValue(instanceId, activeParser)
             If activeParser IsNot Nothing AndAlso activeParser.Parser IsNot Nothing Then
                 Dim pluginIdentity = activeParser.Parser.CurrentSessionIdentity
-                If Not String.IsNullOrEmpty(pluginIdentity) Then Return pluginIdentity
+                If Not String.IsNullOrEmpty(pluginIdentity) Then
+                    ' Parser caught up — invalidate any adoption
+                    ' fallback cache for this instance so future
+                    ' tile switches the parser picks up will be
+                    ' the authoritative source. Cheap no-op when
+                    ' the cache was empty.
+                    Dim discarded As String = Nothing
+                    _adoptedSessionIdentities.TryRemove(instanceId, discarded)
+                    Return pluginIdentity
+                End If
             End If
 
-            ' Fallback: {gameId}:{instanceId}
+            ' Cached adoption fallback — avoids hitting the DB on
+            ' every chat-mirror tick (every 5s while a tile is
+            ' loaded post-reconnect).
+            Dim cached As String = Nothing
+            If _adoptedSessionIdentities.TryGetValue(instanceId, cached) AndAlso
+               Not String.IsNullOrEmpty(cached) Then
+                Return cached
+            End If
+
+            ' DB lookup — the open SessionHost row left over from
+            ' the original tile load carries the realm:tile identity
+            ' the parser would have committed if it had observed the
+            ' sequence live.
+            Dim resolved = LookupOpenSessionHostIdentity(instanceId)
+            If Not String.IsNullOrEmpty(resolved) Then
+                _adoptedSessionIdentities(instanceId) = resolved
+                Return resolved
+            End If
+
+            ' Final fallback: {gameId}:{instanceId}
             Dim gameId = GetGameIdForInstance(instanceId)
             If String.IsNullOrEmpty(gameId) Then Return Nothing
             Return $"{gameId}:{instanceId}"
+        End Function
+
+        ''' <summary>
+        ''' Look up the SessionIdentity of the most recent open
+        ''' SessionHost row for this instance. Used by
+        ''' ResolveSessionIdentity's adoption fallback path. Returns
+        ''' Nothing when no open row exists — either the instance
+        ''' was stopped cleanly (HostedUntilUtc closed by
+        ''' HandleTileUnloaded / ClearPlayerTracking) or it was
+        ''' never running long enough to commit a session.
+        ''' </summary>
+        Private Function LookupOpenSessionHostIdentity(instanceId As String) As String
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim row = db.SessionHosts.
+                        Where(Function(h) h.InstanceId = instanceId AndAlso
+                                          h.HostedUntilUtc Is Nothing).
+                        OrderByDescending(Function(h) h.HostedFromUtc).
+                        FirstOrDefault()
+                    If row IsNot Nothing Then Return row.SessionIdentity
+                    Return Nothing
+                End Using
+            Catch ex As Exception
+                _logger.LogDebug(ex,
+                    "LookupOpenSessionHostIdentity failed for {Id}", instanceId)
+                Return Nothing
+            End Try
         End Function
 
         ''' <summary>
@@ -1415,27 +1808,145 @@ Namespace GSM.Manager.Core
         End Function
 
         ''' <summary>
-        ''' UPSERT into PlayerSessions for a single observation AND
-        ''' append an individual PlayerActivity row for the same
-        ''' event. PlayerSessions is the summary; PlayerActivity is
-        ''' the full event stream that powers History timeline
-        ''' replay and snapshot-at-instant queries.
+        ''' Sync entry point invoked from the SSE log-stream
+        ''' callback (HandlePlayerJoin / HandlePlayerLeave) and
+        ''' from the stop-path flush (ClearPlayerTracking).
+        ''' Resolves session identity synchronously up-front and
+        ''' fires the rest — the Node /players wire call + DB
+        ''' writes — asynchronously on the thread pool.
         '''
-        ''' First sighting creates the PlayerSessions row; subsequent
-        ''' ones bump LastSeenUtc (and LastHostInstanceId if the tile
-        ''' has migrated to a different instance since last sight).
-        ''' Swallows errors so DB failures can't cascade into the
-        ''' event pipeline.
+        ''' Fire-and-forget is deliberate. The wire call to the
+        ''' Node's /players endpoint can take tens to hundreds of
+        ''' milliseconds on a slow link, and we cannot stall the
+        ''' SSE log-stream reader on it: the reader is single-
+        ''' threaded and any per-line latency directly delays
+        ''' downstream log processing. The async path's exceptions
+        ''' are logged inside it; there is nothing for the caller
+        ''' to wait on.
+        '''
+        ''' Snapshotting sessionIdentity here matters specifically
+        ''' for the ClearPlayerTracking flush path. ClearPlayerTracking
+        ''' runs in the Finally of StopInstanceAsync and is followed
+        ''' immediately by StopLogStream, which tears down the
+        ''' parser that ResolveSessionIdentity reads from. If the
+        ''' async persist did its own resolution later, it would
+        ''' miss the parser and fall back to the
+        ''' {gameId}:{instanceId} fallback identity for the
+        ''' synthetic leave rows — orphaning them from the join
+        ''' rows in the History timeline. Capturing the identity
+        ''' here, while the parser is still alive, makes the
+        ''' async path's identity assignment deterministic
+        ''' regardless of stop-sequence timing.
         ''' </summary>
         Private Sub PersistPlayerObservation(instanceId As String,
                                               playerName As String,
                                               isJoin As Boolean)
-            Try
-                Dim sessionIdentity = ResolveSessionIdentity(instanceId)
-                If String.IsNullOrEmpty(sessionIdentity) Then Return
+            Dim sessionIdentity = ResolveSessionIdentity(instanceId)
+            If String.IsNullOrEmpty(sessionIdentity) Then Return
 
+            ' Fire-and-forget. Discard variable holds the Task
+            ' reference so VB's "Function called as Sub" doesn't
+            ' fail compile; we have nothing to await on. Errors
+            ' inside the async path are logged there.
+            Dim _persistTask = PersistPlayerObservationAsync(
+                instanceId, playerName, isJoin, sessionIdentity)
+        End Sub
+
+        ''' <summary>
+        ''' Async core for PersistPlayerObservation. Three steps:
+        '''
+        '''   1. Enrich identity columns via wire call to the
+        '''      Node's /players endpoint. Best-effort: a missed
+        '''      lookup falls back to NULL CharacterId /
+        '''      PlatformUserId / DisplayName on the activity row
+        '''      and HistoryQueryService rendering's
+        '''      IdentityFormatter.Format coalesces gracefully to
+        '''      PlayerName.
+        '''
+        '''      The common miss case is PlayerLeave: the Node's
+        '''      EventStore removes the session from its in-memory
+        '''      dict on the same log line the Manager is
+        '''      processing, so by the time our HTTP request
+        '''      resolves, /players no longer contains the leaving
+        '''      player. PlayerJoin almost always hits because the
+        '''      Node adds the session BEFORE the SSE forwarding
+        '''      reaches the Manager. We accept the leave-time
+        '''      asymmetry rather than maintain a Manager-side
+        '''      identity cache for what is a documented
+        '''      fallback-to-NULL path.
+        '''
+        '''   2. UPSERT PlayerSessions for the per-player
+        '''      aggregate summary (first/last seen, last host
+        '''      instance). Unchanged from pre-5g-2 — the summary
+        '''      table is name-keyed; the new identity columns
+        '''      live only on PlayerActivity.
+        '''
+        '''   3. Append a PlayerActivity row stamped with the
+        '''      resolved identity columns from step 1.
+        '''
+        ''' sessionIdentity is passed in by the sync wrapper
+        ''' (snapshotted while the parser was still alive) rather
+        ''' than resolved here — see PersistPlayerObservation's
+        ''' doc comment for the rationale.
+        '''
+        ''' Identity match by either PlatformPersona OR DisplayName:
+        ''' the Manager's parser delivers PlayerName as the raw
+        ''' login-line string (Steam persona on LO), which matches
+        ''' PlayerSession.PlatformPersona. Chat-derived verdicts
+        ''' (if a future plugin routes them through PlayerJoin)
+        ''' would carry the in-game DisplayName instead. Trying
+        ''' both keeps the match working across both surfaces.
+        ''' </summary>
+        Private Async Function PersistPlayerObservationAsync(instanceId As String,
+                                                              playerName As String,
+                                                              isJoin As Boolean,
+                                                              sessionIdentity As String) As Task
+            Try
                 Dim now = DateTime.UtcNow
                 Dim nodeId = GetNodeIdForInstance(instanceId)
+
+                ' ---- Identity enrichment from Node's /players ----
+                Dim resolvedCharacterId As String = Nothing
+                Dim resolvedPlatformUserId As String = Nothing
+                Dim resolvedDisplayName As String = Nothing
+                Try
+                    Dim client = GetClientForInstance(instanceId)
+                    If client IsNot Nothing Then
+                        Dim sessions = Await client.GetPlayersAsync(instanceId, CancellationToken.None)
+                        If sessions IsNot Nothing Then
+                            Dim matched As PlayerSession = Nothing
+                            For Each s In sessions
+                                If s Is Nothing Then Continue For
+                                Dim personaMatch = Not String.IsNullOrEmpty(s.PlatformPersona) AndAlso
+                                                    String.Equals(s.PlatformPersona, playerName,
+                                                                  StringComparison.OrdinalIgnoreCase)
+                                Dim displayMatch = Not String.IsNullOrEmpty(s.DisplayName) AndAlso
+                                                    String.Equals(s.DisplayName, playerName,
+                                                                  StringComparison.OrdinalIgnoreCase)
+                                If personaMatch OrElse displayMatch Then
+                                    matched = s
+                                    Exit For
+                                End If
+                            Next
+                            If matched IsNot Nothing Then
+                                resolvedCharacterId = matched.CharacterId
+                                resolvedPlatformUserId = matched.PlatformUserId
+                                resolvedDisplayName = matched.DisplayName
+                            End If
+                        End If
+                    End If
+                Catch ex As Exception
+                    ' Wire-call failures (node unreachable,
+                    ' timeout, etc.) degrade gracefully to NULL
+                    ' identity columns. Logged at Debug because
+                    ' they're expected on PlayerLeave events and
+                    ' during transient network failures — Warning
+                    ' would spam the log uselessly.
+                    _logger.LogDebug(ex,
+                        "Identity enrichment failed for {Id}/{Name} — persisting with NULL identity",
+                        instanceId, playerName)
+                End Try
+
                 Using scope = ManagerProgram.Services.CreateScope()
                     Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
 
@@ -1466,7 +1977,10 @@ Namespace GSM.Manager.Core
                         .InstanceId = instanceId,
                         .TimestampUtc = now,
                         .PlayerName = playerName,
-                        .EventKind = If(isJoin, "join", "leave")
+                        .EventKind = If(isJoin, "join", "leave"),
+                        .CharacterId = resolvedCharacterId,
+                        .PlatformUserId = resolvedPlatformUserId,
+                        .DisplayName = resolvedDisplayName
                     })
 
                     db.SaveChanges()
@@ -1475,7 +1989,7 @@ Namespace GSM.Manager.Core
                 _logger.LogDebug(ex, "PersistPlayerObservation failed for {Id}/{Name}",
                                  instanceId, playerName)
             End Try
-        End Sub
+        End Function
 
         ''' <summary>
         ''' Called when the parser commits a new session identity
@@ -1740,11 +2254,163 @@ Namespace GSM.Manager.Core
         End Function
 
         ''' <summary>
-        ''' Loads the instance's ConfigJson merged on top of the
-        ''' installation's ConfigJson (same merge rules as
-        ''' StartInstanceAsync: instance wins on key collision, but
-        ''' an empty instance value does not overwrite a non-empty
-        ''' installation value).
+        ''' Resolves the plugin's preferred graceful-shutdown
+        ''' timeout for an instance via the opt-in
+        ''' ILaunchOptionsProvider interface. Returns the fallback
+        ''' value on any of:
+        '''   • instance row not found (deleted between stop
+        '''     request and resolution)
+        '''   • plugin not loaded (was unloaded or never compiled)
+        '''   • plugin doesn't implement ILaunchOptionsProvider
+        '''   • plugin implements it but left
+        '''     GracefulShutdownTimeoutMs at its -1 sentinel
+        '''   • plugin's GetLaunchOptions threw
+        '''
+        ''' Called from StopInstanceAsync after the per-instance
+        ''' "GracefulTimeoutMs" custom-field lookup misses, so the
+        ''' plugin's static preference fills the gap instead of
+        ''' the universal 25-second hardcoded fallback. See the
+        ''' priority block at the top of StopInstanceAsync for
+        ''' the full ordering.
+        '''
+        ''' Plugin's GetLaunchOptions takes an InstanceConfig.
+        ''' We pass a minimal shell (InstanceId + merged custom
+        ''' fields) since (a) existing plugins don't read any
+        ''' other field off InstanceConfig when reporting launch
+        ''' options, and (b) reconstructing the full config the
+        ''' way StartInstanceAsync does it would mean duplicating
+        ''' the schema-merge logic for a fallback path that runs
+        ''' once per stop. If a future plugin needs richer
+        ''' context here, the shell can grow without changing
+        ''' the interface signature.
+        ''' </summary>
+        Private Function ResolvePluginGracefulTimeoutMs(instanceId As String,
+                                                          fallback As Integer) As Integer
+            Try
+                Dim plugin As IGamePlugin = Nothing
+                Dim mergedFields As Dictionary(Of String, String) = Nothing
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim inst = db.Instances.Find(instanceId)
+                    If inst Is Nothing Then Return fallback
+                    plugin = _pluginRegistry.GetPlugin(inst.GameId)
+                End Using
+                If plugin Is Nothing Then Return fallback
+
+                Dim provider = TryCast(plugin, ILaunchOptionsProvider)
+                If provider Is Nothing Then Return fallback
+
+                mergedFields = GetMergedCustomFields(instanceId)
+                Dim shell As New InstanceConfig With {
+                    .InstanceId = instanceId,
+                    .CustomFields = mergedFields
+                }
+                Dim opts = provider.GetLaunchOptions(shell)
+                If opts Is Nothing Then Return fallback
+                If opts.GracefulShutdownTimeoutMs < 0 Then Return fallback
+                Return opts.GracefulShutdownTimeoutMs
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "Failed to resolve plugin graceful timeout for {Id} — using fallback {Ms}ms",
+                    instanceId, fallback)
+                Return fallback
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Phase 5h three-layer config merge. Builds the merged
+        ''' CustomFields dict for an instance by stacking up to
+        ''' three layers, lowest precedence first:
+        '''
+        '''   Layer 0 — shared-config group (only when the plugin
+        '''            implements ISharedConfigProvider AND the
+        '''            installation has a SharedConfigGroupId set).
+        '''            E.g. LO's Realm group supplies CustomerKey /
+        '''            ProviderKey / RealmName here.
+        '''   Layer 1 — installation (Installation.ConfigJson).
+        '''   Layer 2 — instance (Instance.ConfigJson).
+        '''
+        ''' At each transition between layers, an empty value at
+        ''' the upper layer does NOT overwrite a non-empty value
+        ''' set by a lower layer. This preserves the original
+        ''' two-layer rule (a blank override in the Edit Instance
+        ''' form doesn't wipe a shared value) symmetrically across
+        ''' the new three-layer stack — a blank field in the Edit
+        ''' Installation form doesn't wipe a realm-group value
+        ''' either.
+        '''
+        ''' If the plugin isn't loaded, doesn't implement
+        ''' ISharedConfigProvider, or the installation has no
+        ''' SharedConfigGroupId, Layer 0 is skipped and the merge
+        ''' behaves identically to the pre-5h two-layer version.
+        ''' Errors loading the group (decrypt failure, missing
+        ''' row) log a warning and continue with Layer 1+2 only;
+        ''' a half-merged config is preferable to a failed instance
+        ''' start.
+        ''' </summary>
+        Private Function MergeConfigLayers(db As GsmDbContext,
+                                           installation As InstallationEntity,
+                                           instance As InstanceEntity) As Dictionary(Of String, String)
+            Dim merged As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+            ' Layer 0 — shared-config group (opt-in via plugin
+            ' interface + installation link).
+            If installation IsNot Nothing AndAlso
+               Not String.IsNullOrEmpty(installation.SharedConfigGroupId) Then
+                Dim plugin = _pluginRegistry.GetPlugin(installation.GameId)
+                Dim provider = TryCast(plugin, ISharedConfigProvider)
+                If provider IsNot Nothing Then
+                    Try
+                        Dim schema = provider.GetSharedConfigSchema()
+                        Dim groupFields = _sharedConfigService.LoadGroupFieldsPlaintext(
+                            db, installation.SharedConfigGroupId, schema)
+                        For Each kvp In groupFields
+                            merged(kvp.Key) = kvp.Value
+                        Next
+                    Catch ex As Exception
+                        _logger.LogWarning(ex,
+                            "Failed to load shared-config group {GroupId} for installation {Inst}; continuing with install + instance config only",
+                            installation.SharedConfigGroupId, installation.InstallationId)
+                    End Try
+                End If
+            End If
+
+            ' Layer 1 — installation.
+            If installation IsNot Nothing Then
+                Dim installFields = DeserializeConfig(installation.ConfigJson)
+                For Each kvp In installFields
+                    If String.IsNullOrEmpty(kvp.Value) AndAlso
+                       merged.ContainsKey(kvp.Key) AndAlso
+                       Not String.IsNullOrEmpty(merged(kvp.Key)) Then
+                        Continue For
+                    End If
+                    merged(kvp.Key) = kvp.Value
+                Next
+            End If
+
+            ' Layer 2 — instance.
+            If instance IsNot Nothing Then
+                Dim instanceFields = DeserializeConfig(instance.ConfigJson)
+                For Each kvp In instanceFields
+                    If String.IsNullOrEmpty(kvp.Value) AndAlso
+                       merged.ContainsKey(kvp.Key) AndAlso
+                       Not String.IsNullOrEmpty(merged(kvp.Key)) Then
+                        Continue For
+                    End If
+                    merged(kvp.Key) = kvp.Value
+                Next
+            End If
+
+            Return merged
+        End Function
+
+        ''' <summary>
+        ''' Loads the instance's CustomFields via the Phase 5h
+        ''' three-layer merge (group → installation → instance).
+        ''' Both StartInstanceAsync's resolve path and ad-hoc
+        ''' callers (refresh, automation evaluation, etc.) use
+        ''' MergeConfigLayers so the merge rules can't drift
+        ''' between the two routes.
         ''' </summary>
         Private Function GetMergedCustomFields(instanceId As String) As Dictionary(Of String, String)
             Using scope = ManagerProgram.Services.CreateScope()
@@ -1754,24 +2420,7 @@ Namespace GSM.Manager.Core
                 If inst Is Nothing Then Return New Dictionary(Of String, String)
 
                 Dim install = db.Installations.Find(inst.InstallationId)
-                Dim installFields = If(install IsNot Nothing,
-                                       DeserializeConfig(install.ConfigJson),
-                                       New Dictionary(Of String, String))
-                Dim instanceFields = DeserializeConfig(inst.ConfigJson)
-
-                Dim merged As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
-                For Each kvp In installFields
-                    merged(kvp.Key) = kvp.Value
-                Next
-                For Each kvp In instanceFields
-                    If String.IsNullOrEmpty(kvp.Value) AndAlso
-                       merged.ContainsKey(kvp.Key) AndAlso
-                       Not String.IsNullOrEmpty(merged(kvp.Key)) Then
-                        Continue For
-                    End If
-                    merged(kvp.Key) = kvp.Value
-                Next
-                Return merged
+                Return MergeConfigLayers(db, install, inst)
             End Using
         End Function
 

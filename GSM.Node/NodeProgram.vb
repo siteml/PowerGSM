@@ -1,4 +1,6 @@
 Imports System
+Imports System.Collections.Generic
+Imports System.Globalization
 Imports System.IO
 Imports System.Reflection
 Imports System.Threading.Tasks
@@ -251,6 +253,38 @@ Namespace GSM.Node
                 ' Logging failure must never block startup.
             End Try
 
+            ' ---- Adopt previously-spawned game processes ----
+            ' Re-attach to game-server processes that outlived the
+            ' last node session. Reads InstanceSnapshots, verifies
+            ' each saved PID via Process.GetProcessById +
+            ' start-time match, and rebuilds the ManagedInstance
+            ' record with the live Process handle. Tailers resume
+            ' from saved TailerPositions cursors so log events
+            ' written during the node-down window stream in once
+            ' the new node accepts requests. Runs synchronously
+            ' BEFORE app.Run() so endpoint requests never see a
+            ' transient "everything is Stopped" view that would
+            ' fire false instance-stopped notifications on the
+            ' manager side. Per-snapshot failure logs and removes
+            ' the offending row; pass-level exceptions are caught
+            ' so a wholesale adoption failure can't prevent the
+            ' node from accepting requests at all.
+            Try
+                Dim pm = app.Services.GetRequiredService(Of ProcessManager)()
+                pm.AdoptSnapshots()
+            Catch ex As Exception
+                Try
+                    Dim adoptLogger = app.Services.
+                        GetRequiredService(Of ILoggerFactory)().
+                        CreateLogger("GSM.Node.Adoption")
+                    adoptLogger.LogError(ex,
+                        "Snapshot adoption pass threw at top level — startup continues with empty _instances dict")
+                Catch
+                    ' If even logging fails, swallow rather than
+                    ' refusing to start the node.
+                End Try
+            End Try
+
             app.Run()
 
         End Sub
@@ -493,6 +527,61 @@ Namespace GSM.Node
                     "
                     cmd.ExecuteNonQuery()
                 End Using
+
+                ' ----------------------------------------------------
+                ' InstanceSnapshots schema migration (additive only)
+                '
+                ' Adds columns needed for process re-adoption on node
+                ' restart: ExePath, Arguments, WorkingDirectory,
+                ' LogFilePathsJson, ParseRulesJson, Strategy,
+                ' StdoutIsLog, RequiresConsoleIsolation,
+                ' LogTailerStartDelayMs. Discovered via
+                ' PRAGMA table_info so an upgraded node with
+                ' pre-existing snapshots from the prior schema
+                ' picks up the additions exactly once, and a fresh
+                ' install (CREATE TABLE just ran with the old shape)
+                ' converges to the same final schema.
+                '
+                ' Defaults chosen so a row created under the old
+                ' schema still reads sensibly via
+                ' LoadAllInstanceSnapshots: text columns are NULL
+                ' (which adoption treats as "insufficient data,
+                ' discard this snapshot"), Strategy defaults to 0
+                ' (StdoutCapture), booleans default to 0,
+                ' LogTailerStartDelayMs defaults to 5000ms matching
+                ' the in-memory default.
+                ' ----------------------------------------------------
+                Dim existing As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "PRAGMA table_info(InstanceSnapshots)"
+                    Using reader = cmd.ExecuteReader()
+                        While reader.Read()
+                            ' Column 1 of PRAGMA table_info output
+                            ' is the column name.
+                            existing.Add(reader.GetString(1))
+                        End While
+                    End Using
+                End Using
+
+                Dim columnsToAdd As New List(Of (Name As String, Definition As String)) From {
+                    ("ExePath", "TEXT"),
+                    ("Arguments", "TEXT"),
+                    ("WorkingDirectory", "TEXT"),
+                    ("LogFilePathsJson", "TEXT"),
+                    ("ParseRulesJson", "TEXT"),
+                    ("Strategy", "INTEGER NOT NULL DEFAULT 0"),
+                    ("StdoutIsLog", "INTEGER NOT NULL DEFAULT 0"),
+                    ("RequiresConsoleIsolation", "INTEGER NOT NULL DEFAULT 0"),
+                    ("LogTailerStartDelayMs", "INTEGER NOT NULL DEFAULT 5000")
+                }
+
+                For Each col In columnsToAdd
+                    If existing.Contains(col.Name) Then Continue For
+                    Using cmd = conn.CreateCommand()
+                        cmd.CommandText = $"ALTER TABLE InstanceSnapshots ADD COLUMN {col.Name} {col.Definition}"
+                        cmd.ExecuteNonQuery()
+                    End Using
+                Next
             End Using
         End Sub
 
@@ -551,29 +640,126 @@ Namespace GSM.Node
 
         ''' <summary>
         ''' Saves an instance state snapshot for persistence across
-        ''' node restarts.
+        ''' node restarts. The recovery columns (ExePath, Arguments,
+        ''' WorkingDirectory, LogFilePathsJson, ParseRulesJson,
+        ''' Strategy, StdoutIsLog, RequiresConsoleIsolation,
+        ''' LogTailerStartDelayMs) carry everything the node needs
+        ''' to re-adopt a running game process on the next startup
+        ''' — see ProcessManager.AdoptSnapshots.
         ''' </summary>
         Public Sub SaveInstanceSnapshot(instanceId As String,
                                         state As String,
                                         pid As Integer,
                                         startedAtUtc As DateTime,
                                         crashPolicyJson As String,
-                                        stopIntentPending As Boolean)
+                                        stopIntentPending As Boolean,
+                                        exePath As String,
+                                        arguments As String,
+                                        workingDirectory As String,
+                                        logFilePathsJson As String,
+                                        parseRulesJson As String,
+                                        strategy As Integer,
+                                        stdoutIsLog As Boolean,
+                                        requiresConsoleIsolation As Boolean,
+                                        logTailerStartDelayMs As Integer)
             Using conn = OpenConnection()
                 Using cmd = conn.CreateCommand()
                     cmd.CommandText = "INSERT OR REPLACE INTO InstanceSnapshots
-                        (InstanceId, State, Pid, StartedAtUtc, CrashPolicyJson, StopIntentPending)
-                        VALUES (@id, @state, @pid, @started, @policy, @intent)"
+                        (InstanceId, State, Pid, StartedAtUtc, CrashPolicyJson, StopIntentPending,
+                         ExePath, Arguments, WorkingDirectory, LogFilePathsJson, ParseRulesJson,
+                         Strategy, StdoutIsLog, RequiresConsoleIsolation, LogTailerStartDelayMs)
+                        VALUES (@id, @state, @pid, @started, @policy, @intent,
+                                @exe, @args, @cwd, @logs, @rules,
+                                @strategy, @stdoutLog, @iso, @delay)"
                     cmd.Parameters.AddWithValue("@id", instanceId)
                     cmd.Parameters.AddWithValue("@state", state)
                     cmd.Parameters.AddWithValue("@pid", pid)
                     cmd.Parameters.AddWithValue("@started", startedAtUtc.ToString("o"))
                     cmd.Parameters.AddWithValue("@policy", If(crashPolicyJson, CObj(DBNull.Value)))
                     cmd.Parameters.AddWithValue("@intent", If(stopIntentPending, 1, 0))
+                    cmd.Parameters.AddWithValue("@exe", If(exePath, CObj(DBNull.Value)))
+                    cmd.Parameters.AddWithValue("@args", If(arguments, CObj(DBNull.Value)))
+                    cmd.Parameters.AddWithValue("@cwd", If(workingDirectory, CObj(DBNull.Value)))
+                    cmd.Parameters.AddWithValue("@logs", If(logFilePathsJson, CObj(DBNull.Value)))
+                    cmd.Parameters.AddWithValue("@rules", If(parseRulesJson, CObj(DBNull.Value)))
+                    cmd.Parameters.AddWithValue("@strategy", strategy)
+                    cmd.Parameters.AddWithValue("@stdoutLog", If(stdoutIsLog, 1, 0))
+                    cmd.Parameters.AddWithValue("@iso", If(requiresConsoleIsolation, 1, 0))
+                    cmd.Parameters.AddWithValue("@delay", logTailerStartDelayMs)
                     cmd.ExecuteNonQuery()
                 End Using
             End Using
         End Sub
+
+        ''' <summary>
+        ''' Reads every persisted instance snapshot. Called once on
+        ''' node startup by ProcessManager.AdoptSnapshots to try to
+        ''' re-adopt game processes that survived the last node
+        ''' restart. Returns an empty list when no rows exist (fresh
+        ''' install or all snapshots cleared by graceful stops).
+        '''
+        ''' Null tolerance on every column except InstanceId / State
+        ''' is intentional — snapshots written under the pre-
+        ''' migration schema have NULLs for every recovery field,
+        ''' and the caller treats those as "insufficient data, can't
+        ''' adopt this one" rather than crashing on a DBNull cast.
+        ''' </summary>
+        Public Function LoadAllInstanceSnapshots() As IReadOnlyList(Of InstanceSnapshotRow)
+            Dim rows As New List(Of InstanceSnapshotRow)
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "SELECT InstanceId, State, Pid, StartedAtUtc, CrashPolicyJson, StopIntentPending,
+                                              ExePath, Arguments, WorkingDirectory, LogFilePathsJson, ParseRulesJson,
+                                              Strategy, StdoutIsLog, RequiresConsoleIsolation, LogTailerStartDelayMs
+                                       FROM InstanceSnapshots"
+                    Using reader = cmd.ExecuteReader()
+                        While reader.Read()
+                            Dim row As New InstanceSnapshotRow()
+                            row.InstanceId = reader.GetString(0)
+                            row.State = If(reader.IsDBNull(1), Nothing, reader.GetString(1))
+                            row.Pid = If(reader.IsDBNull(2), 0, reader.GetInt32(2))
+                            If reader.IsDBNull(3) Then
+                                row.StartedAtUtc = DateTime.MinValue
+                            Else
+                                ' RoundtripKind alone is the correct
+                                ' style here — SaveInstanceSnapshot
+                                ' writes startedAtUtc.ToString("o")
+                                ' which encodes Kind=Utc as a trailing
+                                ' "Z", and RoundtripKind preserves that
+                                ' on parse. Earlier this also OR'd in
+                                ' DateTimeStyles.AssumeUniversal as
+                                ' belt-and-braces, but the BCL treats
+                                ' RoundtripKind and the Assume*/Adjust*
+                                ' values as mutually exclusive and
+                                ' throws ArgumentException up front
+                                ' from DateTime.Parse — which on the
+                                ' first call from AdoptSnapshots tore
+                                ' down the entire load, causing every
+                                ' snapshot to be skipped with an empty
+                                ' _instances dict and no instances
+                                ' getting re-adopted on startup.
+                                row.StartedAtUtc = DateTime.Parse(reader.GetString(3),
+                                    CultureInfo.InvariantCulture,
+                                    DateTimeStyles.RoundtripKind)
+                            End If
+                            row.CrashPolicyJson = If(reader.IsDBNull(4), Nothing, reader.GetString(4))
+                            row.StopIntentPending = Not reader.IsDBNull(5) AndAlso reader.GetInt32(5) <> 0
+                            row.ExePath = If(reader.IsDBNull(6), Nothing, reader.GetString(6))
+                            row.Arguments = If(reader.IsDBNull(7), Nothing, reader.GetString(7))
+                            row.WorkingDirectory = If(reader.IsDBNull(8), Nothing, reader.GetString(8))
+                            row.LogFilePathsJson = If(reader.IsDBNull(9), Nothing, reader.GetString(9))
+                            row.ParseRulesJson = If(reader.IsDBNull(10), Nothing, reader.GetString(10))
+                            row.Strategy = If(reader.IsDBNull(11), 0, reader.GetInt32(11))
+                            row.StdoutIsLog = Not reader.IsDBNull(12) AndAlso reader.GetInt32(12) <> 0
+                            row.RequiresConsoleIsolation = Not reader.IsDBNull(13) AndAlso reader.GetInt32(13) <> 0
+                            row.LogTailerStartDelayMs = If(reader.IsDBNull(14), 5000, reader.GetInt32(14))
+                            rows.Add(row)
+                        End While
+                    End Using
+                End Using
+            End Using
+            Return rows
+        End Function
 
         ''' <summary>
         ''' Removes an instance snapshot when an instance is fully stopped.
@@ -691,6 +877,33 @@ Namespace GSM.Node
     Public Class TailerPositionRow
         Public Property BytePosition As Long
         Public Property Fingerprint As String
+    End Class
+
+    ''' <summary>
+    ''' Single row from the InstanceSnapshots table. Returned by
+    ''' NodeDatabase.LoadAllInstanceSnapshots and consumed by
+    ''' ProcessManager.AdoptSnapshots to re-adopt running game
+    ''' processes after a node restart. All recovery-payload
+    ''' fields are nullable / defaulted because pre-migration rows
+    ''' have NULL for them — the consumer treats those rows as
+    ''' undadoptable rather than crashing on a missing field.
+    ''' </summary>
+    Public Class InstanceSnapshotRow
+        Public Property InstanceId As String
+        Public Property State As String
+        Public Property Pid As Integer
+        Public Property StartedAtUtc As DateTime
+        Public Property CrashPolicyJson As String
+        Public Property StopIntentPending As Boolean
+        Public Property ExePath As String
+        Public Property Arguments As String
+        Public Property WorkingDirectory As String
+        Public Property LogFilePathsJson As String
+        Public Property ParseRulesJson As String
+        Public Property Strategy As Integer
+        Public Property StdoutIsLog As Boolean
+        Public Property RequiresConsoleIsolation As Boolean
+        Public Property LogTailerStartDelayMs As Integer
     End Class
 
 End Namespace

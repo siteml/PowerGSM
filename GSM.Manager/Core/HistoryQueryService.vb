@@ -7,6 +7,7 @@ Imports Microsoft.EntityFrameworkCore
 Imports Microsoft.Extensions.DependencyInjection
 Imports Microsoft.Extensions.Logging
 Imports GSM.Manager.Data
+Imports GSM.Plugin
 
 ' ============================================================
 '  HistoryQueryService — read-only query surface for the
@@ -75,8 +76,97 @@ Namespace GSM.Manager.Core
         Public Property SessionIdentity As String
         Public Property TileDisplayName As String
         Public Property InstanceId As String
+
+        ''' <summary>
+        ''' Combined "NodeName:InstanceName:InstanceId" string
+        ''' resolved once per query by joining the row's InstanceId
+        ''' against Instances + Installations + Nodes. The full
+        ''' InstanceId is preserved (not truncated) because LO writes
+        ''' per-instance log files as {InstanceId}.log — having the
+        ''' raw GUID visible lets an operator grep the on-disk log
+        ''' for the exact line that produced a given history row.
+        ''' Empty when the instance or its node has since been
+        ''' deleted, or when the row's InstanceId is itself empty.
+        ''' </summary>
+        Public Property InstanceDisplay As String
+
+        ''' <summary>
+        ''' Display name for the row, resolved via IdentityFormatter
+        ''' so the same player renders identically across Chat and
+        ''' Join/Leave rows. Coalesce priority: DisplayName (the
+        ''' player's chosen in-game character name) → PlayerName
+        ''' (raw parser verdict from the underlying entity row).
+        '''
+        ''' For Chat rows the value is ChatMessages.DisplayName
+        ''' directly — chat lines on Last Oasis carry the in-game
+        ''' character name natively, so it's already canonical. For
+        ''' Join/Leave rows the value is IdentityFormatter.Format(
+        ''' activity.DisplayName, Nothing, activity.PlayerName),
+        ''' preferring the snapshot DisplayName column that Phase
+        ''' 5g-2 added to PlayerActivity and falling back to the
+        ''' raw PlayerName (Steam persona on LO, FLS handle on
+        ''' Conan) for rows that pre-date the 5g-2 migration or
+        ''' where identity enrichment missed at write time.
+        ''' PlayerLeave rows in particular tend to miss enrichment
+        ''' because the Node removes the session from /players on
+        ''' the same log line the Manager processes — see
+        ''' InstanceManager.PersistPlayerObservationAsync.
+        '''
+        ''' Phase 5g-2b render-time chat fallback: for Join/Leave
+        ''' rows where DisplayName was empty (or equal to the raw
+        ''' PlayerName) AND PlatformUserId is populated,
+        ''' LoadTimeline does a render-time lookup against
+        ''' ChatMessages by (SessionIdentity, PlatformUserId) and
+        ''' overrides PlayerName with the most recent chat
+        ''' DisplayName found. Handles the Conan case where the
+        ''' FLS handle binds at join before any chat lands, and
+        ''' the cross-Node case where a returning player joins on
+        ''' a Node whose players-table cache doesn't have them.
+        ''' Players who never chatted within the queried scope
+        ''' fall through to the raw parser PlayerName.
+        ''' </summary>
         Public Property PlayerName As String
+
+        ''' <summary>
+        ''' Resolved Steam/Xbox/etc. platform ID of the actor for
+        ''' this row. Populated for both Chat and Join/Leave rows
+        ''' as of Phase 5g-2 (the activity-row populator captures
+        ''' it from the Node's /players response at write time;
+        ''' the chat-row populator carries the value chat
+        ''' persistence on the Node side bound during parse).
+        ''' Nothing for any row whose underlying entity row pre-
+        ''' dates the corresponding migration, or where the Node
+        ''' couldn't resolve PlatformUserId at the time the line
+        ''' was parsed.
+        ''' </summary>
+        Public Property PlatformUserId As String
+
+        ''' <summary>
+        ''' Resolved CharacterId of the actor for this row. Same
+        ''' populated-for-both-kinds and Nothing semantics as
+        ''' PlatformUserId since Phase 5g-2. Stable across the
+        ''' character's lifetime; the durable identity for
+        ''' cross-name-change queries (e.g. "every event ever
+        ''' from this character regardless of what name they
+        ''' were going by").
+        ''' </summary>
+        Public Property CharacterId As String
+
         Public Property Text As String
+
+        ''' <summary>
+        ''' Phase 5h-6 — plugin-formatted label for the History
+        ''' window's "Source" column, replacing the legacy
+        ''' Tile/Session + Instance columns. Resolved per row by
+        ''' the manager: a SourceLabelContext is built from this
+        ''' row's SessionIdentity + InstanceId plus the resolved
+        ''' node / installation / instance / linked-group display
+        ''' names, then dispatched to the plugin's
+        ''' ISourceLabelProvider.FormatSourceLabel implementation.
+        ''' Plugins not implementing that interface get a default
+        ''' "{Node}/{Install}/{Instance}" label.
+        ''' </summary>
+        Public Property SourceLabel As String
     End Class
 
     ''' <summary>
@@ -90,6 +180,22 @@ Namespace GSM.Manager.Core
         Public Property TileDisplayName As String
         Public Property LastChatText As String
         Public Property LastChatTimeUtc As DateTime?
+
+        ''' <summary>
+        ''' Phase 5h-6 — InstanceId of the join event the player
+        ''' arrived on (the activity replay captures whichever
+        ''' instance bore the join up to the snapshot instant).
+        ''' Used to dispatch SourceLabel formatting through the
+        ''' plugin, and as the value the History window's right-
+        ''' click "Copy instance ID" action emits.
+        ''' </summary>
+        Public Property InstanceId As String
+
+        ''' <summary>
+        ''' Phase 5h-6 — plugin-formatted Source label, resolved
+        ''' the same way as TimelineRow.SourceLabel.
+        ''' </summary>
+        Public Property SourceLabel As String
     End Class
 
     ''' <summary>
@@ -198,13 +304,55 @@ Namespace GSM.Manager.Core
                                   First()
                     }).ToDictionary(Function(x) x.Identity, Function(x) x.Name)
 
+                ' Phase 5h-6 — build a session-identity → realm
+                ' DisplayName map so the session dropdown can
+                ' show the friendly realm name (e.g. "Site's World")
+                ' instead of the raw realm_id substring for
+                ' installations linked to a SharedConfigGroup.
+                ' Path: SessionHosts.InstanceId → Instance →
+                ' Installation → SharedConfigGroup. First-write-
+                ' wins per identity — if the same session
+                ' identity has been hosted by installs linked
+                ' to different groups (shouldn't happen in
+                ' practice; would mean operator misconfiguration),
+                ' we just pick one rather than try to disambiguate.
+                Dim realmNameByIdentity As New Dictionary(Of String, String)(StringComparer.Ordinal)
+                Dim hostMappings = (From h In db.SessionHosts
+                                    Join inst In db.Instances
+                                        On h.InstanceId Equals inst.InstanceId
+                                    Join install In db.Installations
+                                        On inst.InstallationId Equals install.InstallationId
+                                    Where install.SharedConfigGroupId IsNot Nothing
+                                    Select New With {
+                                        .Identity = h.SessionIdentity,
+                                        .GroupId = install.SharedConfigGroupId
+                                    }).Distinct().ToList()
+                If hostMappings.Count > 0 Then
+                    Dim groupIds = hostMappings.
+                        Select(Function(m) m.GroupId).Distinct().ToList()
+                    Dim groupNames = db.SharedConfigGroups.
+                        Where(Function(g) groupIds.Contains(g.GroupId)).
+                        Select(Function(g) New With {.GroupId = g.GroupId, .DisplayName = g.DisplayName}).
+                        ToDictionary(Function(x) x.GroupId, Function(x) x.DisplayName)
+                    For Each m In hostMappings
+                        Dim displayName As String = Nothing
+                        If groupNames.TryGetValue(m.GroupId, displayName) AndAlso
+                           Not String.IsNullOrEmpty(displayName) AndAlso
+                           Not realmNameByIdentity.ContainsKey(m.Identity) Then
+                            realmNameByIdentity(m.Identity) = displayName
+                        End If
+                    Next
+                End If
+
                 Dim result As New List(Of SessionSummary)(merged.Count)
                 For Each kvp In merged
                     Dim tileName As String = Nothing
                     nameByIdentity.TryGetValue(kvp.Key, tileName)
+                    Dim realmName As String = Nothing
+                    realmNameByIdentity.TryGetValue(kvp.Key, realmName)
                     result.Add(New SessionSummary With {
                         .Identity = kvp.Key,
-                        .DisplayLabel = FormatSessionLabel(kvp.Key, tileName),
+                        .DisplayLabel = FormatSessionLabel(kvp.Key, tileName, realmName),
                         .LastActivityUtc = kvp.Value
                     })
                 Next
@@ -238,8 +386,8 @@ Namespace GSM.Manager.Core
                 Dim fromActivity = activityQ.
                     Select(Function(a) a.PlayerName).Distinct().ToList()
                 Dim fromChat = chatQ.
-                    Where(Function(c) c.PlayerName IsNot Nothing).
-                    Select(Function(c) c.PlayerName).Distinct().ToList()
+                    Where(Function(c) c.DisplayName IsNot Nothing).
+                    Select(Function(c) c.DisplayName).Distinct().ToList()
 
                 Return fromActivity.Concat(fromChat).
                     Where(Function(n) Not String.IsNullOrEmpty(n)).
@@ -277,12 +425,18 @@ Namespace GSM.Manager.Core
             Dim endUtc = filter.EndUtc.GetValueOrDefault(DateTime.UtcNow)
             Dim merged As New List(Of TimelineRow)
 
+            ' Hoisted out of the Using so the post-truncate
+            ' SourceLabel resolver can reuse the same map. The
+            ' Dictionary itself is just in-memory data; the EF
+            ' connection that produced it can close behind us.
+            Dim tileNames As Dictionary(Of String, String) = Nothing
+
             Using scope = _serviceProvider.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
 
                 ' Resolve tile-name map once for the whole query
                 ' so we don't do per-row lookups.
-                Dim tileNames = LoadTileNameMap(db, filter.SessionIdentity)
+                tileNames = LoadTileNameMap(db, filter.SessionIdentity)
 
                 ' ---- Chat slice ----
                 If filter.IncludeChat Then
@@ -296,8 +450,8 @@ Namespace GSM.Manager.Core
                     End If
                     If Not String.IsNullOrEmpty(filter.PlayerNamePattern) Then
                         Dim p = filter.PlayerNamePattern
-                        q = q.Where(Function(c) c.PlayerName IsNot Nothing AndAlso
-                                                  EF.Functions.Like(c.PlayerName, $"%{p}%"))
+                        q = q.Where(Function(c) c.DisplayName IsNot Nothing AndAlso
+                                                  EF.Functions.Like(c.DisplayName, $"%{p}%"))
                     End If
                     If Not String.IsNullOrEmpty(filter.ChatTextPattern) Then
                         Dim p = filter.ChatTextPattern
@@ -316,7 +470,9 @@ Namespace GSM.Manager.Core
                             .SessionIdentity = r.SessionIdentity,
                             .TileDisplayName = ResolveDisplayName(tileNames, r.SessionIdentity),
                             .InstanceId = r.InstanceId,
-                            .PlayerName = r.PlayerName,
+                            .PlayerName = r.DisplayName,
+                            .PlatformUserId = r.PlatformUserId,
+                            .CharacterId = r.CharacterId,
                             .Text = r.Text
                         })
                     Next
@@ -345,8 +501,27 @@ Namespace GSM.Manager.Core
 
                     Dim actRows = q.OrderByDescending(Function(a) a.TimestampUtc).
                         Take(TimelineRowLimit + 1).ToList()
+
+                    ' Track activity rows where the write-time
+                    ' snapshot couldn't bind a meaningful character
+                    ' name — either DisplayName was empty (Node's
+                    ' players-table cache missed at the moment of
+                    ' the snapshot, common for first-time-on-this-
+                    ' Node players) or DisplayName equals the raw
+                    ' PlayerName (e.g. Conan's "Join succeeded:"
+                    ' line carries the FLS handle, and pre-5g-2b
+                    ' rows have the same value in both slots).
+                    ' For these, do a render-time lookup against
+                    ' ChatMessages by (SessionIdentity,
+                    ' PlatformUserId) to pull the most recent
+                    ' character name the player chatted under.
+                    ' Rows with no chat to bridge through stay on
+                    ' the raw parser PlayerName — best-effort.
+                    Dim rowsNeedingChatFallback As _
+                        New List(Of (Row As TimelineRow, SessionIdentity As String, PlatformUserId As String))
+
                     For Each r In actRows
-                        merged.Add(New TimelineRow With {
+                        Dim row = New TimelineRow With {
                             .Kind = If(r.EventKind = "join",
                                         TimelineRow.RowKind.Join,
                                         TimelineRow.RowKind.Leave),
@@ -354,10 +529,23 @@ Namespace GSM.Manager.Core
                             .SessionIdentity = r.SessionIdentity,
                             .TileDisplayName = ResolveDisplayName(tileNames, r.SessionIdentity),
                             .InstanceId = r.InstanceId,
-                            .PlayerName = r.PlayerName,
+                            .PlayerName = IdentityFormatter.Format(r.DisplayName, Nothing, r.PlayerName),
+                            .PlatformUserId = r.PlatformUserId,
+                            .CharacterId = r.CharacterId,
                             .Text = Nothing
-                        })
+                        }
+                        merged.Add(row)
+
+                        If Not String.IsNullOrEmpty(r.PlatformUserId) AndAlso
+                           (String.IsNullOrEmpty(r.DisplayName) OrElse
+                            String.Equals(r.DisplayName, r.PlayerName, StringComparison.Ordinal)) Then
+                            rowsNeedingChatFallback.Add((row, r.SessionIdentity, r.PlatformUserId))
+                        End If
                     Next
+
+                    If rowsNeedingChatFallback.Count > 0 Then
+                        ApplyChatFallbackDisplayNames(db, rowsNeedingChatFallback)
+                    End If
                 End If
             End Using
 
@@ -369,12 +557,293 @@ Namespace GSM.Manager.Core
             Dim truncated = merged.Count > TimelineRowLimit
             If truncated Then merged = merged.Take(TimelineRowLimit).ToList()
 
+            ' Resolve InstanceDisplay + SourceLabel for every row
+            ' in one pass. Done after the truncate so we don't
+            ' waste a query on rows we'll discard. Inside a fresh
+            ' scope so the lookup uses its own DbContext rather
+            ' than reusing one whose connection we already closed.
+            ResolveInstanceDisplayNames(merged, tileNames)
+
             Return New TimelineResult With {
                 .Rows = merged,
                 .Truncated = truncated,
                 .Limit = TimelineRowLimit
             }
         End Function
+
+        ''' <summary>
+        ''' Populates TimelineRow.InstanceDisplay AND
+        ''' TimelineRow.SourceLabel for every row in the list,
+        ''' doing a single JOIN against Instances + Installations
+        ''' + Nodes for all distinct InstanceIds plus a follow-up
+        ''' lookup against SharedConfigGroups for any installs
+        ''' that link to one. Rows whose InstanceId no longer
+        ''' resolves to a live (instance, installation, node)
+        ''' triple keep the fallback display
+        ''' "(deleted):(deleted):{instanceId}" so the operator can
+        ''' still see WHICH instance produced the row even after
+        ''' the configuration was removed — useful for retrospective
+        ''' debugging of long-gone servers.
+        '''
+        ''' SourceLabel goes through the plugin's
+        ''' ISourceLabelProvider implementation if the plugin
+        ''' opts in, falling back to a manager-supplied default
+        ''' "{Node}/{Install}/{Instance}" otherwise.
+        ''' </summary>
+        Private Sub ResolveInstanceDisplayNames(rows As List(Of TimelineRow),
+                                                  tileNames As Dictionary(Of String, String))
+            If rows Is Nothing OrElse rows.Count = 0 Then Return
+
+            Dim distinctIds = rows.
+                Where(Function(r) Not String.IsNullOrEmpty(r.InstanceId)).
+                Select(Function(r) r.InstanceId).
+                Distinct().ToList()
+
+            Dim contexts = LoadResolvedInstances(distinctIds)
+            Dim registry = _serviceProvider.GetService(Of PluginRegistry)()
+
+            For Each r In rows
+                If Not String.IsNullOrEmpty(r.InstanceId) Then
+                    Dim resolved As ResolvedInstance = Nothing
+                    If contexts.TryGetValue(r.InstanceId, resolved) Then
+                        r.InstanceDisplay =
+                            $"{If(resolved.NodeName, "")}:{If(resolved.InstanceName, "")}:{r.InstanceId}"
+                    Else
+                        ' Instance row no longer exists in the
+                        ' configuration (deleted, but its history
+                        ' rows linger). Surface that explicitly so
+                        ' the operator doesn't think it's a bug.
+                        r.InstanceDisplay = $"(deleted):(deleted):{r.InstanceId}"
+                    End If
+                End If
+                r.SourceLabel = ResolveSourceLabel(r.SessionIdentity, r.InstanceId,
+                                                     contexts, tileNames, registry)
+            Next
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5h-6 — Pre-resolved per-instance context used by
+        ''' the SourceLabel and InstanceDisplay paths. Captures
+        ''' enough information about each unique InstanceId to
+        ''' build a SourceLabelContext without further DB hits.
+        ''' </summary>
+        Private Class ResolvedInstance
+            Public NodeName As String
+            Public InstallationName As String
+            Public InstanceName As String
+            Public GameId As String
+            Public SharedConfigGroupName As String
+        End Class
+
+        ''' <summary>
+        ''' Phase 5h-6 — fetch ResolvedInstance for each unique
+        ''' InstanceId in distinctIds. Two queries: the first
+        ''' walks the (Instance, Installation, Node) chain in a
+        ''' single round-trip; the second pulls SharedConfigGroup
+        ''' DisplayNames for any installs that link to one. Both
+        ''' results are merged into the returned dictionary.
+        ''' Empty input returns an empty dictionary without
+        ''' touching the database.
+        ''' </summary>
+        Private Function LoadResolvedInstances(distinctIds As List(Of String)) _
+                As Dictionary(Of String, ResolvedInstance)
+            Dim map As New Dictionary(Of String, ResolvedInstance)(StringComparer.Ordinal)
+            If distinctIds Is Nothing OrElse distinctIds.Count = 0 Then Return map
+
+            Using scope = _serviceProvider.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+
+                Dim instanceData = (From inst In db.Instances
+                                    Join install In db.Installations
+                                        On inst.InstallationId Equals install.InstallationId
+                                    Join nodeRow In db.Nodes
+                                        On install.NodeId Equals nodeRow.NodeId
+                                    Where distinctIds.Contains(inst.InstanceId)
+                                    Select New With {
+                                        .InstanceId = inst.InstanceId,
+                                        .NodeName = nodeRow.DisplayName,
+                                        .InstallationName = install.DisplayName,
+                                        .InstanceName = inst.DisplayName,
+                                        .GameId = install.GameId,
+                                        .SharedConfigGroupId = install.SharedConfigGroupId
+                                    }).ToList()
+
+                ' Second pass: load the linked SharedConfigGroup
+                ' DisplayNames for any installs that point to one.
+                ' LEFT JOIN expressed as two queries + in-memory
+                ' merge — simpler than VB's Group Join syntax and
+                ' the typical N (number of distinct linked groups)
+                ' is tiny.
+                Dim groupIds = instanceData.
+                    Where(Function(r) Not String.IsNullOrEmpty(r.SharedConfigGroupId)).
+                    Select(Function(r) r.SharedConfigGroupId).
+                    Distinct().ToList()
+
+                Dim groupNameMap As New Dictionary(Of String, String)(StringComparer.Ordinal)
+                If groupIds.Count > 0 Then
+                    Dim groups = db.SharedConfigGroups.
+                        Where(Function(g) groupIds.Contains(g.GroupId)).
+                        Select(Function(g) New With {.GroupId = g.GroupId, .DisplayName = g.DisplayName}).
+                        ToList()
+                    For Each g In groups
+                        groupNameMap(g.GroupId) = g.DisplayName
+                    Next
+                End If
+
+                For Each row In instanceData
+                    Dim groupName As String = Nothing
+                    If Not String.IsNullOrEmpty(row.SharedConfigGroupId) Then
+                        groupNameMap.TryGetValue(row.SharedConfigGroupId, groupName)
+                    End If
+                    map(row.InstanceId) = New ResolvedInstance With {
+                        .NodeName = row.NodeName,
+                        .InstallationName = row.InstallationName,
+                        .InstanceName = row.InstanceName,
+                        .GameId = row.GameId,
+                        .SharedConfigGroupName = groupName
+                    }
+                Next
+            End Using
+            Return map
+        End Function
+
+        ''' <summary>
+        ''' Phase 5h-6 — build a SourceLabelContext and dispatch
+        ''' to the plugin's ISourceLabelProvider implementation,
+        ''' falling back to a manager-supplied default if the
+        ''' plugin doesn't opt in (or returns Nothing/empty).
+        ''' Defensive against plugin exceptions — a misbehaving
+        ''' plugin's formatting bug shouldn't kill the whole query.
+        ''' </summary>
+        Private Shared Function ResolveSourceLabel(sessionIdentity As String,
+                                                     instanceId As String,
+                                                     contexts As Dictionary(Of String, ResolvedInstance),
+                                                     tileNames As Dictionary(Of String, String),
+                                                     registry As PluginRegistry) As String
+            Dim tileName As String = Nothing
+            If tileNames IsNot Nothing AndAlso Not String.IsNullOrEmpty(sessionIdentity) Then
+                tileNames.TryGetValue(sessionIdentity, tileName)
+            End If
+
+            Dim resolved As ResolvedInstance = Nothing
+            If contexts IsNot Nothing AndAlso Not String.IsNullOrEmpty(instanceId) Then
+                contexts.TryGetValue(instanceId, resolved)
+            End If
+
+            Dim ctx As New SourceLabelContext With {
+                .SessionIdentity = sessionIdentity,
+                .TileName = tileName,
+                .InstanceId = instanceId
+            }
+            If resolved IsNot Nothing Then
+                ctx.NodeName = resolved.NodeName
+                ctx.InstallationName = resolved.InstallationName
+                ctx.InstanceName = resolved.InstanceName
+                ctx.SharedConfigGroupName = resolved.SharedConfigGroupName
+            End If
+
+            ' Dispatch to plugin if the GameId resolves to a
+            ' loaded plugin that implements the interface.
+            Dim label As String = Nothing
+            If resolved IsNot Nothing AndAlso registry IsNot Nothing AndAlso
+               Not String.IsNullOrEmpty(resolved.GameId) Then
+                Dim gamePlugin = registry.GetPlugin(resolved.GameId)
+                If gamePlugin IsNot Nothing Then
+                    Dim provider = TryCast(gamePlugin, ISourceLabelProvider)
+                    If provider IsNot Nothing Then
+                        Try
+                            label = provider.FormatSourceLabel(ctx)
+                        Catch
+                            ' Plugin bug — fall through to default.
+                        End Try
+                    End If
+                End If
+            End If
+
+            If Not String.IsNullOrEmpty(label) Then Return label
+            Return BuildDefaultSourceLabel(ctx)
+        End Function
+
+        ''' <summary>
+        ''' Phase 5h-6 — the manager-supplied fallback label used
+        ''' when no plugin opts in. Format is "{Node}/{Install}/
+        ''' {Instance}", skipping empty segments so a partially-
+        ''' resolved context (e.g. instance deleted but row
+        ''' lingers) still produces a clean label rather than
+        ''' awkward double-slash gaps. Returns the raw
+        ''' SessionIdentity if no instance segments resolve at
+        ''' all — better than a blank cell.
+        ''' </summary>
+        Private Shared Function BuildDefaultSourceLabel(ctx As SourceLabelContext) As String
+            Dim segments As New List(Of String)
+            If Not String.IsNullOrEmpty(ctx.NodeName) Then segments.Add(ctx.NodeName)
+            If Not String.IsNullOrEmpty(ctx.InstallationName) Then segments.Add(ctx.InstallationName)
+            If Not String.IsNullOrEmpty(ctx.InstanceName) Then segments.Add(ctx.InstanceName)
+            If segments.Count > 0 Then Return String.Join("/", segments)
+            Return If(ctx.SessionIdentity, "")
+        End Function
+
+        ''' <summary>
+        ''' Phase 5g-2b render-time chat fallback. For each
+        ''' activity TimelineRow whose write-time snapshot didn't
+        ''' bind a meaningful character name (DisplayName empty or
+        ''' equal to raw PlayerName), look up the most recent
+        ''' ChatMessages.DisplayName for that (SessionIdentity,
+        ''' PlatformUserId) pair and override TimelineRow.PlayerName
+        ''' if found.
+        '''
+        ''' Query strategy: one indexed lookup per DISTINCT
+        ''' (SessionIdentity, PlatformUserId) pair. The IX_chat_pid
+        ''' index added in Phase 5g-1 keys on (PlatformUserId,
+        ''' TimestampUtc DESC) so each lookup is a fast seek;
+        ''' bounding by distinct pairs (typically a handful, even
+        ''' on a busy server) keeps the total query count small.
+        ''' Pulled-then-discarded data is minimal because we project
+        ''' just DisplayName and TOP 1.
+        '''
+        ''' Caller is inside an existing scope; we share the
+        ''' caller's DbContext rather than opening a new one.
+        ''' </summary>
+        Private Shared Sub ApplyChatFallbackDisplayNames(
+                db As GsmDbContext,
+                rowsNeedingFallback As List(Of (Row As TimelineRow, SessionIdentity As String, PlatformUserId As String)))
+            If rowsNeedingFallback Is Nothing OrElse rowsNeedingFallback.Count = 0 Then Return
+
+            ' Unique (sessionId, pid) pairs — multiple TimelineRows
+            ' for the same player collapse to one query.
+            ' Explicit named-tuple syntax (`:=`) on the Select
+            ' projection so element names survive the Distinct/
+            ' ToList chain regardless of how aggressive VB.NET's
+            ' tuple-element-name inference is in any given build.
+            Dim uniquePairs = rowsNeedingFallback.
+                Select(Function(t) (SessionIdentity:=t.SessionIdentity, PlatformUserId:=t.PlatformUserId)).
+                Distinct().ToList()
+
+            Dim displayNameMap As New Dictionary(Of String, String)(StringComparer.Ordinal)
+            For Each pair In uniquePairs
+                Dim sid = pair.SessionIdentity
+                Dim pid = pair.PlatformUserId
+                Dim displayName = db.ChatMessages.
+                    Where(Function(c) c.SessionIdentity = sid AndAlso
+                                        c.PlatformUserId = pid AndAlso
+                                        c.DisplayName IsNot Nothing).
+                    OrderByDescending(Function(c) c.TimestampUtc).
+                    Select(Function(c) c.DisplayName).
+                    FirstOrDefault()
+                If Not String.IsNullOrEmpty(displayName) Then
+                    displayNameMap(sid & "|" & pid) = displayName
+                End If
+            Next
+
+            For Each tup In rowsNeedingFallback
+                Dim key = tup.SessionIdentity & "|" & tup.PlatformUserId
+                Dim resolved As String = Nothing
+                If displayNameMap.TryGetValue(key, resolved) AndAlso
+                   Not String.IsNullOrEmpty(resolved) Then
+                    tup.Row.PlayerName = resolved
+                End If
+            Next
+        End Sub
 
         ' ============================================================
         '  Snapshot (presence-at-instant) query
@@ -401,6 +870,8 @@ Namespace GSM.Manager.Core
             If filter Is Nothing Then Return New List(Of SnapshotRow)
 
             Dim instant = filter.StartUtc
+            Dim tileNames As Dictionary(Of String, String) = Nothing
+            Dim result As New List(Of SnapshotRow)
 
             Using scope = _serviceProvider.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
@@ -423,12 +894,16 @@ Namespace GSM.Manager.Core
                 token.ThrowIfCancellationRequested()
 
                 ' Replay. Key: (session, name) so multiple realms
-                ' don't collapse the same name across tiles.
-                Dim present As New Dictionary(Of String, (SessionIdentity As String, PlayerName As String, JoinedUtc As DateTime))
+                ' don't collapse the same name across tiles. The
+                ' tuple now also carries InstanceId so the snapshot
+                ' row's SourceLabel can resolve through the same
+                ' plugin dispatch the timeline uses.
+                Dim present As _
+                    New Dictionary(Of String, (SessionIdentity As String, PlayerName As String, JoinedUtc As DateTime, InstanceId As String))
                 For Each ev In events
                     Dim key = ev.SessionIdentity & "|" & ev.PlayerName
                     If ev.EventKind = "join" Then
-                        present(key) = (ev.SessionIdentity, ev.PlayerName, ev.TimestampUtc)
+                        present(key) = (ev.SessionIdentity, ev.PlayerName, ev.TimestampUtc, ev.InstanceId)
                     ElseIf ev.EventKind = "leave" Then
                         present.Remove(key)
                     End If
@@ -436,19 +911,18 @@ Namespace GSM.Manager.Core
 
                 If present.Count = 0 Then Return New List(Of SnapshotRow)
 
-                Dim tileNames = LoadTileNameMap(db, filter.SessionIdentity)
+                tileNames = LoadTileNameMap(db, filter.SessionIdentity)
 
                 ' For each present player, fetch the most recent
                 ' chat message at-or-before the instant. One query
                 ' per player is fine at the sizes we expect
                 ' (presence count is bounded by active players).
-                Dim result As New List(Of SnapshotRow)(present.Count)
                 For Each kvp In present
                     token.ThrowIfCancellationRequested()
                     Dim info = kvp.Value
                     Dim lastChat = db.ChatMessages.
                         Where(Function(c) c.SessionIdentity = info.SessionIdentity AndAlso
-                                           c.PlayerName = info.PlayerName AndAlso
+                                           c.DisplayName = info.PlayerName AndAlso
                                            c.TimestampUtc <= instant).
                         OrderByDescending(Function(c) c.TimestampUtc).
                         FirstOrDefault()
@@ -458,16 +932,32 @@ Namespace GSM.Manager.Core
                         .JoinedAtUtc = info.JoinedUtc,
                         .SessionIdentity = info.SessionIdentity,
                         .TileDisplayName = ResolveDisplayName(tileNames, info.SessionIdentity),
+                        .InstanceId = info.InstanceId,
                         .LastChatText = If(lastChat IsNot Nothing, lastChat.Text, Nothing),
                         .LastChatTimeUtc = If(lastChat IsNot Nothing,
                                               CType(lastChat.TimestampUtc, DateTime?),
                                               Nothing)
                     })
                 Next
-
-                Return result.OrderBy(Function(r) r.PlayerName,
-                                       StringComparer.OrdinalIgnoreCase).ToList()
             End Using
+
+            ' Phase 5h-6 — resolve plugin-formatted SourceLabel
+            ' in a follow-up pass. Same shape as the timeline
+            ' path: load instance contexts once for all distinct
+            ' InstanceIds, then dispatch per row.
+            Dim distinctInstanceIds = result.
+                Where(Function(r) Not String.IsNullOrEmpty(r.InstanceId)).
+                Select(Function(r) r.InstanceId).
+                Distinct().ToList()
+            Dim instanceContexts = LoadResolvedInstances(distinctInstanceIds)
+            Dim registry = _serviceProvider.GetService(Of PluginRegistry)()
+            For Each r In result
+                r.SourceLabel = ResolveSourceLabel(r.SessionIdentity, r.InstanceId,
+                                                     instanceContexts, tileNames, registry)
+            Next
+
+            Return result.OrderBy(Function(r) r.PlayerName,
+                                   StringComparer.OrdinalIgnoreCase).ToList()
         End Function
 
         ' ============================================================
@@ -503,25 +993,42 @@ Namespace GSM.Manager.Core
         End Function
 
         ''' <summary>
-        ''' Turn a raw session identity + optional tile name into
-        ''' a display string. Last Oasis: "Forested Wetlands — realm 281474…".
-        ''' Factorio or anything else without a resolvable tile name:
-        ''' shows the identity as-is. Nothing in → empty string out.
+        ''' Turn a raw session identity + optional tile name +
+        ''' optional realm DisplayName into a display string.
+        ''' Last Oasis: "Forested Wetlands — Site's World" when
+        ''' realmDisplayName is provided (Phase 5h-6, from the
+        ''' linked SharedConfigGroup), or "Forested Wetlands —
+        ''' realm 281474…" when it isn't (the legacy fallback to
+        ''' the realm_id substring). Factorio or anything else
+        ''' without a resolvable tile name: shows the identity
+        ''' as-is. Nothing in → empty string out.
         ''' </summary>
         Public Shared Function FormatSessionLabel(sessionIdentity As String,
-                                                   tileName As String) As String
+                                                   tileName As String,
+                                                   Optional realmDisplayName As String = Nothing) As String
             If String.IsNullOrEmpty(sessionIdentity) Then Return ""
 
             ' Last Oasis format is "lastoasis:{realm_id}:{tile_id}".
             If sessionIdentity.StartsWith("lastoasis:", StringComparison.Ordinal) Then
                 Dim parts = sessionIdentity.Split(":"c)
                 If parts.Length >= 3 Then
-                    Dim realmId = parts(1)
-                    Dim realmShort = If(realmId.Length > 8, realmId.Substring(0, 8) & "…", realmId)
-                    If Not String.IsNullOrEmpty(tileName) Then
-                        Return $"{tileName} — realm {realmShort}"
+                    ' Realm segment: prefer the user-set realm name
+                    ' over the truncated numeric realm_id. Both end
+                    ' up bare-text without a "realm" prefix when the
+                    ' DisplayName is set — the friendly name is the
+                    ' realm, no qualifier needed.
+                    Dim realmSegment As String
+                    If Not String.IsNullOrEmpty(realmDisplayName) Then
+                        realmSegment = realmDisplayName
+                    Else
+                        Dim realmId = parts(1)
+                        Dim realmShort = If(realmId.Length > 8, realmId.Substring(0, 8) & "…", realmId)
+                        realmSegment = "realm " & realmShort
                     End If
-                    Return $"Tile {parts(2)} — realm {realmShort}"
+                    If Not String.IsNullOrEmpty(tileName) Then
+                        Return $"{tileName} — {realmSegment}"
+                    End If
+                    Return $"Tile {parts(2)} — {realmSegment}"
                 End If
             End If
 

@@ -361,9 +361,4 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
-/Phase4c_Plan.md
-/Phase5d_Plan.md
-/Phase5e_Plan.md
-/PowerGSM_Reference.md
-/Phase5f_Plan.md
 /CHANGELOG.pdf
