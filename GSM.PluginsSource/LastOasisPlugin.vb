@@ -842,9 +842,9 @@ Public Class LastOasisPlugin
                 .Pattern = "LogPersistence: .*Persisting " & gDisplayName & ".+?), UniqueNetId = " & gPlatform & "\w+):" & gPlatformUserId & "\d+)"
             },
             New LogParseRule With {
-                .Name = "Player Disconnect (control channel close or NetConnection close)",
+                .Name = "Player Disconnect (NetConnection close)",
                 .Kind = ParsedEventKind.PlayerLeave,
-                .Pattern = "LogNet: U(?:Channel::Close:.*?ChIndex == 0|NetConnection::Close).*?RemoteAddr: " & gRemoteAddress & "[0-9.]+:\d+),"
+                .Pattern = "LogNet: UNetConnection::Close.*?RemoteAddr: " & gRemoteAddress & "[0-9.]+:\d+),"
             },
             New LogParseRule With {
                 .Name = "Chat Message",
@@ -1093,18 +1093,29 @@ Public Class LastOasisLogParser
         End If
 
         ' ----- Player leave -----
-        If text.Contains("LogNet: UChannel::Close:") OrElse
-           text.Contains("LogNet: UNetConnection::Close") Then
+        '
+        ' Match ONLY UNetConnection::Close, NOT UChannel::Close.
+        ' UE4 emits UNetConnection::Close exactly ONCE per disconnect
+        ' (the high-level connection close), then iterates the
+        ' connection's open channels and emits UChannel::Close for
+        ' each. If we matched both shapes, the UChannel::Close lines
+        ' that follow UNetConnection::Close would fail the IP->name
+        ' lookup below (the dict entry was just removed) and emit a
+        ' nameless leave, which InstanceManager's "exactly one player
+        ' online means it was that player" heuristic would then
+        ' misattribute to an unrelated player still on the tile.
+        ' UNetConnection::Close is the canonical disconnect signal
+        ' and carries the RemoteAddr we need — using it alone gives
+        ' exactly one named leave per real disconnect, no nameless
+        ' tail.
+        If text.Contains("LogNet: UNetConnection::Close") Then
 
             Dim addr = ExtractRemoteAddr(text)
             Dim resolvedName As String = Nothing
 
             If Not String.IsNullOrEmpty(addr) Then
                 _connectionsByAddr.TryGetValue(addr, resolvedName)
-
-                If text.Contains("LogNet: UNetConnection::Close") Then
-                    _connectionsByAddr.Remove(addr)
-                End If
+                _connectionsByAddr.Remove(addr)
             End If
 
             Dim info As PlayerInfo = Nothing

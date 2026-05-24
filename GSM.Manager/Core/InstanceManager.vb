@@ -102,26 +102,42 @@ Namespace GSM.Manager.Core
         ' Manager-side player tracking for notification dedup.
         '
         ' The log stream produces join/leave verdicts via the game
-        ' plugin's ILogParser, but that output is noisy for two reasons:
-        '   1. UE4 fires BOTH UChannel::Close AND UNetConnection::Close
-        '      on a real disconnect, and the LastOasis parser matches
-        '      either one. Net result: two "player left" events per
-        '      actual leave.
-        '   2. UE4 also fires those same log lines for server-internal
-        '      channels (EOS auth, backend telemetry) that aren't
-        '      player connections at all, so we get spurious leaves
+        ' plugin's ILogParser. Three sources of noise to filter:
+        '   1. Plugins may emit nameless leaves when their IP->name
+        '      binding has been lost (e.g. Manager reconnected mid-
+        '      session and missed the original Join). These need to
+        '      attach to *some* tracked session to be persisted
+        '      meaningfully — hence the "one player online means it
+        '      was that player" heuristic, debounced via
+        '      EmptyLeaveCooldownMs to avoid attributing a burst of
+        '      nameless leaves to the same player repeatedly.
+        '   2. UE4 also fires connection-close log lines for server-
+        '      internal channels (EOS auth, backend telemetry) that
+        '      aren't player connections at all. Plugins that match
+        '      broadly enough to catch those produce spurious leaves
         '      with no matching join.
+        '   3. When a log stream reconnects or the node's ring buffer
+        '      replays a tail, previously-seen join/leave lines come
+        '      through the parser again and would refire notifications.
         '
-        ' On top of that, when a log stream reconnects or the node's
-        ' ring buffer replays a tail, previously-seen join/leave lines
-        ' come through the parser again and would refire notifications.
+        ' We solve all three by gating notifications on an actual
+        ' state transition: only emit PlayerJoined if the name wasn't
+        ' already in the active set, only emit PlayerLeft if the name
+        ' was in the set. Nameless leaves fall back to the
+        ' single-player-attribution heuristic above.
         '
-        ' We solve all three by gating notifications on an actual state
-        ' transition: only emit PlayerJoined if the name wasn't already
-        ' in the active set, only emit PlayerLeft if the name was in
-        ' the set. Nameless leaves (UE4's typical case) fall back to a
-        ' debounce + "one player online means it was that player"
-        ' heuristic.
+        ' Plugin-side note: LO previously matched both UChannel::Close
+        ' AND UNetConnection::Close on a real disconnect, producing
+        ' two leave events per actual leave. The second was usually
+        ' nameless (UNetConnection::Close cleared the IP->name dict
+        ' first, the subsequent UChannel::Close failed name lookup)
+        ' and the single-player heuristic would misattribute it to an
+        ' unrelated player still on the tile — a real false-positive
+        ' bug. The LO parser now matches UNetConnection::Close only,
+        ' which eliminates both the duplication and the misattribution
+        ' for that plugin. The heuristic remains for the manager-
+        ' reconnect case (case 1 above) and for plugins that may
+        ' produce nameless leaves by other means.
         ' ----------------------------------------------------------------
         Private ReadOnly _activePlayers As _
             New ConcurrentDictionary(Of String, HashSet(Of String))

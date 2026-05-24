@@ -64,7 +64,6 @@ Imports GSM.Plugin
 '                           operators who prefer setting it
 '                           there. Configuration tab launch arg
 '                           wins at runtime.
-'    AdminPassword       — required for in-game admin + RCON karma
 '    Port                — game UDP, default 7777
 '    QueryPort           — Steam query UDP, default 27015
 '    RconPort            — RCON TCP, default 25575 (via InstanceConfig)
@@ -89,6 +88,22 @@ Imports GSM.Plugin
 '    fails earlier). The plugin therefore exposes ServerPassword
 '    only via the Engine.ini structured editor (Network tab),
 '    where it lives in the file Conan actually reads.
+'
+'  Where AdminPassword goes (NOT a Configuration-tab field):
+'    Conan reads AdminPassword from ServerSettings.ini's
+'    [ServerSettings] AdminPassword. Older versions of this
+'    plugin exposed it as an instance-level Configuration-tab
+'    field that got appended to the launch URL as
+'    ?AdminPassword=X; that worked at spawn time but split the
+'    canonical INI value from PowerGSM's stored value, creating
+'    two places to keep in sync (and a footgun if an operator
+'    edited the INI directly and then re-saved the instance
+'    config). Surfaced now via the Server Settings tab
+'    (ServerSettings.ini structured editor) where Conan
+'    natively stores it. Operators upgrading from a plugin
+'    version that had AdminPassword on the Configuration tab
+'    need to re-enter the password in the Server Settings tab;
+'    the legacy value in ConfigJson is ignored on launch.
 ' ============================================================
 
 Public Class ConanExilesPlugin
@@ -295,11 +310,13 @@ Public Class ConanExilesPlugin
         ' to set it. See the file-header comment for the full
         ' rationale.
 
-        Dim adminPassword = GetField(config.CustomFields, "AdminPassword")
-        If Not String.IsNullOrEmpty(adminPassword) Then
-            url.Append("?AdminPassword=")
-            url.Append(EscapeUrlValue(adminPassword))
-        End If
+        ' AdminPassword used to be appended here as ?AdminPassword=X
+        ' on the launch URL. It now lives in ServerSettings.ini's
+        ' [ServerSettings] AdminPassword and is set via the Server
+        ' Settings file editor tab. Conan reads it from the INI at
+        ' startup; no launch-URL plumbing needed. See the file-
+        ' header "Where AdminPassword goes" comment for the
+        ' rationale.
 
         Dim multihome = GetField(config.CustomFields, "Multihome")
         If Not String.IsNullOrEmpty(multihome) Then
@@ -351,20 +368,14 @@ Public Class ConanExilesPlugin
     End Function
 
     Public Function ValidateConfig(config As InstanceConfig) As IReadOnlyList(Of String) Implements IGamePlugin.ValidateConfig
-        Dim errors As New List(Of String)
-
-        ' AdminPassword is what the user types in-game to claim
-        ' admin status (the "Make Me Admin" button). Without it
-        ' there's no way to access the in-game admin panel and
-        ' RCON karma can't be raised above 0, which kills RCON
-        ' too. Surface as a warning so the user can still launch
-        ' an experimental server without one but knows what they
-        ' lose.
-        If String.IsNullOrWhiteSpace(GetField(config.CustomFields, "AdminPassword")) Then
-            errors.Add("AdminPassword is blank. Without it you can't claim admin in-game and RCON karma can't be raised — set one before launch.")
-        End If
-
-        Return errors
+        ' No instance-level validation currently. The AdminPassword
+        ' check that lived here through Phase 5g-2 moved with the
+        ' field to ServerSettings.ini — the file-editor schema's
+        ' IsRequired flag covers that surface now. Function kept as
+        ' a no-op stub because IGamePlugin requires the
+        ' implementation; future instance-level validations land
+        ' here if any arise.
+        Return New List(Of String)
     End Function
 
     ' ============================================================
@@ -402,14 +413,6 @@ Public Class ConanExilesPlugin
                 .Description = "Appears in the in-game server browser. Avoid special characters that need URL escaping — engine parses this off the launch URL. (Also exposed on the Network (Engine.ini) tab for operators who prefer setting it there; the launch URL wins at runtime.)",
                 .FieldType = ConfigFieldType.Text,
                 .DefaultValue = "PowerGSM Conan Server"
-            },
-            New ConfigFieldDescriptor With {
-                .Key = "AdminPassword",
-                .Label = "Admin Password",
-                .Description = "Type this in-game (Settings → Server Settings → Make Me Admin) to grant admin rights. Also required for RCON karma to function. Should differ from the ServerPassword set on the Network (Engine.ini) tab.",
-                .FieldType = ConfigFieldType.Password,
-                .IsSensitive = True,
-                .IsRequired = True
             },
             New ConfigFieldDescriptor With {
                 .Key = "MaxPlayers",
@@ -956,13 +959,11 @@ Public Class ConanExilesPlugin
     '    worse than the raw file.
     '
     '  Fields NOT in the ServerSettings schema:
-    '    - ServerName / AdminPassword. These come from the
-    '      launch-URL command line via the Configuration tab,
-    '      which is the source of truth for them. ServerName
-    '      ALSO appears on the Network (Engine.ini) tab so
-    '      operators have the choice; AdminPassword is
-    '      Configuration-only because Conan reads it from the
-    '      URL exclusively.
+    '    - ServerName. Comes from the launch-URL command line
+    '      via the Configuration tab, which is the source of
+    '      truth. ServerName ALSO appears on the Network
+    '      (Engine.ini) tab so operators have the choice; the
+    '      Configuration tab value wins at runtime.
     '    - The 80-odd other ServerSettings.ini fields a power
     '      user might want. They round-trip verbatim through
     '      WriteValuesToFile's preserve-existing-text behaviour,
@@ -1104,6 +1105,14 @@ Public Class ConanExilesPlugin
         ' SchemaFormBuilder doesn't render headers (per
         ' Factorio's matching note).
         Return New ConfigFieldDescriptor() {
+            New ConfigFieldDescriptor With {
+                .Key = "AdminPassword",
+                .Label = "Admin password",
+                .Description = "[Identity] Type this in-game (Settings → Server Settings → Make Me Admin) to grant admin rights. Also required for RCON karma to function above 0 — without it RCON is effectively non-functional. Different from the connect-time ServerPassword on the Engine.ini (Network) tab.",
+                .FieldType = ConfigFieldType.Password,
+                .IsSensitive = True,
+                .IsRequired = True
+            },
             New ConfigFieldDescriptor With {
                 .Key = "ServerCommunity",
                 .Label = "Server community",

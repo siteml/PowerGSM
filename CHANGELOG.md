@@ -9,6 +9,54 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Last Oasis: false-positive player Leave events in History
+  when another player on the same tile disconnected.** When
+  player A disconnected, UE4 emitted a `UNetConnection::Close`
+  log line followed by one or more `UChannel::Close` lines for
+  the same connection. The LO parser matched both shapes,
+  producing two leave events per real disconnect. The first
+  resolved player A's name correctly (and cleared the IP-to-name
+  dict entry); the second failed the lookup (entry just
+  removed) and emitted a nameless leave. InstanceManager's
+  "exactly one player online means it was that player"
+  nameless-leave heuristic then misattributed the second leave
+  to whichever player was still on the tile. Net symptom: when
+  someone disconnected from a two-player tile, the History
+  window logged BOTH the real leaver AND the remaining player
+  as having left at the same timestamp, even though the
+  remaining player was still on the server (visible in the
+  InstancePanel with their original JoinedAt preserved). The LO
+  parser now matches `UNetConnection::Close` only, which fires
+  exactly once per disconnect and reliably resolves the
+  leaver's name. The InstanceManager heuristic is preserved as
+  a defensive fallback for the manager-reconnect-mid-session
+  case and for plugins that may produce nameless leaves by
+  other means.
+
+### Changed
+
+- **Conan Exiles: AdminPassword moved from the Configuration
+  tab to the Server Settings (ServerSettings.ini) file editor.**
+  Conan reads `AdminPassword` natively from
+  `ServerSettings.ini`'s `[ServerSettings]` section. Older
+  versions of the plugin appended it to the launch URL as
+  `?AdminPassword=X` and stored it as an instance-level
+  config field, which worked at spawn time but split the
+  canonical INI value from PowerGSM's stored value — a
+  footgun if an operator edited the INI directly and then
+  re-saved the instance config. Now surfaced via the Server
+  Settings tab where Conan natively stores it.
+
+  **Migration for existing Conan operators:** the legacy
+  value in your instance ConfigJson is ignored on launch. Open
+  the Server Settings tab for each Conan instance and set
+  AdminPassword there (top of the Identity cluster). Without
+  it, in-game admin claim won't work and RCON karma can't
+  rise above 0 — same critical-field semantics as before,
+  just a different home in the UI.
+
 ## [0.3.0] - 2026-05-22
 
 ### Changed
