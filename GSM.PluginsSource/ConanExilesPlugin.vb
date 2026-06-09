@@ -1,3 +1,4 @@
+' <plugin id="conanexiles" name="Conan Exiles Dedicated Server" version="1.0.0" author="siteml" requiresContracts="1">
 ' <RequiresContracts: 1>
 Imports System
 Imports System.Collections.Generic

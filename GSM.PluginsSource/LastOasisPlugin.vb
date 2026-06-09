@@ -1,3 +1,4 @@
+' <plugin id="lastoasis" name="Last Oasis Dedicated Server" version="1.0.0" author="siteml" requiresContracts="1">
 ' <RequiresContracts: 1>
 Imports System
 Imports System.Collections.Generic
@@ -11,7 +12,14 @@ Imports GSM.Plugin
 '  AppID: 920720 (free dedicated server)
 '  Engine: Unreal Engine 4
 '  Install: SteamCMD only
-'  RCON: Source RCON protocol
+'  RCON: Not supported — Last Oasis does not expose a Source
+'         RCON listener (or any other admin protocol over the
+'         network). In-game admin commands go through the chat
+'         system with the -EnableCheats flag instead. PowerGSM
+'         used to expose RconPort / RconPassword fields and
+'         pass -RconPort= / -RconPassword= to the binary; both
+'         were silently ignored by MistServer and removed in
+'         Phase 5j-ish cleanup.
 '  Mods: None (client-side only)
 '
 '  Key config fields (realm-level, since Phase 5h — stored on
@@ -34,8 +42,6 @@ Imports GSM.Plugin
 '    Identifier   — unique per instance on this realm
 '    Port         — game port (UDP), default 5555
 '    QueryPort    — Steam query port, default 27015
-'    RconPort     — RCON port, default 8081
-'    RconPassword — RCON password (blank = disabled)
 '    Slots        — tile slot count, default 5
 '    OverrideConnectionAddress — external IP override
 ' ============================================================
@@ -304,12 +310,20 @@ Public Class LastOasisPlugin
         args.Add($"-port={port}")
         args.Add($"-QueryPort={queryPort}")
 
-        ' RCON
-        If Not String.IsNullOrEmpty(config.RconPassword) Then
-            Dim rconPort = If(config.RconPort, 8081)
-            args.Add($"-RconPort={rconPort}")
-            args.Add($"-RconPassword={config.RconPassword}")
-        End If
+        ' RCON: Last Oasis doesn't support RCON — see header
+        ' comment for the why. No -RconPort= / -RconPassword=
+        ' args added to the command line; the binary ignores
+        ' those switches in any case. The InstanceManager may
+        ' still propagate stale RconPort / RconPassword values
+        ' from legacy ConfigJson into the Node's spawn request
+        ' (its resolve block reads customFields unconditionally),
+        ' but with no listener on the game side those values are
+        ' dead-letter — any Manager-initiated SendRconCommand
+        ' would just fail to connect. A future cleanup could gate
+        ' the InstanceManager RCON-resolve block on
+        ' GetRconProtocol().HasValue so even the spawn request
+        ' stays clean, but that's a wider change than the
+        ' user-facing schema cleanup here.
 
         ' Slots
         Dim slots = GetFieldInt(config.CustomFields, "Slots", 5)
@@ -473,22 +487,6 @@ Public Class LastOasisPlugin
                 .MinValue = 1024,
                 .MaxValue = 65535,
                 .IsPort = True
-            },
-            New ConfigFieldDescriptor With {
-                .Key = "RconPort",
-                .Label = "RCON Port",
-                .FieldType = ConfigFieldType.IntegerField,
-                .DefaultValue = "8081",
-                .MinValue = 1024,
-                .MaxValue = 65535,
-                .IsPort = True
-            },
-            New ConfigFieldDescriptor With {
-                .Key = "RconPassword",
-                .Label = "RCON Password",
-                .Description = "Leave blank to disable RCON.",
-                .FieldType = ConfigFieldType.Password,
-                .IsSensitive = True
             },
             New ConfigFieldDescriptor With {
                 .Key = "Slots",
@@ -847,6 +845,11 @@ Public Class LastOasisPlugin
                 .Pattern = "LogNet: UNetConnection::Close.*?RemoteAddr: " & gRemoteAddress & "[0-9.]+:\d+),"
             },
             New LogParseRule With {
+                .Name = "Player Disconnect (UChannel control-channel close — idle kick / server-initiated)",
+                .Kind = ParsedEventKind.PlayerLeave,
+                .Pattern = "LogNet: UChannel::Close: Sending CloseBunch\. ChIndex == 0\..*?RemoteAddr: " & gRemoteAddress & "[0-9.]+:\d+),"
+            },
+            New LogParseRule With {
                 .Name = "Chat Message",
                 .Kind = ParsedEventKind.ChatMessage,
                 .Pattern = "LogGame: Chat message from " & gDisplayName & "[^:]+): " & gMessage & ".+)$"
@@ -881,10 +884,24 @@ Public Class LastOasisPlugin
 
     ' ============================================================
     '  RCON
+    '
+    '  Last Oasis doesn't have one. Returning Nothing here
+    '  flows into two places: (1) the InstanceManager's
+    '  start-time block that resolves rconProtocol /
+    '  rconPassword from the merged CustomFields skips the
+    '  resolve when GetRconProtocol returns no value, so no
+    '  RCON-related fields get pushed to the Node; (2) the
+    '  InstancePanel's PopulateConfigTab and the Edit Instance
+    '  form both filter the RconPort/RconPassword schema fields
+    '  out when GetRconProtocol returns no value, so the
+    '  Configuration tab no longer shows them either. The
+    '  schema itself no longer declares those fields (see
+    '  GetInstanceConfigSchema above), so even on a plugin
+    '  reload after this change the UI stays consistent.
     ' ============================================================
 
     Public Function GetRconProtocol() As RconProtocol? Implements IGamePlugin.GetRconProtocol
-        Return RconProtocol.SourceRcon
+        Return Nothing
     End Function
 
     ' ============================================================
@@ -924,7 +941,7 @@ End Class
 ' ============================================================
 
 Public Class LastOasisLogParser
-    Implements ILogParser
+    Implements ILogParser, IConnectionBindingAware
 
     Public ReadOnly Property GameId As String = "lastoasis" Implements ILogParser.GameId
 
@@ -938,19 +955,48 @@ Public Class LastOasisLogParser
     ' connection's RemoteAddr (from NotifyAcceptedConnection) and
     ' binding it to the next player name we see in Join succeeded.
     '
-    ' State is per-parser-instance, which means per-GSM-instance —
-    ' PluginRegistry.CreateParser is called once per instance. The
-    ' parser runs inside the log-stream callback, which is
+    ' The parser runs inside the log-stream callback, which is
     ' single-threaded per instance, so no locking is needed.
     '
-    ' If the manager reconnects mid-session we lose our bindings and
-    ' the first close after reconnect will have no name — the
-    ' InstanceManager's HandlePlayerLeave handles that case with the
-    ' nameless-leave heuristic, so nothing gets stuck.
+    ' The binding store (_connectionsByAddr) is the Manager-owned,
+    ' per-instance dictionary injected via IConnectionBindingAware,
+    ' so it PERSISTS across mid-session log-stream reconnects even
+    ' though the parser object itself is recreated. That's what lets
+    ' a close arriving after a reconnect still resolve its name —
+    ' including a UChannel::Close-only timeout/kick, which the leave
+    ' path drops entirely when it can't resolve a name. (Before this
+    ' was externalised, a reconnect wiped the bindings and only clean
+    ' UNetConnection::Close disconnects survived — via InstanceManager's
+    ' nameless-leave heuristic; UChannel-only closes were silently
+    ' lost, leaving the session open in history.) _pendingRemoteAddr
+    ' stays per-parser and transient: losing it across a reconnect
+    ' only affects a connection caught mid-handshake, which self-heals
+    ' on the next close.
     ' ------------------------------------------------------------
 
     Private _pendingRemoteAddr As String = Nothing
-    Private ReadOnly _connectionsByAddr As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+    ' RemoteAddr -> player-name bindings, bound at "Join succeeded"
+    ' and consumed on the close line. Externalised behind
+    ' IConnectionBindingAware so the Manager hands us the SAME
+    ' dictionary across stream reconnects — a recreated parser would
+    ' otherwise start empty and drop the next close (notably a
+    ' UChannel::Close-only timeout, which we no-match when we can't
+    ' resolve a name) as a never-recorded leave. Defaults to a
+    ' private dict for standalone use; the Manager overwrites it via
+    ' the ConnectionBindings setter before the first line is parsed.
+    Private _connectionsByAddr As IDictionary(Of String, String) =
+        New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+    Public Property ConnectionBindings As IDictionary(Of String, String) _
+        Implements IConnectionBindingAware.ConnectionBindings
+        Get
+            Return _connectionsByAddr
+        End Get
+        Set(value As IDictionary(Of String, String))
+            If value IsNot Nothing Then _connectionsByAddr = value
+        End Set
+    End Property
 
     Private Shared ReadOnly _remoteAddrRegex As New Regex(
         "RemoteAddr:\s*([^\s,]+)",
@@ -1094,20 +1140,40 @@ Public Class LastOasisLogParser
 
         ' ----- Player leave -----
         '
-        ' Match ONLY UNetConnection::Close, NOT UChannel::Close.
-        ' UE4 emits UNetConnection::Close exactly ONCE per disconnect
-        ' (the high-level connection close), then iterates the
-        ' connection's open channels and emits UChannel::Close for
-        ' each. If we matched both shapes, the UChannel::Close lines
-        ' that follow UNetConnection::Close would fail the IP->name
-        ' lookup below (the dict entry was just removed) and emit a
-        ' nameless leave, which InstanceManager's "exactly one player
-        ' online means it was that player" heuristic would then
-        ' misattribute to an unrelated player still on the tile.
-        ' UNetConnection::Close is the canonical disconnect signal
-        ' and carries the RemoteAddr we need — using it alone gives
-        ' exactly one named leave per real disconnect, no nameless
-        ' tail.
+        ' Two flavours of disconnect emit different log shapes:
+        '
+        '   (1) Client-initiated disconnect (normal quit, alt-F4,
+        '       crash, network drop): UE4 fires
+        '         LogNet: UNetConnection::Close
+        '       once, then iterates the connection's open channels
+        '       and fires LogNet: UChannel::Close: Sending
+        '       CloseBunch... for each, INCLUDING the control
+        '       channel at ChIndex == 0. Total: one
+        '       UNetConnection::Close + many UChannel::Close.
+        '
+        '   (2) Server-initiated kick (idle kick, manual kick, ban):
+        '       UE4 destroys the PlayerController via KickPlayer,
+        '       which closes the control channel directly via
+        '         LogNet: UChannel::Close: Sending CloseBunch.
+        '         ChIndex == 0. ...
+        '       and DOES NOT emit UNetConnection::Close at all.
+        '       The Steamworks session is already torn down so
+        '       UniqueId reads as "Steam:UNKNOWN" on this line.
+        '
+        ' To catch both flavours with exactly one named leave per
+        ' real disconnect, we match each pattern but dedup against
+        ' _connectionsByAddr: the FIRST match for a given remote
+        ' address removes the entry, so the second match (the
+        ' UChannel::Close after UNetConnection::Close in flavour 1)
+        ' finds no entry and is suppressed as NoMatch. In flavour
+        ' 2 only UChannel::Close fires, the entry is found, and
+        ' the leave is emitted normally.
+        '
+        ' Order of the two branches doesn't matter — either match
+        ' first wins, the other dedups itself out. Listing
+        ' UNetConnection::Close first because it's the more
+        ' common path and exits the function earlier on hit.
+
         If text.Contains("LogNet: UNetConnection::Close") Then
 
             Dim addr = ExtractRemoteAddr(text)
@@ -1129,6 +1195,47 @@ Public Class LastOasisLogParser
                               "Player disconnected",
                               $"Player left: {resolvedName}"),
                 .PlayerInfo = info
+            })
+        End If
+
+        ' Server-initiated kick path — idle kick, manual kick,
+        ' ban. ChIndex == 0 restricts us to the control channel
+        ' close (one per connection); without that restriction
+        ' every actor/voice channel close on a normal disconnect
+        ' would also flow through here. "Sending" (not
+        ' "Receiving") because the SERVER is initiating the close
+        ' — client-initiated closes still appear in flavour-1
+        ' UChannel::Close lines but those are already deduped
+        ' away by the entry removal in the UNetConnection::Close
+        ' branch above.
+        '
+        ' Dedup discipline: only emit if _connectionsByAddr has
+        ' an entry for this address. If not, either (a) flavour-1
+        ' already removed it (UNetConnection::Close fired first),
+        ' or (b) the parser was created mid-session and never
+        ' saw the corresponding Join — in both cases NoMatch is
+        ' safer than a nameless leave that InstanceManager's
+        ' "exactly one player online" heuristic might misattribute.
+        If text.Contains("LogNet: UChannel::Close: Sending CloseBunch. ChIndex == 0") Then
+
+            Dim addr = ExtractRemoteAddr(text)
+            If String.IsNullOrEmpty(addr) Then
+                Return ParsedLogEvent.NoMatch
+            End If
+
+            Dim resolvedName As String = Nothing
+            If Not _connectionsByAddr.TryGetValue(addr, resolvedName) Then
+                ' Either deduped (regular disconnect, UNetConnection::Close
+                ' branch above already handled it) or we don't have a
+                ' name binding to attach. Either way, drop.
+                Return ParsedLogEvent.NoMatch
+            End If
+            _connectionsByAddr.Remove(addr)
+
+            Return StampIdentity(New ParsedLogEvent With {
+                .EventType = LogEventType.PlayerLeave,
+                .Message = $"Player kicked or disconnected: {resolvedName}",
+                .PlayerInfo = New PlayerInfo With {.PlayerName = resolvedName}
             })
         End If
 
