@@ -1,0 +1,7 @@
+{
+  "ManagerPath": "GSM.Manager.exe",
+  "MaxRestartsInWindow": 5,
+  "WindowSeconds": 300,
+  "SafeModeAfterRapidCount": 2,
+  "SafeModeRapidWindowSeconds": 60
+}

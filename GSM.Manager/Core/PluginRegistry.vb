@@ -13,6 +13,7 @@ Imports Microsoft.Extensions.Logging
 Imports Basic.Reference.Assemblies
 Imports GSM.Node.Api
 Imports GSM.Plugin
+Imports GSM.Utility
 
 ' ============================================================
 '  PluginRegistry — Roslyn compilation + hot-reload
@@ -60,8 +61,25 @@ Namespace GSM.Manager.Core
     Public Class PluginRegistry
         Implements ILogParserCoordinator
 
+        ''' <summary>
+        ''' Phase 7-2 — raised at the end of every successful
+        ''' ReloadAll (including the startup load), AFTER the new
+        ''' plugin set is in place. Fired from inside the reload lock
+        ''' on the caller's thread — handlers must offload real work
+        ''' (UtilityPluginHost restarts its plugins via Task.Run).
+        ''' </summary>
+        Public Event Reloaded As EventHandler
+
         Private ReadOnly _plugins As New ConcurrentDictionary(Of String, IGamePlugin)
         Private ReadOnly _pluginStatuses As New ConcurrentDictionary(Of String, PluginLoadStatus)
+
+        ' Phase 7-1 — utility plugins (second plugin kind), keyed by
+        ' PluginId. Same lifecycle as game plugins: discovered per
+        ' file, hot-reloaded with the shared ALC, cleared on reload.
+        ' Manifests and declared contracts versions for utility
+        ' plugins live in the same per-id maps as game plugins — the
+        ' two id spaces are kept collision-free at load time.
+        Private ReadOnly _utilityPlugins As New ConcurrentDictionary(Of String, IUtilityPlugin)
 
         ' Phase 5f-3 — declared contracts version per loaded
         ' plugin, keyed by GameId. Populated when a plugin loads
@@ -72,6 +90,12 @@ Namespace GSM.Manager.Core
         ' show the declared version next to each loaded plugin
         ' so users can spot "Loaded but old" cases at a glance.
         Private ReadOnly _declaredContractsByGameId As New ConcurrentDictionary(Of String, Integer)
+
+        ' Phase 6-1 — parsed inline manifest per loaded GameId
+        ' (id/name/version/author/dependencies). Cleared on every reload
+        ' alongside _plugins. Drives the Plugin Status version/author/
+        ' source columns and 6-2+ update-tracking by version.
+        Private ReadOnly _manifestsByGameId As New ConcurrentDictionary(Of String, PluginManifest)
 
         Private ReadOnly _logger As ILogger(Of PluginRegistry)
         Private ReadOnly _pluginsDirectory As String
@@ -96,6 +120,17 @@ Namespace GSM.Manager.Core
         End Sub
 
         ''' <summary>
+        ''' The directory plugin .vb sources are loaded from. Exposed so
+        ''' the compatibility checker (Phase 5l-3) compiles exactly the
+        ''' files this registry loads.
+        ''' </summary>
+        Public ReadOnly Property PluginsDirectory As String
+            Get
+                Return _pluginsDirectory
+            End Get
+        End Property
+
+        ''' <summary>
         ''' Returns a plugin by GameId, or Nothing if not loaded.
         ''' </summary>
         Public Function GetPlugin(gameId As String) As IGamePlugin
@@ -109,6 +144,23 @@ Namespace GSM.Manager.Core
         ''' </summary>
         Public Function GetAllPlugins() As IReadOnlyList(Of IGamePlugin)
             Return _plugins.Values.ToList()
+        End Function
+
+        ''' <summary>
+        ''' Phase 7-1 — returns a utility plugin by PluginId, or
+        ''' Nothing if not loaded.
+        ''' </summary>
+        Public Function GetUtilityPlugin(pluginId As String) As IUtilityPlugin
+            Dim result As IUtilityPlugin = Nothing
+            _utilityPlugins.TryGetValue(pluginId, result)
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Phase 7-1 — returns all currently loaded utility plugins.
+        ''' </summary>
+        Public Function GetUtilityPlugins() As IReadOnlyList(Of IUtilityPlugin)
+            Return _utilityPlugins.Values.ToList()
         End Function
 
         ''' <summary>
@@ -139,6 +191,18 @@ Namespace GSM.Manager.Core
             Dim result As Integer
             If _declaredContractsByGameId.TryGetValue(gameId, result) Then Return result
             Return Nothing
+        End Function
+
+        ''' <summary>
+        ''' Phase 6-1 — the parsed inline manifest for a loaded plugin,
+        ''' or Nothing if the plugin isn't loaded. A legacy/local plugin
+        ''' returns a manifest with HasPluginBlock = False.
+        ''' </summary>
+        Public Function GetManifest(gameId As String) As PluginManifest
+            If String.IsNullOrEmpty(gameId) Then Return Nothing
+            Dim result As PluginManifest = Nothing
+            _manifestsByGameId.TryGetValue(gameId, result)
+            Return result
         End Function
 
         ''' <summary>
@@ -200,7 +264,9 @@ Namespace GSM.Manager.Core
             End If
             _plugins.Clear()
             _pluginStatuses.Clear()
+            _utilityPlugins.Clear()
             _declaredContractsByGameId.Clear()
+            _manifestsByGameId.Clear()
 
             ' Ensure plugins directory exists
             If Not Directory.Exists(_pluginsDirectory) Then
@@ -223,8 +289,12 @@ Namespace GSM.Manager.Core
             ' that way they all get unloaded together on the next reload.
             _loadContext = New AssemblyLoadContext("PluginContext", isCollectible:=True)
 
-            ' Gather references once (shared across per-file compilations)
+            ' Gather references once (shared across per-file compilations).
+            ' Plugins that declare capabilities but NOT network get a
+            ' network-stripped variant (7-3b) — computed lazily per file
+            ' below so the common case pays nothing.
             Dim references = GetMetadataReferences()
+            Dim networkStrippedReferences As List(Of MetadataReference) = Nothing
 
             Dim compilationOptions As New VisualBasicCompilationOptions(
                 OutputKind.DynamicallyLinkedLibrary,
@@ -250,6 +320,35 @@ Namespace GSM.Manager.Core
                     })
                     Continue For
                 End Try
+
+                ' Phase 6-1 — parse the inline manifest (id/name/version/
+                ' author/deps). Additive: the contracts-version
+                ' negotiation below keeps its own legacy parse for now.
+                Dim manifest = PluginManifestParser.Parse(sourceText)
+
+                ' Phase 7-3b — reference-set gating. A plugin that
+                ' declares capabilities (the `requires` attribute) but
+                ' NOT `network` compiles WITHOUT the System.Net.*
+                ' reference assemblies, so HttpClient/Socket/etc become
+                ' a compile error naming the missing capability instead
+                ' of silently-permitted runtime behaviour. This applies
+                ' ONLY to plugins that opted into the capability model:
+                ' game plugins (no `requires`) keep every reference, so
+                ' their legitimate network use is untouched. It's a
+                ' genuine compile-time gate for honest and lazy code;
+                ' a determined author can't be stopped by it (see
+                ' Phase7_Plan.md scoping note).
+                Dim fileReferences = references
+                Dim declaresCapabilities = manifest IsNot Nothing AndAlso
+                                           manifest.Requires IsNot Nothing AndAlso
+                                           manifest.Requires.Count > 0
+                If declaresCapabilities AndAlso
+                   Not manifest.Requires.Contains(UtilityCapabilities.Network) Then
+                    If networkStrippedReferences Is Nothing Then
+                        networkStrippedReferences = StripNetworkReferences(references)
+                    End If
+                    fileReferences = networkStrippedReferences
+                End If
 
                 ' Phase 5f-3 — contracts version negotiation.
                 ' Three outcomes from comparing the plugin's
@@ -323,7 +422,7 @@ Namespace GSM.Manager.Core
                 Dim compilation = VisualBasicCompilation.Create(
                     asmName,
                     {tree},
-                    references,
+                    fileReferences,
                     compilationOptions)
 
                 Using ms As New MemoryStream()
@@ -394,6 +493,7 @@ Namespace GSM.Manager.Core
                             ' instantiate, or were rejected as
                             ' DuplicateGameId.
                             _declaredContractsByGameId(gid) = effectiveDeclaredVersion
+                            _manifestsByGameId(gid) = manifest
 
                             If previousGameIds.Contains(gid) Then
                                 summary.UpdatedGameIds.Add(gid)
@@ -409,6 +509,81 @@ Namespace GSM.Manager.Core
                                 .Message = $"Failed to instantiate: {ex.Message}"
                             })
                             _pluginStatuses(pluginType.Name) = PluginLoadStatus.InterfaceMismatch
+                        End Try
+                    Next
+
+                    ' Phase 7-1 — find and instantiate IUtilityPlugin
+                    ' implementations. Two extra rules vs game plugins
+                    ' (Phase 7 Decision 3): a <plugin> manifest with id
+                    ' AND version is REQUIRED (utility plugins are new —
+                    ' no legacy leniency), and the runtime PluginId must
+                    ' match the manifest id. Ids share one keyspace with
+                    ' game plugins so cross-kind collisions are refused.
+                    For Each utilityType In pluginAssembly.GetTypes().
+                            Where(Function(t) Not t.IsAbstract AndAlso
+                                              Not t.IsInterface AndAlso
+                                              GetType(IUtilityPlugin).IsAssignableFrom(t))
+                        Try
+                            If manifest Is Nothing OrElse Not manifest.HasPluginBlock OrElse
+                               String.IsNullOrEmpty(manifest.Id) OrElse
+                               String.IsNullOrEmpty(manifest.Version) Then
+                                summary.CompilationErrors.Add(New PluginCompilationError With {
+                                    .FileName = fileName,
+                                    .Message = "Utility plugins require a ' <plugin id=""..."" version=""...""> manifest — skipped."
+                                })
+                                _pluginStatuses(utilityType.Name) = PluginLoadStatus.InterfaceMismatch
+                                Continue For
+                            End If
+
+                            Dim utilityInstance = DirectCast(Activator.CreateInstance(utilityType), IUtilityPlugin)
+                            Dim pid = utilityInstance.PluginId
+
+                            If String.IsNullOrEmpty(pid) OrElse
+                               Not String.Equals(pid, manifest.Id, StringComparison.OrdinalIgnoreCase) Then
+                                summary.CompilationErrors.Add(New PluginCompilationError With {
+                                    .FileName = fileName,
+                                    .Message = $"Utility plugin's PluginId '{pid}' doesn't match the manifest id '{manifest.Id}' — skipped."
+                                })
+                                _pluginStatuses(utilityType.Name) = PluginLoadStatus.InterfaceMismatch
+                                Continue For
+                            End If
+
+                            If _utilityPlugins.ContainsKey(pid) OrElse _plugins.ContainsKey(pid) Then
+                                summary.CompilationErrors.Add(New PluginCompilationError With {
+                                    .FileName = utilityType.Name,
+                                    .Message = $"Duplicate plugin id '{pid}' — skipping"
+                                })
+                                _pluginStatuses(utilityType.Name) = PluginLoadStatus.DuplicateGameId
+                                Continue For
+                            End If
+
+                            ' Phase 7-3 — unknown capability names are a
+                            ' WARNING (forward-compat with future
+                            ' capability sets), never a load error.
+                            If manifest.Requires IsNot Nothing Then
+                                For Each capName In manifest.Requires
+                                    If Not UtilityCapabilities.IsKnown(capName) Then
+                                        _logger.LogWarning(
+                                            "Utility plugin {Id} declares unknown capability '{Cap}' — ignored (this manager's contracts v{Version} doesn't know it)",
+                                            pid, capName, NodeApiContract.ContractsVersion)
+                                    End If
+                                Next
+                            End If
+
+                            _utilityPlugins(pid) = utilityInstance
+                            _pluginStatuses(utilityType.Name) = PluginLoadStatus.Loaded
+                            summary.LoadedPlugins.Add(pid)
+                            _declaredContractsByGameId(pid) = effectiveDeclaredVersion
+                            _manifestsByGameId(pid) = manifest
+
+                            _logger.LogInformation("Loaded utility plugin: {PluginId} ({Type})",
+                                                   pid, utilityType.Name)
+                        Catch ex As Exception
+                            summary.CompilationErrors.Add(New PluginCompilationError With {
+                                .FileName = utilityType.Name,
+                                .Message = $"Failed to instantiate utility plugin: {ex.Message}"
+                            })
+                            _pluginStatuses(utilityType.Name) = PluginLoadStatus.InterfaceMismatch
                         End Try
                     Next
                 End Using
@@ -428,6 +603,14 @@ Namespace GSM.Manager.Core
                 "Plugin reload complete: {Loaded} loaded, {Added} added, {Removed} removed, {Errors} errors",
                 summary.LoadedPlugins.Count, summary.AddedGameIds.Count,
                 summary.RemovedGameIds.Count, summary.CompilationErrors.Count)
+
+            ' Phase 7-2 — let subscribers (UtilityPluginHost) react to
+            ' the new plugin set. Never let a handler break the reload.
+            Try
+                RaiseEvent Reloaded(Me, EventArgs.Empty)
+            Catch ex As Exception
+                _logger.LogWarning(ex, "A Reloaded event handler threw")
+            End Try
 
             Return summary
         End Function
@@ -540,6 +723,42 @@ Namespace GSM.Manager.Core
             End Try
 
             Return refs
+        End Function
+
+        ''' <summary>
+        ''' Phase 7-3b — returns a copy of the reference set with the
+        ''' System.Net.* assemblies removed, so a plugin compiled
+        ''' against it cannot resolve HttpClient/Socket/etc. Used for
+        ''' capability-declaring plugins that didn't declare `network`.
+        '''
+        ''' Identification is by the reference's Display path/name
+        ''' (Basic.Reference.Assemblies names each embedded reference
+        ''' after its assembly, e.g. "System.Net.Http.dll"). We strip
+        ''' the System.Net.* family plus the sockets/primitives that
+        ''' carry the networking surface, and deliberately keep
+        ''' everything else (notably System.Private.CoreLib, which
+        ''' some networking types forward through but which stripping
+        ''' would break the entire BCL).
+        ''' </summary>
+        Private Shared Function StripNetworkReferences(
+                source As List(Of MetadataReference)) As List(Of MetadataReference)
+            Dim result As New List(Of MetadataReference)
+            For Each r In source
+                Dim display = If(r.Display, "")
+                Dim leaf = display
+                Dim slash = display.LastIndexOfAny(New Char() {"/"c, "\"c})
+                If slash >= 0 Then leaf = display.Substring(slash + 1)
+
+                ' Strip the networking assemblies by leaf name. Matches
+                ' "System.Net.dll", "System.Net.Http.dll",
+                ' "System.Net.Sockets.dll", "System.Net.Primitives.dll",
+                ' etc., without touching unrelated System.* assemblies.
+                If leaf.StartsWith("System.Net", StringComparison.OrdinalIgnoreCase) Then
+                    Continue For
+                End If
+                result.Add(r)
+            Next
+            Return result
         End Function
 
     End Class

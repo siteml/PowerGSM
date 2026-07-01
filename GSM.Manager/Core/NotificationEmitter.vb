@@ -2,6 +2,7 @@
 Imports System.Collections.Generic
 Imports System.Threading
 Imports System.Threading.Tasks
+Imports System.Linq
 Imports Microsoft.EntityFrameworkCore
 Imports Microsoft.Extensions.DependencyInjection
 Imports Microsoft.Extensions.Logging
@@ -175,6 +176,14 @@ Namespace GSM.Manager.Core
             Dim tokens As New NotificationTokens()
             tokens.CustomTokens = New Dictionary(Of String, String)
 
+            ' Scope fan-out (Phase 5n): collect every instance + set tag
+            ' this event pertains to. For instance-level events that's
+            ' the one instance; for installation-level events (updates)
+            ' it's all instances under the installation, so instance- and
+            ' set-scoped destinations still match.
+            Dim scopeInstanceIds As New List(Of String)
+            Dim scopeSetTags As New List(Of String)
+
             Using scope = _serviceProvider.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
 
@@ -187,6 +196,9 @@ Namespace GSM.Manager.Core
                         tokens.InstanceId = inst.InstanceId
                         tokens.InstanceName = inst.DisplayName
                         tokens.GameId = inst.GameId
+                        tokens.InstanceSetTag = If(inst.InstanceSetTag, "")
+                        scopeInstanceIds.Add(inst.InstanceId)
+                        If Not String.IsNullOrEmpty(inst.InstanceSetTag) Then scopeSetTags.Add(inst.InstanceSetTag)
                         If inst.Installation IsNot Nothing Then
                             tokens.InstallationId = inst.Installation.InstallationId
                             tokens.InstallationName = inst.Installation.DisplayName
@@ -236,6 +248,19 @@ Namespace GSM.Manager.Core
                             tokens.NodeId = install.Node.NodeId
                             tokens.NodeName = install.Node.DisplayName
                         End If
+
+                        ' Fan out the installation-level event across the
+                        ' instances it hosts, so instance- and set-scoped
+                        ' destinations match (e.g. an update on an install
+                        ' whose instances carry the targeted set tag).
+                        Dim related = Await db.Instances.
+                            Where(Function(i) i.InstallationId = installationId).
+                            Select(Function(i) New With {.Id = i.InstanceId, .Tag = i.InstanceSetTag}).
+                            ToListAsync()
+                        For Each r In related
+                            scopeInstanceIds.Add(r.Id)
+                            If Not String.IsNullOrEmpty(r.Tag) Then scopeSetTags.Add(r.Tag)
+                        Next
                     End If
                 End If
             End Using
@@ -253,7 +278,9 @@ Namespace GSM.Manager.Core
                 .Message = If(message, ""),
                 .Tokens = tokens,
                 .Metadata = New Dictionary(Of String, String),
-                .Timestamp = DateTime.UtcNow
+                .Timestamp = DateTime.UtcNow,
+                .ScopeInstanceIds = scopeInstanceIds,
+                .ScopeInstanceSetTags = scopeSetTags.Distinct().ToList()
             }
         End Function
 

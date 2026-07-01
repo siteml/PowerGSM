@@ -181,6 +181,39 @@ Namespace GSM.Manager.Core
             Return DeserialiseFieldsFromStorage(entity.ConfigJson, schema)
         End Function
 
+        ''' <summary>
+        ''' Returns ONLY the group's non-sensitive (plaintext-stored)
+        ''' field values — without the schema and without decrypting
+        ''' anything. Sensitive fields are sentinel-prefixed in
+        ''' storage, so this just deserialises the JSON and drops any
+        ''' sentinel-prefixed entry. Cheap and leak-free: used by the
+        ''' History source-label path (Phase 7-6) to read a cosmetic
+        ''' field like RealmName without ever touching the encrypted
+        ''' keys. Empty dict when the group is missing or has no
+        ''' fields.
+        ''' </summary>
+        Public Function LoadNonSensitiveFields(db As GsmDbContext, groupId As String) As Dictionary(Of String, String)
+            Dim result As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+            Dim entity = GetGroup(db, groupId)
+            If entity Is Nothing OrElse String.IsNullOrEmpty(entity.ConfigJson) Then Return result
+
+            Dim raw As Dictionary(Of String, String) = Nothing
+            Try
+                raw = JsonSerializer.Deserialize(Of Dictionary(Of String, String))(entity.ConfigJson)
+            Catch ex As Exception
+                _logger.LogWarning(ex, "Failed to deserialise shared-config JSON for non-sensitive read; returning empty")
+                Return result
+            End Try
+            If raw Is Nothing Then Return result
+
+            For Each kvp In raw
+                If kvp.Value Is Nothing Then Continue For
+                If kvp.Value.StartsWith(EncryptedSentinel, StringComparison.Ordinal) Then Continue For
+                result(kvp.Key) = kvp.Value
+            Next
+            Return result
+        End Function
+
         ' ============================================================
         '  Encryption sentinel encode/decode
         '

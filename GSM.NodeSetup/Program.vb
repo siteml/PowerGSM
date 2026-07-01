@@ -37,6 +37,15 @@ Module Program
             Return
         End If
 
+        ' --apply-update: the self-update survivor. Runs headless (never the
+        ' GUI/console wizard): wait for the exiting node's PID to die, swap the
+        ' staged GSM.Node.new over the live binary (keeping GSM.Node.old), then
+        ' relaunch via the service or directly. See SelfUpdateApply.
+        If parsed.ApplyUpdate Then
+            Environment.ExitCode = SelfUpdateApply.Run(parsed.WaitPid)
+            Return
+        End If
+
         ' Resolve the config path. Default: nodesettings.json next to this
         ' executable. AppContext.BaseDirectory is the published-output dir
         ' both in development and in dotnet publish output.
@@ -123,6 +132,16 @@ Module Program
                     result.ForceGui = True
                 Case "--auto-init"
                     result.AutoInit = True
+                Case "--apply-update"
+                    result.ApplyUpdate = True
+                Case "--wait-pid"
+                    If i + 1 < args.Length Then
+                        Dim pidVal As Integer
+                        If Integer.TryParse(args(i + 1), pidVal) Then
+                            result.WaitPid = pidVal
+                        End If
+                        i += 1
+                    End If
                 Case "--config"
                     If i + 1 < args.Length Then
                         result.ConfigPath = args(i + 1)
@@ -151,6 +170,11 @@ Module Program
         Console.WriteLine("                      deployment script.")
         Console.WriteLine("  --config <path>     Path to nodesettings.json (default: next")
         Console.WriteLine("                      to the executable)")
+        Console.WriteLine("  --apply-update      Internal: swap in a staged node update and")
+        Console.WriteLine("                      relaunch. Spawned by the node during a")
+        Console.WriteLine("                      self-update; pair with --wait-pid.")
+        Console.WriteLine("  --wait-pid <pid>    Internal: PID of the exiting node to wait for")
+        Console.WriteLine("                      before swapping the binary (with --apply-update).")
         Console.WriteLine("  --help, -h          Show this message")
         Console.WriteLine()
         Console.WriteLine("With no arguments, the tool launches the GUI on Windows and the")
@@ -162,6 +186,8 @@ Module Program
         Public Property ForceCli As Boolean
         Public Property ForceGui As Boolean
         Public Property AutoInit As Boolean
+        Public Property ApplyUpdate As Boolean
+        Public Property WaitPid As Integer
         Public Property ConfigPath As String
     End Class
 

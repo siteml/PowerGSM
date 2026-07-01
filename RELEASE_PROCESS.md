@@ -137,6 +137,12 @@ For extra confidence, download one zip, extract somewhere fresh, run the
 binary. The Manager's About dialog should show `0.2.0`, the Node's
 startup log should say `GSM.Node 0.2.0 starting`.
 
+The Manager zip also bundles `GSM.Watchdog.exe` (+ `watchdogsettings.json`)
+next to `GSM.Manager.exe`, the same way the Node zip bundles
+`GSM.CtrlCSender.exe` — confirm it's present. It's produced by the
+Manager's `PublishWatchdog` / `CopyWatchdogToPublish` targets (a
+self-contained single-file win-x64 build), mirroring Node → CtrlCSender.
+
 ---
 
 ## Pre-release dry runs (rc tags)
@@ -252,6 +258,11 @@ Two distinct cases here:
    `dotnet publish` does NOT propagate. Fix: add the property to the
    inner Properties string in `GSM.Node.vbproj` directly.
 
+   The Manager has an analogous `PublishWatchdog` target
+   (`GSM.Manager.vbproj`) that cross-compiles the win-x64
+   self-contained `GSM.Watchdog.exe`; its inner `Properties` string
+   already carries `EnableWindowsTargeting=true` for the same reason.
+
 (Self-contained publish targeting a `win-*` RID from a Linux host
 triggers this check even when the target project's TFM is plain `net8.0`.
 The check fires on the RID + SelfContained combination, not the TFM.)
@@ -330,6 +341,37 @@ Hotfix flow:
 Users running the broken 0.2.0 will see the new version on the Releases
 page; if/when an auto-update check is built (Phase 5f-5 deferred this
 to v2), they'll be notified directly.
+
+---
+
+## Watchdog logon task (manual setup)
+
+The Manager's **Settings → Startup** toggle installs the per-user Task
+Scheduler logon task that launches `GSM.Watchdog.exe` at sign-in (the
+watchdog then keeps the Manager running). That's the supported path.
+For a headless/scripted setup, or just to verify, you can drive
+`schtasks` directly against the co-located watchdog:
+
+Query (exit 0 = installed):
+
+```
+schtasks /Query /TN "PowerGSM Watchdog"
+```
+
+Remove:
+
+```
+schtasks /Delete /TN "PowerGSM Watchdog" /F
+```
+
+Creating it by hand is best done from an XML definition (the install
+path contains spaces, and the task needs a `RestartOnFailure` backstop
+— neither of which `/TR` handles cleanly); the Manager builds that XML
+in `WatchdogTaskInstaller.BuildTaskXml`, with the `<Settings>` children
+in schema order and the file written as UTF-16. The task runs
+`LeastPrivilege` + `InteractiveToken` as the current user, so creating
+it needs no elevation (no UAC). Reinstalling from the toggle (uncheck
+→ Save → check → Save) regenerates it.
 
 ---
 

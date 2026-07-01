@@ -1949,6 +1949,12 @@ Namespace GSM.Manager.Core
         ' ============================================================
 
         Private Function BuildPanelMessage(p As DiscordPanelEntity) As DiscordMessageBuilder
+            ' Phase 5k: player-list panels render a different body
+            ' (online roster grouped by instance, no Manage button).
+            If String.Equals(p.PanelKind, "PlayerList", StringComparison.OrdinalIgnoreCase) Then
+                Return BuildPlayerListMessage(p)
+            End If
+
             Dim instances = ResolveInScopeInstances(p)
             Dim title = If(String.IsNullOrEmpty(p.DisplayName), "PowerGSM", p.DisplayName)
 
@@ -2036,6 +2042,162 @@ Namespace GSM.Manager.Core
             msg.Content = sb.ToString()
             msg.AddComponents(manageButton)
             Return msg
+        End Function
+
+        ''' <summary>
+        ''' Phase 5k — render an online-players roster panel. Reuses
+        ''' ResolveInScopeInstances for scope plus the enriched per-
+        ''' instance player lists it now carries; groups by instance
+        ''' and lists each online player in the 5d-6 identity format.
+        ''' Instances with nobody online are skipped unless the
+        ''' panel's ShowEmptyGroups toggle is set. Same plain-content,
+        ''' full-width, 1800-char-capped style as the instance-manager
+        ''' panel, but read-only (no Manage button).
+        ''' </summary>
+        Private Function BuildPlayerListMessage(p As DiscordPanelEntity) As DiscordMessageBuilder
+            Dim instances = ResolveInScopeInstances(p)
+            Dim title = If(String.IsNullOrEmpty(p.DisplayName), "Players online", p.DisplayName)
+
+            ' Total online across the whole scope, computed up front so
+            ' it can go in the title (ShowTotalInTitle) as well as the
+            ' footer. Empty/Nothing player lists contribute 0.
+            Dim totalOnline = 0
+            If instances IsNot Nothing Then
+                totalOnline = instances.Sum(Function(i) If(i.Players, New List(Of PlayerSession)).Count)
+            End If
+
+            Dim sb As New StringBuilder()
+            Dim titleCount = If(p.ShowTotalInTitle, $" ({totalOnline})", "")
+            sb.AppendLine($"## {Escape(title)}{titleCount}")
+            sb.AppendLine()
+
+            Dim groupsShown = 0
+            Dim truncated = False
+
+            If instances Is Nothing OrElse instances.Count = 0 Then
+                sb.AppendLine("_No instances in scope._")
+            Else
+                ' Order by display name first so instances are
+                ' stable within a group; SortInstancesForGrouping then
+                ' clusters by node / game when a grouping is set (it
+                ' leaves the display-name order intact for "None").
+                Dim kind = If(p.GroupingKind, "None")
+                Dim ordered = SortInstancesForGrouping(
+                    instances.OrderBy(Function(i) i.DisplayName).ToList(), kind)
+                Dim lastPrimary As String = Nothing
+                Dim lastSecondary As String = Nothing
+                For Each inst In ordered
+                    Dim players = If(inst.Players, New List(Of PlayerSession))
+                    Dim count = players.Count
+
+                    ' Hide empty instances unless the operator opted
+                    ' to show all (Phase 5k decision 3).
+                    If count = 0 AndAlso Not p.ShowEmptyGroups Then Continue For
+
+                    ' Build this instance's block: any node/game group
+                    ' headers opening here (same level scheme as the
+                    ' instance panel — ## __node__ / ### game), then the
+                    ' bold instance header, then the player rows. Group
+                    ' headers only emit for groups with visible content,
+                    ' since hidden-empty instances Continue above.
+                    Dim block As New List(Of String)
+
+                    If kind <> "None" Then
+                        Dim primaryKey As String = ""
+                        Dim secondaryKey As String = ""
+                        Select Case kind
+                            Case "ByNode" : primaryKey = If(inst.NodeName, "")
+                            Case "ByGame" : primaryKey = If(inst.GameId, "")
+                            Case "ByNodeThenGame"
+                                primaryKey = If(inst.NodeName, "")
+                                secondaryKey = If(inst.GameId, "")
+                        End Select
+
+                        If lastPrimary Is Nothing OrElse Not String.Equals(lastPrimary, primaryKey, StringComparison.Ordinal) Then
+                            block.Add($"## __{GroupHeaderLabel(primaryKey)}__")
+                            lastPrimary = primaryKey
+                            lastSecondary = Nothing
+                        End If
+                        If kind = "ByNodeThenGame" Then
+                            If lastSecondary Is Nothing OrElse Not String.Equals(lastSecondary, secondaryKey, StringComparison.Ordinal) Then
+                                block.Add($"### {GroupHeaderLabel(secondaryKey)}")
+                                lastSecondary = secondaryKey
+                            End If
+                        End If
+                    End If
+
+                    ' Instance header: name, its context line (tile /
+                    ' save) when present, and the online count.
+                    Dim header As String = $"**{Escape(inst.DisplayName)}**"
+                    If Not String.IsNullOrEmpty(inst.ContextLine) Then
+                        header &= $" — {Escape(inst.ContextLine)}"
+                    End If
+                    header &= $" ({count})"
+                    block.Add(header)
+
+                    For Each pl In players
+                        block.Add($"• {FormatPlayerLabel(pl, p.ShowJoinTime)}")
+                    Next
+
+                    For Each ln In block
+                        If sb.Length + ln.Length + 1 > 1800 Then
+                            truncated = True
+                            Exit For
+                        End If
+                        sb.AppendLine(ln)
+                    Next
+                    If truncated Then Exit For
+
+                    groupsShown += 1
+                    sb.AppendLine()
+                Next
+
+                If groupsShown = 0 AndAlso Not truncated Then
+                    sb.AppendLine("_No players online._")
+                End If
+                If truncated Then
+                    sb.AppendLine("_…list truncated._")
+                End If
+            End If
+
+            Dim footerTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            sb.Append($"-# PowerGSM • {totalOnline} online • updated <t:{footerTs}:R>")
+
+            ' Read-only: no Manage button on a roster panel.
+            Dim msg As New DiscordMessageBuilder()
+            msg.Content = sb.ToString()
+            Return msg
+        End Function
+
+        ''' <summary>
+        ''' 5d-6 identity format for one player on a roster:
+        ''' "character (Platform: persona)" when the platform and a
+        ''' distinct persona are known, "character (persona)" when the
+        ''' platform isn't, and the coalesced name otherwise. Mirrors
+        ''' GsmSlashCommands.BuildPlayersResponse so /players and the
+        ''' player panel read identically.
+        ''' </summary>
+        Private Shared Function FormatPlayerLabel(p As PlayerSession, showJoinTime As Boolean) As String
+            Dim displayed = IdentityFormatter.Format(p.DisplayName, p.PlatformPersona, "(unknown)")
+            Dim personaDistinct = Not String.IsNullOrEmpty(p.PlatformPersona) AndAlso
+                                  Not String.Equals(p.PlatformPersona, displayed, StringComparison.Ordinal)
+            Dim sb As New StringBuilder()
+            sb.Append($"**{Escape(displayed)}**")
+            If personaDistinct AndAlso Not String.IsNullOrEmpty(p.Platform) Then
+                sb.Append($" ({Escape(p.Platform)}: {Escape(p.PlatformPersona)})")
+            ElseIf personaDistinct Then
+                sb.Append($" ({Escape(p.PlatformPersona)})")
+            End If
+            ' Phase 5k-2c — optional join time as a relative timestamp.
+            ' JoinedUtc comes from the node (PlayerSession); treat it as
+            ' UTC explicitly so the unix conversion doesn't shift by the
+            ' host offset. Skip when unset (default DateTime).
+            If showJoinTime AndAlso p.JoinedUtc <> Date.MinValue Then
+                Dim ju = DateTime.SpecifyKind(p.JoinedUtc, DateTimeKind.Utc)
+                Dim unix = New DateTimeOffset(ju).ToUnixTimeSeconds()
+                sb.Append($" — joined <t:{unix}:R>")
+            End If
+            Return sb.ToString()
         End Function
 
         ' ============================================================
@@ -2296,8 +2458,13 @@ Namespace GSM.Manager.Core
         ''' Walk the (already-grouping-sorted) instance list and
         ''' produce the ordered list of rendered lines, including
         ''' group header lines emitted on group transitions. Headers
-        ''' use Markdown H3 (### ) for the primary grouping key and
-        ''' bold (**...**) for the inner key in two-level grouping.
+        ''' use Markdown H2 (## ) plus underline (__...__) for the
+        ''' primary grouping key and H3 (### ) for the inner key in
+        ''' two-level grouping, so the two levels and the bold
+        ''' instance rows beneath them are three visually distinct
+        ''' sizes — and the primary is the only underlined line, the
+        ''' strongest visual anchor (the old bold inner header was
+        ''' indistinguishable from the bold instance lines).
         ''' Empty group keys render under "_(unknown)_".
         ''' </summary>
         Private Shared Function BuildPanelRenderItems(
@@ -2332,7 +2499,7 @@ Namespace GSM.Manager.Core
                 ' Nothing (distinct from "") so the first row
                 ' always emits a header even if its key is empty.
                 If lastPrimary Is Nothing OrElse Not String.Equals(lastPrimary, primaryKey, StringComparison.Ordinal) Then
-                    out.Add($"### {GroupHeaderLabel(primaryKey)}")
+                    out.Add($"## __{GroupHeaderLabel(primaryKey)}__")
                     lastPrimary = primaryKey
                     ' Force secondary re-emit when primary
                     ' changes — the secondary header should
@@ -2343,7 +2510,7 @@ Namespace GSM.Manager.Core
 
                 If kind = "ByNodeThenGame" Then
                     If lastSecondary Is Nothing OrElse Not String.Equals(lastSecondary, secondaryKey, StringComparison.Ordinal) Then
-                        out.Add($"**{GroupHeaderLabel(secondaryKey)}**")
+                        out.Add($"### {GroupHeaderLabel(secondaryKey)}")
                         lastSecondary = secondaryKey
                     End If
                 End If
@@ -2537,7 +2704,12 @@ Namespace GSM.Manager.Core
                 Try
                     Dim players = _instanceManager.GetPlayersAsync(e.InstanceId).
                         GetAwaiter().GetResult()
-                    row.PlayerCount = If(players Is Nothing, 0, players.Count)
+                    ' Enrich so PlayerList panels can show resolved
+                    ' character names (same resolver path /players
+                    ' uses); the count derives from the same list.
+                    Dim enriched = _instanceManager.EnrichPlayers(e.InstanceId, players)
+                    row.Players = If(enriched, New List(Of PlayerSession))
+                    row.PlayerCount = row.Players.Count
                 Catch ex As Exception
                     _logger.LogDebug(ex,
                         "Panel render: GetPlayersAsync threw for {Id}", e.InstanceId)
@@ -3919,8 +4091,10 @@ Namespace GSM.Manager.Core
                 .VisibilityProfileId = e.VisibilityProfileId
             }
             entry.EnabledEventTypes = ParseDestEnumSet(e.EnabledEventTypesJson)
+            entry.NodeFilter = ParseDestStringSet(e.NodeFilterJson)
             entry.InstallationFilter = ParseDestStringSet(e.InstallationFilterJson)
             entry.InstanceFilter = ParseDestStringSet(e.InstanceFilterJson)
+            entry.InstanceSetFilter = ParseDestStringSet(e.InstanceSetFilterJson, StringComparer.Ordinal)
             entry.TemplateOverrides = ParseDestTemplateOverrides(e.TemplateOverridesJson)
             Return entry
         End Function
@@ -3945,8 +4119,9 @@ Namespace GSM.Manager.Core
             Return result
         End Function
 
-        Private Shared Function ParseDestStringSet(json As String) As HashSet(Of String)
-            Dim result As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Private Shared Function ParseDestStringSet(json As String,
+                Optional comparer As IEqualityComparer(Of String) = Nothing) As HashSet(Of String)
+            Dim result As New HashSet(Of String)(If(comparer, StringComparer.OrdinalIgnoreCase))
             If String.IsNullOrEmpty(json) Then Return result
             Try
                 Dim list = JsonSerializer.Deserialize(Of List(Of String))(json)
@@ -4027,6 +4202,16 @@ Namespace GSM.Manager.Core
             ''' ByNodeThenGame grouping passes.
             ''' </summary>
             Public Property GameId As String
+
+            ''' <summary>
+            ''' Enriched online players on this instance (Phase 5k).
+            ''' Populated by BuildInScopeRow from the same
+            ''' GetPlayersAsync fetch that feeds PlayerCount, run
+            ''' through InstanceManager.EnrichPlayers so character
+            ''' names resolve. Empty when not running or the fetch
+            ''' failed. Only the PlayerList panel kind reads it.
+            ''' </summary>
+            Public Property Players As IReadOnlyList(Of PlayerSession) = New List(Of PlayerSession)
         End Class
 
     End Class
@@ -4103,8 +4288,10 @@ Namespace GSM.Manager.Core
         Public Property ChannelId As String
         Public Property VisibilityProfileId As String
         Public Property EnabledEventTypes As HashSet(Of NotificationEventType)
+        Public Property NodeFilter As HashSet(Of String)
         Public Property InstallationFilter As HashSet(Of String)
         Public Property InstanceFilter As HashSet(Of String)
+        Public Property InstanceSetFilter As HashSet(Of String)
         Public Property TemplateOverrides As Dictionary(Of NotificationEventType, String)
 
         ''' <summary>
@@ -4121,22 +4308,48 @@ Namespace GSM.Manager.Core
                 If Not EnabledEventTypes.Contains(context.EventType) Then Return False
             End If
 
+            ' Scope: union-of-includes across the four dimensions
+            ' (Phase 5n) — identical rule to
+            ' DiscordWebhookPlugin.DestinationCacheEntry.MatchesEvent.
+            ' In scope if it matches ANY non-empty filter; all-empty
+            ' filters means no scope restriction. Event-type gate above
+            ' stays a separate AND.
             Dim tokens = context.Tokens
-            If InstallationFilter IsNot Nothing AndAlso InstallationFilter.Count > 0 Then
+            Dim anyFilter = HasItems(NodeFilter) OrElse HasItems(InstallationFilter) OrElse
+                            HasItems(InstanceFilter) OrElse HasItems(InstanceSetFilter)
+            If anyFilter Then
+                Dim nodeId = If(tokens Is Nothing, "", If(tokens.NodeId, ""))
                 Dim installId = If(tokens Is Nothing, "", If(tokens.InstallationId, ""))
-                If String.IsNullOrEmpty(installId) OrElse
-                   Not InstallationFilter.Contains(installId) Then
-                    Return False
-                End If
-            End If
-            If InstanceFilter IsNot Nothing AndAlso InstanceFilter.Count > 0 Then
-                Dim instanceId = If(tokens Is Nothing, "", If(tokens.InstanceId, ""))
-                If String.IsNullOrEmpty(instanceId) OrElse
-                   Not InstanceFilter.Contains(instanceId) Then
-                    Return False
-                End If
+                ' Instance / set dimensions match against every instance
+                ' the event pertains to (Phase 5n fan-out): the single
+                ' instance for instance-level events, all instances under
+                ' the installation for installation-level events.
+                Dim inScope = Hit(NodeFilter, nodeId) OrElse
+                              Hit(InstallationFilter, installId) OrElse
+                              HitAny(InstanceFilter, context.ScopeInstanceIds) OrElse
+                              HitAny(InstanceSetFilter, context.ScopeInstanceSetTags)
+                If Not inScope Then Return False
             End If
             Return True
+        End Function
+
+        Private Shared Function HasItems(items As HashSet(Of String)) As Boolean
+            Return items IsNot Nothing AndAlso items.Count > 0
+        End Function
+
+        Private Shared Function Hit(items As HashSet(Of String), value As String) As Boolean
+            Return items IsNot Nothing AndAlso items.Count > 0 AndAlso
+                   Not String.IsNullOrEmpty(value) AndAlso items.Contains(value)
+        End Function
+
+        ' Multi-value variant for the fanned-out instance / set
+        ' dimensions: true if the filter contains ANY of the values.
+        Private Shared Function HitAny(items As HashSet(Of String), values As List(Of String)) As Boolean
+            If items Is Nothing OrElse items.Count = 0 OrElse values Is Nothing Then Return False
+            For Each v In values
+                If Not String.IsNullOrEmpty(v) AndAlso items.Contains(v) Then Return True
+            Next
+            Return False
         End Function
     End Class
 

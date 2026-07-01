@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      Plain class library: the shared Node<->shim wire protocol (frame
+      format, message DTOs, transport listener/client). Referenced as a
+      normal managed assembly by BOTH GSM.Node and GSM.Shim so the
+      versioned, append-only protocol is single-sourced (Phase 8
+      decision 5). No OutputType -> Library by default.
+    -->
+    <TargetFramework>net8.0</TargetFramework>
+
+    <!--
+      Referenced by GSM.Node (win-x64;linux-x64) and GSM.Shim
+      (win-x64;linux-x64), both published self-contained with a pinned
+      RID under the no-restore release flow. Declaring both RIDs here
+      gives this lib its per-RID slot in obj/project.assets.json so a
+      RID-pinned publish doesn't trip NETSDK1047 (same reasoning as
+      GSM.Node / GSM.CtrlCSender).
+    -->
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
+
+    <RootNamespace></RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OptionStrict>Off</OptionStrict>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionInfer>On</OptionInfer>
+    <AssemblyName>GSM.Shim.Protocol</AssemblyName>
+  </PropertyGroup>
+
+</Project>

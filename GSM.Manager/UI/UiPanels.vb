@@ -18,6 +18,54 @@ Imports GSM.Plugin
 Namespace GSM.Manager.UI
 
     ' ============================================================
+    '  PanelIdLabel — shared helper for the dim, copyable "ID …"
+    '  sub-label shown on the Node / Installation / Instance panels.
+    '  The raw id is stashed in the label's Tag; a right-click
+    '  "Copy ID" item copies it. AddressOf handler (not a per-call
+    '  lambda) so there are no closure-lifetime surprises.
+    ' ============================================================
+    Friend Module PanelIdLabel
+
+        Public Function Create(location As Point) As Label
+            Dim lbl As New Label() With {
+                .AutoSize = True,
+                .Location = location,
+                .ForeColor = Color.Gray,
+                .Font = New Font("Segoe UI", 8.0F)
+            }
+            Dim menu As New ContextMenuStrip()
+            Dim copyItem As New ToolStripMenuItem("Copy ID")
+            AddHandler copyItem.Click, AddressOf OnCopyClick
+            menu.Items.Add(copyItem)
+            menu.Tag = lbl
+            lbl.ContextMenuStrip = menu
+            Return lbl
+        End Function
+
+        Public Sub SetId(lbl As Label, id As String)
+            If lbl Is Nothing Then Return
+            lbl.Tag = id
+            lbl.Text = If(String.IsNullOrEmpty(id), "", "ID  " & id)
+        End Sub
+
+        Private Sub OnCopyClick(sender As Object, e As EventArgs)
+            Dim item = TryCast(sender, ToolStripMenuItem)
+            If item Is Nothing Then Return
+            Dim menu = TryCast(item.Owner, ContextMenuStrip)
+            If menu Is Nothing Then Return
+            Dim lbl = TryCast(menu.Tag, Label)
+            If lbl Is Nothing Then Return
+            Dim id = TryCast(lbl.Tag, String)
+            If String.IsNullOrEmpty(id) Then Return
+            Try
+                Clipboard.SetText(id)
+            Catch
+            End Try
+        End Sub
+
+    End Module
+
+    ' ============================================================
     '  WelcomePanel — shown when no specific node/instance selected
     ' ============================================================
 
@@ -89,6 +137,7 @@ Namespace GSM.Manager.UI
         Private _hostLabel As Label
         Private _statusLabel As Label
         Private _compatLabel As Label
+        Private _idLabel As Label
         Private _installationsListView As ListView
 
         ' Cancellation source for the on-load /api/version fetch.
@@ -160,11 +209,16 @@ Namespace GSM.Manager.UI
             _compatLabel.Text = "Checking node version..."
             _compatLabel.ForeColor = SystemColors.GrayText
 
+            ' Node ID backstop — dim, right-click-copyable. Sits
+            ' below the compat line, above the Installations heading.
+            _idLabel = PanelIdLabel.Create(New Point(2, 132))
+            PanelIdLabel.SetId(_idLabel, _nodeId)
+
             Dim installLabel As New Label()
             installLabel.Text = "Installations"
             installLabel.Font = New Font("Segoe UI", 11, FontStyle.Bold)
             installLabel.AutoSize = True
-            installLabel.Location = New Point(0, 130)
+            installLabel.Location = New Point(0, 160)
 
             ' Header section docked to top holds the info labels.
             ' Height bumped from 140 to 160 to accommodate the
@@ -173,9 +227,9 @@ Namespace GSM.Manager.UI
             ' the header section.
             Dim header As New Panel()
             header.Dock = DockStyle.Top
-            header.Height = 160
+            header.Height = 186
             header.Controls.AddRange(New Control() {
-                _nameLabel, _hostLabel, _statusLabel, _compatLabel, installLabel
+                _nameLabel, _hostLabel, _statusLabel, _compatLabel, _idLabel, installLabel
             })
 
             _installationsListView = New ListView()
@@ -404,6 +458,7 @@ Namespace GSM.Manager.UI
         Private _methodLabel As Label
         Private _versionLabel As Label
         Private _credentialLabel As Label
+        Private _idLabel As Label
         Private _checkUpdatesButton As Button
         Private _updateStatusLabel As Label
 
@@ -582,6 +637,10 @@ Namespace GSM.Manager.UI
                 .Location = New Point(2, 135)
             }
 
+            ' Installation ID backstop — dim, right-click-copyable.
+            _idLabel = PanelIdLabel.Create(New Point(2, 153))
+            PanelIdLabel.SetId(_idLabel, _installationId)
+
             ' Check-for-updates button + status label (to the right of
             ' the header info). Hitting the button runs a fast SteamCMD
             ' app_info query on the node — no download.
@@ -603,10 +662,10 @@ Namespace GSM.Manager.UI
             ' Bumped from 150 → 170 to make room for the new
             ' Install Method line. The other rows shift down by
             ' 20px in lockstep so the visual rhythm stays even.
-            header.Height = 170
+            header.Height = 178
             header.Controls.AddRange(New Control() {
                 _nameLabel, _gameLabel, _pathLabel, _methodLabel,
-                _versionLabel, _credentialLabel,
+                _versionLabel, _credentialLabel, _idLabel,
                 _checkUpdatesButton, _updateStatusLabel
             })
 
@@ -1636,6 +1695,7 @@ Namespace GSM.Manager.UI
         Private _nameLabel As Label
         Private _gameLabel As Label
         Private _statusLabel As Label
+        Private _idLabel As Label
         Private _startButton As Button
         Private _stopButton As Button
         Private _restartButton As Button
@@ -1899,6 +1959,12 @@ Namespace GSM.Manager.UI
             _statusLabel.Location = New Point(22, 75)
             _statusLabel.MaximumSize = New Size(800, 0)
 
+            ' Instance ID backstop — dim, right-click-copyable. X=22
+            ' so the header offset loop lands it at the same 2px indent
+            ' as the game/status lines.
+            _idLabel = PanelIdLabel.Create(New Point(22, 95))
+            PanelIdLabel.SetId(_idLabel, _instanceId)
+
             ' ---- Buttons ----
             Dim buttonY = 115
             _startButton = New Button()
@@ -1946,7 +2012,7 @@ Namespace GSM.Manager.UI
             headerPanel.Dock = DockStyle.Top
             headerPanel.Height = 155
             headerPanel.Controls.AddRange(New Control() {
-                _nameLabel, _gameLabel, _statusLabel,
+                _nameLabel, _gameLabel, _statusLabel, _idLabel,
                 _startButton, _stopButton, _restartButton, _showLogsToggle,
                 _historyButton
             })
@@ -2498,6 +2564,11 @@ Namespace GSM.Manager.UI
             If isRunning Then
                 Try
                     players = Await mgr.GetPlayersAsync(_instanceId)
+                    ' Phase 5g-2d — enrich against the resolver so the
+                    ' Character column shows the resolved DisplayName
+                    ' (e.g. "site's character") even when this
+                    ' /players snapshot hasn't surfaced it yet.
+                    players = mgr.EnrichPlayers(_instanceId, players)
                 Catch
                 End Try
                 Try
@@ -2527,11 +2598,24 @@ Namespace GSM.Manager.UI
             ApplyProcessState(procState)
             If isRunning Then
                 ApplyPlayers(players)
-                AppendChat(chat)
+                AppendChat(chat, players)
             Else
-                ' Clear live data when not running
+                ' Clear live data when not running. Chat is part of
+                ' "live data" — the Chat tab shows the current
+                ' session's chat only; cross-session chat lookups
+                ' belong in the History window. When the instance
+                ' stops, there's no current session, so the tab
+                ' resets to empty and waits for the next start.
+                ' _lastChatTimestamp is also reset so a subsequent
+                ' start triggers a fresh fetch from the Node rather
+                ' than picking up after wherever the last poll left
+                ' off (the cursor wouldn't be meaningful across a
+                ' stop/start anyway — the new session's players have
+                ' new JoinedUtc values).
                 _playerList.ClearRows()
                 _playerCountLabel.Text = "Players online: 0"
+                If _chatList.Rows.Count > 0 Then _chatList.ClearRows()
+                _lastChatTimestamp = Nothing
             End If
         End Sub
 
@@ -2672,8 +2756,41 @@ Namespace GSM.Manager.UI
             Return $"{CInt(span.TotalDays)}d {span.Hours}h ago"
         End Function
 
-        Private Sub AppendChat(chat As IReadOnlyList(Of ChatMessage))
+        Private Sub AppendChat(chat As IReadOnlyList(Of ChatMessage),
+                                players As IReadOnlyList(Of PlayerSession))
             If chat Is Nothing OrElse chat.Count = 0 Then Return
+
+            ' Advance the cursor based on the FULL received list,
+            ' before any filtering. The Node returns chat sorted
+            ' ascending by timestamp, so the max here is the last
+            ' element — but iterate defensively in case the wire
+            ' ordering ever changes. The cursor must advance past
+            ' rows that we filter out, otherwise the next poll
+            ' would re-fetch them and the loop would never make
+            ' progress on a chat-heavy past session whose players
+            ' have all disconnected.
+            For Each msg In chat
+                If msg Is Nothing Then Continue For
+                If msg.TimestampUtc > If(_lastChatTimestamp, DateTime.MinValue) Then
+                    _lastChatTimestamp = msg.TimestampUtc
+                End If
+            Next
+
+            ' Filter chat to the current session only. The Node's
+            ' chat_messages table is persistent and unfiltered —
+            ' it carries every line ever spoken on this instance,
+            ' across server restarts and tile changes. The Chat
+            ' tab here is a live-session surface, so cross-session
+            ' history doesn't belong; that's what the History
+            ' window is for. Filter accepts a row iff it matches
+            ' a currently-connected player by identity AND its
+            ' timestamp is at or after that player's most recent
+            ' JoinedUtc. Same filter the Phase 5j purge+rebuild
+            ' uses, so InstancePanel and rebuilt History stay
+            ' consistent.
+            Dim filtered = InstanceManager.FilterChatToCurrentSessions(chat, players)
+            If filtered Is Nothing OrElse filtered.Kept Is Nothing OrElse
+               filtered.Kept.Count = 0 Then Return
 
             ' Autoscroll detection: only follow the tail when the
             ' user is already there (or the list is empty). The
@@ -2689,7 +2806,7 @@ Namespace GSM.Manager.UI
 
             _chatList.BeginUpdate()
             Try
-                For Each msg In chat
+                For Each msg In filtered.Kept
                     Dim localTime = msg.TimestampUtc.ToLocalTime()
                     ' "yyyy-MM-dd HH:mm:ss" — unambiguous across locales
                     ' and sortable as text. Multi-day chat sessions would
@@ -2699,9 +2816,6 @@ Namespace GSM.Manager.UI
                         localTime.ToString("yyyy-MM-dd HH:mm:ss"),
                         If(msg.DisplayName, ""),
                         If(msg.Text, ""))
-                    If msg.TimestampUtc > If(_lastChatTimestamp, DateTime.MinValue) Then
-                        _lastChatTimestamp = msg.TimestampUtc
-                    End If
                 Next
 
                 ' Cap at 500 messages in the view
@@ -2782,76 +2896,41 @@ Namespace GSM.Manager.UI
         ''' Resolve the plugin and merged config, then run
         ''' ValidateConfig against it. Returns the warning list, or
         ''' an empty list when the plugin is unavailable / config
-        ''' lookup fails. Mirrors the install+instance ConfigJson
-        ''' merge logic in InstanceManager.StartInstanceAsync —
-        ''' install fields go in first, instance fields overlay
-        ''' on top — so plugins see exactly the same merged config
-        ''' the runtime will hand them.
+        ''' lookup fails. Routes through InstanceManager.
+        ''' GetMergedCustomFields so the validator sees the full
+        ''' three-layer merge (shared-config group → installation
+        ''' → instance) — the same view StartInstanceAsync hands
+        ''' the plugin at launch. An earlier version of this
+        ''' method did its own two-layer install+instance merge
+        ''' and surfaced spurious "CustomerKey is required"
+        ''' warnings for Last Oasis installations whose CustomerKey
+        ''' lived on a linked Realm group rather than in install
+        ''' ConfigJson; using the canonical merge eliminates that
+        ''' class of drift.
         ''' </summary>
         Private Function BuildPreFlightValidationWarnings() As IReadOnlyList(Of String)
             Dim empty As IReadOnlyList(Of String) = New List(Of String)
             Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
             If registry Is Nothing Then Return empty
+            Dim mgr = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If mgr Is Nothing Then Return empty
 
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
                 Dim instanceEntity = db.Instances.Find(_instanceId)
                 If instanceEntity Is Nothing Then Return empty
-                Dim installEntity = db.Installations.Find(instanceEntity.InstallationId)
-                If installEntity Is Nothing Then Return empty
 
                 Dim plugin = registry.GetPlugin(instanceEntity.GameId)
                 If plugin Is Nothing Then Return empty
 
-                ' Merge install ConfigJson under instance ConfigJson —
-                ' instance fields win on collision. Case-insensitive
-                ' dict to match the runtime path's key handling.
-                Dim merged As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
-                If Not String.IsNullOrEmpty(installEntity.ConfigJson) Then
-                    Try
-                        Dim installDict = System.Text.Json.JsonSerializer.Deserialize(
-                            Of Dictionary(Of String, String))(installEntity.ConfigJson)
-                        If installDict IsNot Nothing Then
-                            For Each kvp In installDict
-                                merged(kvp.Key) = kvp.Value
-                            Next
-                        End If
-                    Catch
-                    End Try
-                End If
-                If Not String.IsNullOrEmpty(instanceEntity.ConfigJson) Then
-                    Try
-                        Dim instDict = System.Text.Json.JsonSerializer.Deserialize(
-                            Of Dictionary(Of String, String))(instanceEntity.ConfigJson)
-                        If instDict IsNot Nothing Then
-                            For Each kvp In instDict
-                                ' Critical guard, mirrors the merge rule in
-                                ' InstanceManager.StartInstanceAsync: an
-                                ' empty instance value must NOT overwrite
-                                ' a non-empty install value. The Edit
-                                ' Instance form persists every override
-                                ' field as a key (with empty string when
-                                ' the user left it blank), which means
-                                ' a blind overlay would clobber
-                                ' install-level CustomerKey / ProviderKey
-                                ' / etc. with empty strings — producing
-                                ' "CustomerKey is required" warnings on
-                                ' instances whose installations have the
-                                ' key set just fine. The actual start
-                                ' path doesn't have this bug because
-                                ' InstanceManager applies the same guard
-                                ' before invoking the plugin.
-                                If String.IsNullOrEmpty(kvp.Value) AndAlso
-                                   merged.ContainsKey(kvp.Key) AndAlso
-                                   Not String.IsNullOrEmpty(merged(kvp.Key)) Then
-                                    Continue For
-                                End If
-                                merged(kvp.Key) = kvp.Value
-                            Next
-                        End If
-                    Catch
-                    End Try
-                End If
+                ' Single source of truth for merged CustomFields.
+                ' GetMergedCustomFields applies the same three-layer
+                ' stack StartInstanceAsync uses (Realm group →
+                ' installation → instance) with the same
+                ' empty-doesn't-clobber-non-empty rule between
+                ' layers, so the pre-flight validator sees exactly
+                ' the dictionary the plugin will see at launch.
+                Dim merged = mgr.GetMergedCustomFields(_instanceId)
 
                 Dim cfg As New InstanceConfig With {
                     .InstanceId = instanceEntity.InstanceId,
@@ -2959,7 +3038,38 @@ Namespace GSM.Manager.UI
                 Case Else
                     SetButtonsEnabled(False)
             End Select
+
+            ' Phase 5m-2e — if the game plugin isn't loaded, Start and
+            ' Restart are never allowed (starting would launch an
+            ' unmanageable, untracked process). Stop is left as the
+            ' state policy set it above, so a running orphan can still
+            ' be stopped. Mirrors the InstanceManager start guard.
+            If IsPluginMissing() Then
+                _startButton.Enabled = False
+                _restartButton.Enabled = False
+            End If
         End Sub
+
+        ''' <summary>
+        ''' Phase 5m-2e — true when this instance's game plugin isn't
+        ''' loaded. On any lookup failure returns False: the
+        ''' InstanceManager start guard is the real backstop, so we
+        ''' don't risk wrongly locking the buttons on a transient hiccup.
+        ''' </summary>
+        Private Function IsPluginMissing() As Boolean
+            Try
+                Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+                If registry Is Nothing Then Return False
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim ent = db.Instances.Find(_instanceId)
+                    If ent Is Nothing Then Return False
+                    Return registry.GetPlugin(ent.GameId) Is Nothing
+                End Using
+            Catch
+                Return False
+            End Try
+        End Function
 
         ' ============================================================
         '  Logs tab — toggle, build, polling, append
@@ -3527,6 +3637,15 @@ Namespace GSM.Manager.UI
 
     Public Class SchemaFormBuilder
 
+        ' Width that field labels, descriptions, and the Notice banner
+        ' wrap to. Fixed (rather than tracking the live container
+        ' width) because the form positions controls absolutely by
+        ' yOffset — labels are sized once at build. Capping the width
+        ' makes long text wrap to multiline within the panel instead
+        ' of running off the right edge and forcing a horizontal
+        ' scrollbar. Roughly matches the 400px input controls.
+        Private Const ContentWidth As Integer = 430
+
         ''' <summary>
         ''' Builds a Panel containing form controls generated from
         ''' the given config field descriptors. Returns the panel
@@ -3574,25 +3693,52 @@ Namespace GSM.Manager.UI
             End If
 
             For Each field In schema
-                ' Label
-                Dim lbl As New Label()
-                lbl.Text = If(field.Label, field.Key)
-                lbl.AutoSize = True
-                lbl.Location = New Point(10, yOffset)
-                lbl.Font = New Font("Segoe UI", 9, FontStyle.Bold)
-                panel.Controls.Add(lbl)
-                yOffset += 20
+                ' Notice fields render as a prominent inline banner
+                ' instead of a labelled input — a can't-miss callout
+                ' for "special criteria" the operator must see. No
+                ' control is registered for them, so ValueExtractor
+                ' naturally skips them and nothing is persisted.
+                If field.FieldType = ConfigFieldType.Notice Then
+                    RenderNoticeBanner(panel, field, yOffset)
+                    Continue For
+                End If
 
-                ' Description
+                ' Label — wrap to the content width so a long label
+                ' becomes multiline instead of running off the panel.
+                Dim lblFont As New Font("Segoe UI", 9, FontStyle.Bold)
+                Dim lblText = If(field.Label, field.Key)
+                Dim lblSize = TextRenderer.MeasureText(
+                    lblText, lblFont,
+                    New Size(ContentWidth, Integer.MaxValue),
+                    TextFormatFlags.WordBreak Or TextFormatFlags.TextBoxControl)
+                Dim lbl As New Label()
+                lbl.AutoSize = False
+                lbl.Size = New Size(ContentWidth, lblSize.Height + 2)
+                lbl.Text = lblText
+                lbl.Location = New Point(10, yOffset)
+                lbl.Font = lblFont
+                panel.Controls.Add(lbl)
+                yOffset += lblSize.Height + 4
+
+                ' Description — same width cap so long help text wraps
+                ' to multiple lines and the layout advances past the
+                ' real (possibly multi-line) height rather than a
+                ' fixed single line.
                 If Not String.IsNullOrEmpty(field.Description) Then
+                    Dim descFont As New Font("Segoe UI", 8)
+                    Dim descSize = TextRenderer.MeasureText(
+                        field.Description, descFont,
+                        New Size(ContentWidth, Integer.MaxValue),
+                        TextFormatFlags.WordBreak Or TextFormatFlags.TextBoxControl)
                     Dim descLbl As New Label()
+                    descLbl.AutoSize = False
+                    descLbl.Size = New Size(ContentWidth, descSize.Height + 2)
                     descLbl.Text = field.Description
-                    descLbl.AutoSize = True
                     descLbl.ForeColor = Color.Gray
-                    descLbl.Font = New Font("Segoe UI", 8)
+                    descLbl.Font = descFont
                     descLbl.Location = New Point(10, yOffset)
                     panel.Controls.Add(descLbl)
-                    yOffset += 18
+                    yOffset += descSize.Height + 6
                 End If
 
                 ' Input control
@@ -3764,6 +3910,82 @@ Namespace GSM.Manager.UI
                                   End Function
             }
         End Function
+
+        ''' <summary>
+        ''' Render a ConfigFieldType.Notice descriptor as an inline
+        ''' amber callout banner: the Label as a bold heading and the
+        ''' Description as the body, both wrapped inside a bordered
+        ''' panel. Advances yOffset past the banner. No input control
+        ''' is created, so the field never contributes to the form's
+        ''' extracted values. Both labels use MaximumSize-based
+        ''' wrapping (AutoSize grows height) so long bodies don't
+        ''' truncate the way a plain description label does.
+        ''' </summary>
+        Private Shared Sub RenderNoticeBanner(panel As Panel,
+                                              field As ConfigFieldDescriptor,
+                                              ByRef yOffset As Integer)
+            Const innerPad As Integer = 8
+            Dim innerWidth = ContentWidth - innerPad * 2
+
+            ' Measure wrapped text explicitly with TextRenderer
+            ' rather than trusting Label.AutoSize — AutoSize height is
+            ' unreliable before the control is parented / has a handle,
+            ' which previously left the panel too short and collapsed
+            ' the body text onto the title line. Fixed-size labels
+            ' sized from the measurement wrap and stack correctly.
+            Dim parts As New List(Of Control)
+            Dim curY = innerPad
+            Dim measureFlags As TextFormatFlags =
+                TextFormatFlags.WordBreak Or TextFormatFlags.TextBoxControl
+
+            If Not String.IsNullOrEmpty(field.Label) Then
+                Dim titleFont As New Font("Segoe UI", 9, FontStyle.Bold)
+                Dim titleSize = TextRenderer.MeasureText(
+                    field.Label, titleFont,
+                    New Size(innerWidth, Integer.MaxValue), measureFlags)
+                Dim title As New Label()
+                title.AutoSize = False
+                title.Size = New Size(innerWidth, titleSize.Height + 2)
+                title.Font = titleFont
+                title.ForeColor = Color.FromArgb(124, 79, 0)
+                title.Text = field.Label
+                title.Location = New Point(innerPad, curY)
+                parts.Add(title)
+                curY += titleSize.Height + 6
+            End If
+
+            If Not String.IsNullOrEmpty(field.Description) Then
+                Dim bodyFont As New Font("Segoe UI", 8.5F)
+                Dim bodySize = TextRenderer.MeasureText(
+                    field.Description, bodyFont,
+                    New Size(innerWidth, Integer.MaxValue), measureFlags)
+                Dim body As New Label()
+                body.AutoSize = False
+                body.Size = New Size(innerWidth, bodySize.Height + 2)
+                body.Font = bodyFont
+                body.ForeColor = Color.FromArgb(90, 70, 30)
+                body.Text = field.Description
+                body.Location = New Point(innerPad, curY)
+                parts.Add(body)
+                curY += bodySize.Height + 2
+            End If
+
+            ' Nothing to show (no label, no description) — skip
+            ' silently rather than drawing an empty box.
+            If parts.Count = 0 Then Return
+
+            Dim banner As New Panel()
+            banner.Location = New Point(10, yOffset)
+            banner.Size = New Size(ContentWidth, curY + innerPad)
+            banner.BorderStyle = BorderStyle.FixedSingle
+            banner.BackColor = Color.FromArgb(255, 247, 214)
+            For Each c In parts
+                banner.Controls.Add(c)
+            Next
+            panel.Controls.Add(banner)
+
+            yOffset += banner.Height + 12
+        End Sub
 
         ''' <summary>
         ''' Background helper: invokes the file-list provider on the

@@ -211,6 +211,41 @@ jobs:
             -DestinationPath "PowerGSM-Node-$version-win-x64.zip" `
             -CompressionLevel Optimal
 
+      # BUILD-INFO.json travels INSIDE the Manager zip (the zip globs
+      # the publish folder, so writing it here is enough). Phase 5l-3's
+      # plugin-compatibility pre-flight reads it from the staged update
+      # and compares contractsVersion against the running install's own
+      # BUILD-INFO.json to warn when a Contracts bump could break
+      # Roslyn-compiled plugins — without having to compile anything
+      # first. GSM.Contracts.dll is published as a loose file (it's
+      # ExcludeFromSingleFile=true so Roslyn can reference it), so its
+      # assembly version is readable straight from the publish folder;
+      # contractsVersion stays null if it's ever bundled, which the
+      # consumer treats as "unknown, proceed with caution".
+      - name: Write BUILD-INFO.json (Manager)
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $dir = "GSM.Manager\publish\manager-win-x64"
+          $contractsDll = Join-Path $dir "GSM.Contracts.dll"
+          $contractsVersion = $null
+          if (Test-Path $contractsDll) {
+            $contractsVersion = [System.Reflection.AssemblyName]::GetAssemblyName($contractsDll).Version.ToString()
+          }
+          $info = [ordered]@{
+            product           = "PowerGSM.Manager"
+            version           = $version
+            tag               = "v$version"
+            commit            = "${{ github.sha }}"
+            buildUtc          = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            targetFramework   = "net8.0-windows"
+            runtimeIdentifier = "win-x64"
+            contractsVersion  = $contractsVersion
+          }
+          $json = $info | ConvertTo-Json
+          Set-Content -Path (Join-Path $dir "BUILD-INFO.json") -Value $json -Encoding UTF8
+          Write-Host $json
+
       - name: Zip Manager artifact
         shell: pwsh
         run: |
@@ -418,6 +453,18 @@ jobs:
         # the release call.
         run: ls -la artifacts/
 
+      # SHA256SUMS is a release asset (not inside any zip) listing the
+      # checksum of every release zip. Phase 5l-2 downloads it first,
+      # then verifies the Manager zip it pulls against the matching
+      # line before extracting/applying — the integrity gate for
+      # self-update. Standard `sha256sum` format ("<hash>  <name>"),
+      # so it also verifies with `sha256sum -c SHA256SUMS`. Generated
+      # from inside artifacts/ so the names are bare basenames.
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum PowerGSM-*.zip | tee SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -426,6 +473,7 @@ jobs:
           files: |
             artifacts/PowerGSM-Manager-*.zip
             artifacts/PowerGSM-Node-*.zip
+            artifacts/SHA256SUMS
           draft: false
           # Tags containing a hyphen (0.1.0-rc1, 0.2.0-beta) are
           # marked pre-release. GitHub's UI surfaces these

@@ -99,6 +99,20 @@ Namespace GSM.Plugin
         ''' (the chosen filename), same wire shape as Text.
         ''' </summary>
         ManagedFilePicker
+
+        ''' <summary>
+        ''' Renders as a read-only inline banner/callout instead of an
+        ''' input control — a prominent, can't-miss message box drawn
+        ''' inline between the surrounding fields. The descriptor's
+        ''' Label is the bold banner heading and Description is the
+        ''' body; no value is collected or persisted for a Notice
+        ''' field (it never appears in the extracted values dict, so
+        ''' it needs no real storage Key). Use it for "special
+        ''' criteria" the operator must not miss — e.g. Conan's
+        ''' reserved pinger port at game port + 1. Place the
+        ''' descriptor in schema order where the banner should appear.
+        ''' </summary>
+        Notice
     End Enum
 
     ''' <summary>
@@ -327,6 +341,34 @@ Namespace GSM.Plugin
         ''' building their picture of what's in use.
         ''' </summary>
         Public Property IsPort As Boolean = False
+
+        ''' <summary>
+        ''' Additional ports this field reserves relative to its own
+        ''' value, expressed as integer offsets. For each offset N,
+        ''' the value (this field's port + N) is treated by the
+        ''' manager's PortAllocator as occupied — folded into the
+        ''' node-wide "in use" set for both new-instance suggestion
+        ''' and save-time conflict validation — even though no
+        ''' editable field holds it.
+        '''
+        ''' The motivating case is a game that hard-codes a companion
+        ''' port at a fixed offset from a configurable one and gives
+        ''' the operator no way to move it: Conan Exiles' "pinger"
+        ''' port is always game port + 1 (UDP), so the Conan plugin
+        ''' sets ReservedPortOffsets = {1} on its Port field. Without
+        ''' it, the allocator would happily suggest or accept a
+        ''' second instance's game/query port on a neighbour's pinger
+        ''' and that server would silently fail to list.
+        '''
+        ''' Only meaningful on fields with IsPort = True; ignored
+        ''' otherwise. The reservation is protocol-agnostic, matching
+        ''' how the allocator treats every port (bare integers, no
+        ''' TCP/UDP distinction) — a deliberate slight over-
+        ''' reservation in exchange for simplicity. Nothing/empty
+        ''' means the field reserves only its own value, which is
+        ''' exactly what every existing port field already did.
+        ''' </summary>
+        Public Property ReservedPortOffsets As List(Of Integer)
 
         ''' <summary>
         ''' For FieldType=ManagedFilePicker: the RelativePath of the
@@ -579,6 +621,45 @@ Namespace GSM.Plugin
         ''' Returns crash patterns the node should watch for.
         ''' </summary>
         Function GetCrashPatterns() As IReadOnlyList(Of String)
+    End Interface
+
+    ''' <summary>
+    ''' Opt-in capability a log parser implements when it keeps
+    ''' connection-correlation state that must SURVIVE parser
+    ''' recreation across log-stream reconnects.
+    '''
+    ''' The motivating case is Last Oasis: the parser binds each
+    ''' connection's RemoteAddr to the player name seen at
+    ''' "Join succeeded", so a later close line (which carries only
+    ''' the address, not the name) can be attributed to the right
+    ''' player. That binding lives on the parser instance — but the
+    ''' Manager recreates the parser on every log-stream reconnect.
+    ''' A fresh parser starts with an empty binding table, so a
+    ''' disconnect arriving after a reconnect loses its name. For a
+    ''' clean quit (UNetConnection::Close) the Manager's nameless-
+    ''' leave heuristic still catches it; for a timeout/kick whose
+    ''' only signal is UChannel::Close the parser drops it as a
+    ''' no-match, and the session is left open in history forever.
+    '''
+    ''' Implementing this interface lets the Manager own ONE binding
+    ''' store per instance and hand the same dictionary to each
+    ''' parser it (re)creates, so bindings persist across reconnects
+    ''' and are cleared only when the instance actually stops.
+    ''' Parsers with no cross-reconnect state simply don't implement
+    ''' it and are completely unaffected.
+    ''' </summary>
+    Public Interface IConnectionBindingAware
+        ''' <summary>
+        ''' Manager-supplied, instance-scoped store of
+        ''' RemoteAddr -> resolved player name. The Manager assigns
+        ''' this once, right after creating the parser and before
+        ''' feeding it any line; the SAME dictionary instance is
+        ''' reused across parser recreations for a given instance.
+        ''' Implementations use it as their backing store for
+        ''' connection bindings instead of a private field, so the
+        ''' state outlives any single parser. Never assigned Nothing.
+        ''' </summary>
+        Property ConnectionBindings As IDictionary(Of String, String)
     End Interface
 
     ''' <summary>
@@ -1754,6 +1835,67 @@ Namespace GSM.Plugin
     End Interface
 
     ''' <summary>
+    ''' Opt-in interface (ContractsVersion 2) for plugins that need
+    ''' instance config written into the game's OWN config file(s) just
+    ''' before launch — rather than passed on the command line.
+    '''
+    ''' Two motivating cases, same shape:
+    '''   - File-only games (no launch args) whose port must come from
+    '''     the node port allocator. The allocator stores the chosen
+    '''     port in CustomFields; BuildLaunchArguments can't carry it
+    '''     (there are no args), so the plugin renders it into the
+    '''     config file here. (Windrose DirectConnectionServerPort.)
+    '''   - Text values that garble through command-line quoting
+    '''     (spaces / unicode) but read cleanly from a config file.
+    '''     (Conan ServerName.)
+    '''
+    ''' The Manager calls this in StartInstanceAsync after merging the
+    ''' config layers into CustomFields and before sending the start
+    ''' request: for each path from GetStartupFiles it reads the current
+    ''' file from the node (empty string if absent), calls
+    ''' RenderStartupFile, and writes the result back via the same node
+    ''' file endpoints IInstanceFileEditorProvider uses — only when the
+    ''' rendered text differs. A read/write failure is logged and the
+    ''' launch proceeds (the file keeps its last value); it does not
+    ''' block start.
+    '''
+    ''' Single-ownership rule: a value rendered here must NOT also be
+    ''' editable in an IInstanceFileEditorProvider schema for the same
+    ''' file, or the two fight — this render runs last and would revert
+    ''' editor edits. Move such a field to the instance Configuration
+    ''' schema (GetInstanceConfigSchema) and drop it from the file
+    ''' editor.
+    ''' </summary>
+    Public Interface IStartupFileProvider
+        ''' <summary>
+        ''' Relative paths (under the installation directory, forward
+        ''' slashes) of the config files this plugin wants to (re)write
+        ''' from instance config at start. Cheap; called once per start.
+        ''' Empty list = nothing to do.
+        ''' </summary>
+        Function GetStartupFiles(instanceConfig As InstanceConfig) _
+            As IReadOnlyList(Of String)
+
+        ''' <summary>
+        ''' Produce the new content for one file, given its CURRENT
+        ''' on-disk text (empty string when the file doesn't exist yet).
+        ''' Inject the instance-config values this plugin owns and
+        ''' preserve everything else (round-trip unknown fields). Return
+        ''' Nothing — or text equal to existingText — to skip the write.
+        '''
+        ''' Return Nothing when existingText is empty if the game must
+        ''' create the file itself first (e.g. Windrose generates
+        ''' ServerDescription.json on first launch; the rendered values
+        ''' then apply from the second launch on). The plugin owns all
+        ''' parsing/serialisation — reuse the same helpers as its file
+        ''' editor; nothing format-specific lives on the Manager side.
+        ''' </summary>
+        Function RenderStartupFile(relativePath As String,
+                                    instanceConfig As InstanceConfig,
+                                    existingText As String) As String
+    End Interface
+
+    ''' <summary>
     ''' Opt-in interface plugins implement to declare a "shared
     ''' config group" — a set of fields that multiple
     ''' installations of the same plugin can reference via a
@@ -1945,6 +2087,21 @@ Namespace GSM.Plugin
         ''' it as their friendly label for the group.
         ''' </summary>
         Public Property SharedConfigGroupName As String
+
+        ''' <summary>
+        ''' Phase 7-6 — the linked SharedConfigGroup's NON-SENSITIVE
+        ''' field values (sensitive fields like keys are omitted, not
+        ''' decrypted, so this stays cheap and leaks nothing into the
+        ''' label path), keyed by the plugin's own shared-config field
+        ''' keys. Empty/Nothing when the installation links to no
+        ''' group. Lets a plugin render a field-level value distinct
+        ''' from the group's DisplayName — e.g. Last Oasis reads
+        ''' "RealmName" here for the canonical realm name (identical
+        ''' across a realm's several per-provider-key groups), while
+        ''' DisplayName carries the per-group "realm (provider)" label
+        ''' used in pickers.
+        ''' </summary>
+        Public Property SharedConfigFields As IReadOnlyDictionary(Of String, String)
     End Class
 
 End Namespace

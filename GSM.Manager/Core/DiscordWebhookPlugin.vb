@@ -347,8 +347,10 @@ Namespace GSM.Manager.Core
             }
 
             entry.EnabledEventTypes = ParseEnumSet(e.EnabledEventTypesJson)
+            entry.NodeFilter = ParseStringSet(e.NodeFilterJson)
             entry.InstallationFilter = ParseStringSet(e.InstallationFilterJson)
             entry.InstanceFilter = ParseStringSet(e.InstanceFilterJson)
+            entry.InstanceSetFilter = ParseStringSet(e.InstanceSetFilterJson, StringComparer.Ordinal)
             entry.TemplateOverrides = ParseTemplateOverrides(e.TemplateOverridesJson)
 
             Return entry
@@ -370,8 +372,9 @@ Namespace GSM.Manager.Core
             Return result
         End Function
 
-        Private Shared Function ParseStringSet(json As String) As HashSet(Of String)
-            Dim result As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Private Shared Function ParseStringSet(json As String,
+                Optional comparer As IEqualityComparer(Of String) = Nothing) As HashSet(Of String)
+            Dim result As New HashSet(Of String)(If(comparer, StringComparer.OrdinalIgnoreCase))
             If String.IsNullOrEmpty(json) Then Return result
             Try
                 Dim list = JsonSerializer.Deserialize(Of List(Of String))(json)
@@ -415,8 +418,10 @@ Namespace GSM.Manager.Core
         Public Property WebhookUrl As String
         Public Property VisibilityProfileId As String
         Public Property EnabledEventTypes As HashSet(Of NotificationEventType)
+        Public Property NodeFilter As HashSet(Of String)
         Public Property InstallationFilter As HashSet(Of String)
         Public Property InstanceFilter As HashSet(Of String)
+        Public Property InstanceSetFilter As HashSet(Of String)
         Public Property TemplateOverrides As Dictionary(Of NotificationEventType, String)
 
         Public Function MatchesEvent(context As NotificationContext) As Boolean
@@ -424,22 +429,52 @@ Namespace GSM.Manager.Core
                 If Not EnabledEventTypes.Contains(context.EventType) Then Return False
             End If
 
+            ' Scope: union-of-includes across the four dimensions
+            ' (Phase 5n). The event is in scope if it matches ANY
+            ' non-empty filter; when every filter is empty the
+            ' destination has no scope restriction (all instances).
+            ' The event-type gate above stays a separate AND.
             Dim tokens = context.Tokens
-            If InstallationFilter IsNot Nothing AndAlso InstallationFilter.Count > 0 Then
+            Dim anyFilter = HasItems(NodeFilter) OrElse HasItems(InstallationFilter) OrElse
+                            HasItems(InstanceFilter) OrElse HasItems(InstanceSetFilter)
+            If anyFilter Then
+                Dim nodeId = If(tokens Is Nothing, "", If(tokens.NodeId, ""))
                 Dim installId = If(tokens Is Nothing, "", If(tokens.InstallationId, ""))
-                If String.IsNullOrEmpty(installId) OrElse
-                   Not InstallationFilter.Contains(installId) Then
-                    Return False
-                End If
-            End If
-            If InstanceFilter IsNot Nothing AndAlso InstanceFilter.Count > 0 Then
-                Dim instanceId = If(tokens Is Nothing, "", If(tokens.InstanceId, ""))
-                If String.IsNullOrEmpty(instanceId) OrElse
-                   Not InstanceFilter.Contains(instanceId) Then
-                    Return False
-                End If
+                ' Instance / set dimensions match against every instance
+                ' the event pertains to (Phase 5n fan-out): the single
+                ' instance for instance-level events, all instances under
+                ' the installation for installation-level events.
+                Dim inScope = Hit(NodeFilter, nodeId) OrElse
+                              Hit(InstallationFilter, installId) OrElse
+                              HitAny(InstanceFilter, context.ScopeInstanceIds) OrElse
+                              HitAny(InstanceSetFilter, context.ScopeInstanceSetTags)
+                If Not inScope Then Return False
             End If
             Return True
+        End Function
+
+        ' Union-of-includes helpers. HasItems = "this dimension
+        ' contributes a filter"; Hit = "a present token value is in
+        ' this filter". InstanceSetFilter carries an Ordinal comparer
+        ' (set parity with RuleScope.InstanceSet); the ID filters are
+        ' OrdinalIgnoreCase — each set's own comparer applies here.
+        Private Shared Function HasItems(items As HashSet(Of String)) As Boolean
+            Return items IsNot Nothing AndAlso items.Count > 0
+        End Function
+
+        Private Shared Function Hit(items As HashSet(Of String), value As String) As Boolean
+            Return items IsNot Nothing AndAlso items.Count > 0 AndAlso
+                   Not String.IsNullOrEmpty(value) AndAlso items.Contains(value)
+        End Function
+
+        ' Multi-value variant for the fanned-out instance / set
+        ' dimensions: true if the filter contains ANY of the values.
+        Private Shared Function HitAny(items As HashSet(Of String), values As List(Of String)) As Boolean
+            If items Is Nothing OrElse items.Count = 0 OrElse values Is Nothing Then Return False
+            For Each v In values
+                If Not String.IsNullOrEmpty(v) AndAlso items.Contains(v) Then Return True
+            Next
+            Return False
         End Function
     End Class
 

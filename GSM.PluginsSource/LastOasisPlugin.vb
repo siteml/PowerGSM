@@ -610,8 +610,19 @@ Public Class LastOasisPlugin
         If context Is Nothing Then Return Nothing
 
         ' --- Realm-display segment ---
+        ' Phase 7-6: prefer the canonical RealmName field — identical
+        ' across a realm's several per-provider-key groups, so History
+        ' stays consistent while the group DisplayName may carry a
+        ' per-provider "(label)" suffix used in pickers. Fall back to
+        ' the group DisplayName (pre-7-6), then the realm_id substring.
         Dim realmDisplay As String = Nothing
-        If Not String.IsNullOrEmpty(context.SharedConfigGroupName) Then
+        Dim realmNameField As String = Nothing
+        If context.SharedConfigFields IsNot Nothing Then
+            context.SharedConfigFields.TryGetValue("RealmName", realmNameField)
+        End If
+        If Not String.IsNullOrEmpty(realmNameField) Then
+            realmDisplay = realmNameField
+        ElseIf Not String.IsNullOrEmpty(context.SharedConfigGroupName) Then
             realmDisplay = context.SharedConfigGroupName
         ElseIf Not String.IsNullOrEmpty(context.SessionIdentity) Then
             ' SessionIdentity shape: "lastoasis:{realm_id}:{tile_id}".

@@ -190,6 +190,13 @@ Namespace Global.Migrations
                         HasMaxLength(50).
                         HasColumnType("TEXT")
 
+                    b.Property(Of String)("PanelKind").
+                        IsRequired().
+                        ValueGeneratedOnAdd().
+                        HasMaxLength(40).
+                        HasColumnType("TEXT").
+                        HasDefaultValue("InstanceManager")
+
                     b.Property(Of Integer)("RefreshIntervalSeconds").
                         HasColumnType("INTEGER")
 
@@ -201,6 +208,21 @@ Namespace Global.Migrations
                     b.Property(Of String)("ScopeTargetId").
                         HasMaxLength(200).
                         HasColumnType("TEXT")
+
+                    b.Property(Of Boolean)("ShowEmptyGroups").
+                        ValueGeneratedOnAdd().
+                        HasColumnType("INTEGER").
+                        HasDefaultValue(False)
+
+                    b.Property(Of Boolean)("ShowJoinTime").
+                        ValueGeneratedOnAdd().
+                        HasColumnType("INTEGER").
+                        HasDefaultValue(False)
+
+                    b.Property(Of Boolean)("ShowTotalInTitle").
+                        ValueGeneratedOnAdd().
+                        HasColumnType("INTEGER").
+                        HasDefaultValue(False)
 
                     b.Property(Of Date)("UpdatedUtc").
                         HasColumnType("TEXT")
@@ -434,6 +456,12 @@ Namespace Global.Migrations
                     b.Property(Of String)("InstanceFilterJson").
                         HasColumnType("TEXT")
 
+                    b.Property(Of String)("InstanceSetFilterJson").
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("NodeFilterJson").
+                        HasColumnType("TEXT")
+
                     b.Property(Of String)("TemplateOverridesJson").
                         HasColumnType("TEXT")
 
@@ -598,6 +626,51 @@ Namespace Global.Migrations
                     b.ToTable("PlayerSessions")
                 End Sub)
 
+            modelBuilder.Entity("GSM.Manager.Data.PluginSourceEntity",
+                Sub(b)
+                    b.Property(Of String)("SourceId").
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("Branch").
+                        HasMaxLength(100).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("DisplayName").
+                        IsRequired().
+                        HasMaxLength(200).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of Boolean)("IsEnabled").
+                        HasColumnType("INTEGER")
+
+                    b.Property(Of Boolean)("IsOfficial").
+                        HasColumnType("INTEGER")
+
+                    b.Property(Of Date?)("LastFetchedUtc").
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("Owner").
+                        IsRequired().
+                        HasMaxLength(100).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("Repo").
+                        IsRequired().
+                        HasMaxLength(100).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("RepoPath").
+                        HasMaxLength(300).
+                        HasColumnType("TEXT")
+
+                    b.HasKey("SourceId")
+
+                    b.HasIndex("Owner", "Repo", "RepoPath").
+                        IsUnique()
+
+                    b.ToTable("PluginSources")
+                End Sub)
+
             modelBuilder.Entity("GSM.Manager.Data.RuleExecutionEntity",
                 Sub(b)
                     b.Property(Of String)("ExecutionId").
@@ -733,6 +806,37 @@ Namespace Global.Migrations
                     b.ToTable("SteamCredentials")
                 End Sub)
 
+            modelBuilder.Entity("GSM.Manager.Data.UpdateHistoryEntity",
+                Sub(b)
+                    b.Property(Of String)("HistoryId").
+                        HasColumnType("TEXT")
+
+                    b.Property(Of Date)("AppliedAtUtc").
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("Detail").
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("FromVersion").
+                        HasMaxLength(100).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("Outcome").
+                        IsRequired().
+                        HasMaxLength(40).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("ToVersion").
+                        HasMaxLength(100).
+                        HasColumnType("TEXT")
+
+                    b.HasKey("HistoryId")
+
+                    b.HasIndex("AppliedAtUtc")
+
+                    b.ToTable("UpdateHistory")
+                End Sub)
+
             modelBuilder.Entity("GSM.Manager.Data.VisibilityProfileEntity",
                 Sub(b)
                     b.Property(Of String)("ProfileId").
@@ -758,6 +862,31 @@ Namespace Global.Migrations
                     b.HasKey("ProfileId")
 
                     b.ToTable("VisibilityProfiles")
+                End Sub)
+
+            modelBuilder.Entity("GSM.Manager.Data.WebSessionEntity",
+                Sub(b)
+                    b.Property(Of String)("SessionKey").
+                        HasMaxLength(200).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of Date)("CapturedAtUtc").
+                        HasColumnType("TEXT")
+
+                    b.Property(Of String)("CapturedByPluginId").
+                        HasMaxLength(100).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of Byte())("EncryptedCookieHeader").
+                        IsRequired().
+                        HasColumnType("BLOB")
+
+                    b.Property(Of Date?)("LastUsedUtc").
+                        HasColumnType("TEXT")
+
+                    b.HasKey("SessionKey")
+
+                    b.ToTable("WebSessions")
                 End Sub)
 
             modelBuilder.Entity("GSM.Manager.Data.InstallationEntity",

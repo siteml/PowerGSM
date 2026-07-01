@@ -180,6 +180,16 @@ way:
 - An enum member is removed or renamed.
 - A class is removed or renamed.
 
+**Exception (added Phase 7):** a bump is also warranted when a
+major new plugin-facing *surface* is introduced — e.g. a whole new
+plugin kind like `IUtilityPlugin` — so plugins that REQUIRE the new
+surface can declare the new version and fail fast on an older
+Manager with one clear message instead of a Roslyn "type not
+defined" cascade. Such bumps remain fully backward-compatible:
+plugins declaring an older contracts version keep loading
+unchanged. This is a deliberate, rare exception; routine additive
+changes still do not bump.
+
 Does **not** bump when:
 
 - A new method or property is added to an interface that has a
@@ -222,6 +232,7 @@ phase 5f-3.
 | Contracts version | First introduced in | Notable changes |
 | ----------------- | ------------------- | --------------- |
 | 1                 | 0.1.0               | Initial baseline. All types documented in `GSM.Contracts/*.vb`. |
+| 2                 | 0.4.0 (Phase 7)     | Adds the utility-plugin surface: `IUtilityPlugin`, `UtilityEvent`/`UtilityEventKind`, `IUtilityContext`, web-session capture DTOs, capability constants (namespace `GSM.Utility`). Purely additive — contracts-v1 game plugins load unchanged; utility plugins must declare `requiresContracts="2"`. |
 
 ---
 

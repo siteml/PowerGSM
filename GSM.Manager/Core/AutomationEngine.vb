@@ -83,6 +83,28 @@ Namespace GSM.Manager.Core
         End Sub
 
         ''' <summary>
+        ''' Display names of rules whose actions are executing right
+        ''' now. Used by the self-update apply pre-flight (Phase 5l-3)
+        ''' to warn that applying will interrupt an in-flight rule
+        ''' (a Sequence, WaitForServerEmpty, etc.) that won't resume.
+        ''' Most rules finish near-instantly and never appear here;
+        ''' only genuinely long-running executions do.
+        ''' </summary>
+        Public Function GetRunningRuleNames() As List(Of String)
+            Dim names As New List(Of String)
+            For Each ruleId In _runningExecutions.Keys
+                Dim rule As AutomationRule = Nothing
+                If _rules.TryGetValue(ruleId, rule) AndAlso rule IsNot Nothing AndAlso
+                   Not String.IsNullOrEmpty(rule.DisplayName) Then
+                    names.Add(rule.DisplayName)
+                Else
+                    names.Add(ruleId)
+                End If
+            Next
+            Return names
+        End Function
+
+        ''' <summary>
         ''' Reloads rules from the database.
         '''
         ''' Self-starting: if the engine hasn't been Start()ed yet,

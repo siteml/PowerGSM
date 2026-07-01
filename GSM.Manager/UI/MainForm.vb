@@ -36,6 +36,21 @@ Imports GSM.Node.Api
 
 Namespace GSM.Manager.UI
 
+    ''' <summary>Phase 5m-2b — severity styling for the MainForm banner.</summary>
+    Public Enum BannerSeverity
+        Info
+        Warning
+        Critical
+    End Enum
+
+    ''' <summary>Phase 5m-2b — in-app restart request, honoured by
+    ''' ManagerProgram after the form closes.</summary>
+    Public Enum RelaunchRequest
+        None
+        Normal
+        SafeMode
+    End Enum
+
     Public Class MainForm
         Inherits Form
 
@@ -46,6 +61,8 @@ Namespace GSM.Manager.UI
         Private _menuStrip As MenuStrip
         Private _statusStrip As StatusStrip
         Private _statusLabel As ToolStripStatusLabel
+        Private _readOnlyInstallLabel As ToolStripStatusLabel
+        Private _updateStatusLabel As ToolStripStatusLabel
         Private _versionStatusLabel As ToolStripStatusLabel
 
         ' ---- Tree root nodes ----
@@ -116,6 +133,48 @@ Namespace GSM.Manager.UI
         ' tracking when they close.
         Private _automationWindow As AutomationRulesForm
 
+        ' ---- System tray (Phase 5m-1) ----
+        Private _tray As TrayController
+        ' Set by the tray's Exit action (and, in 5m-1b, File -> Exit)
+        ' so the close-to-tray interceptor added in 5m-1b lets a
+        ' deliberate exit through instead of hiding to tray. Written
+        ' now, read once that interceptor exists.
+        Private _reallyExit As Boolean = False
+        ' Phase 5m-1b tray preferences, cached in fields (loaded at
+        ' construction, refreshed when the Settings dialog closes).
+        Private _minimizeToTray As Boolean = True
+        Private _closeToTray As Boolean = False
+        Private _startMinimized As Boolean = False
+        ' Phase 5m-1b — desired splitter width awaiting application
+        ' when the form started minimized (the container had no real
+        ' width at Shown). -1 = nothing pending; applied on the first
+        ' resize to a normal window state.
+        Private _pendingSplitterDistance As Integer = -1
+
+        ' ---- Notification banner + safe mode (Phase 5m-2b) ----
+        ' A dockable strip below the menu for prominent, persistent
+        ' warnings: SAFE MODE here, and the missing-plugin / orphaned-
+        ' entity alerts in 5m-2e. Hidden until ShowBanner is called.
+        Private _bannerPanel As Panel
+        Private _bannerLabel As Label
+        Private _bannerActionLink As LinkLabel
+        Private _bannerAction As Action
+        Private _safeMode As Boolean = False
+        ''' <summary>
+        ''' Phase 5m-2b — set when the user picks Restart in Safe Mode
+        ''' / Restart Normally. Read by ManagerProgram after the form
+        ''' closes to relaunch the exe with or without --safe-mode.
+        ''' </summary>
+        Public Property RequestedRelaunch As RelaunchRequest = RelaunchRequest.None
+
+        ' Phase 5m-2e — cached orphan ID sets consulted by the tree-
+        ' badge resolvers (ResolveInstallationIcon / ResolveInstanceIcon)
+        ' so an orphaned entity paints DarkRed. Refreshed by
+        ' RefreshOrphanWarning; empty in safe mode (orphan surfacing is
+        ' suppressed there) and before the first reconciliation runs.
+        Private _orphanedInstallationIds As New HashSet(Of String)(StringComparer.Ordinal)
+        Private _orphanedInstanceIds As New HashSet(Of String)(StringComparer.Ordinal)
+
         ' ============================================================
         '  WS_EX_COMPOSITED — form-level paint flicker fix on resize
         '
@@ -157,34 +216,75 @@ Namespace GSM.Manager.UI
             End Get
         End Property
 
-        Public Sub New()
+        Public Sub New(Optional safeMode As Boolean = False)
+            _safeMode = safeMode
             FormIconHelper.ApplyTo(Me)
             InitializeComponent()
             BuildTree()
             ShowPanel(New WelcomePanel())
             AddHandler Me.Shown, AddressOf MainForm_Shown
             AddHandler Me.FormClosing, AddressOf MainForm_FormClosing
+            AddHandler Me.FormClosed, AddressOf MainForm_FormClosed
+
+            ' Phase 5l-1 — wire the self-update indicator (subscribe to
+            ' the checker + show any already-known update).
+            InitUpdateIndicator()
+
+            ' Phase 5m-1 — system-tray icon. Built after the form
+            ' icon is applied (FormIconHelper sets Me.Icon above) so
+            ' the tray matches the app; behaviour lives in the
+            ' callbacks below. Phase 5m-2b — the tray also carries the
+            ' restart-into-mode entry, labelled for the current mode.
+            Dim restartLabel As String
+            Dim restartAction As Action
+            If _safeMode Then
+                restartLabel = "Restart Normally"
+                restartAction = AddressOf RestartNormally
+            Else
+                restartLabel = "Restart in Safe Mode"
+                restartAction = AddressOf RestartInSafeMode
+            End If
+            _tray = New TrayController(
+                If(Me.Icon, SystemIcons.Application),
+                "PowerGSM Manager",
+                AddressOf RestoreFromTray,
+                AddressOf ExitFromTray,
+                restartLabel,
+                restartAction)
+
+            ' Phase 5m-1b — load tray preferences, wire the
+            ' minimize-to-tray intercept, and honour Start Minimized.
+            LoadTrayPreferences()
+            AddHandler Me.Resize, AddressOf MainForm_Resize
+            If _startMinimized Then Me.WindowState = FormWindowState.Minimized
+
+            ' Phase 5m-2b — SAFE MODE banner. Persistent until the user
+            ' restarts normally (the banner link, or File → Restart
+            ' Normally).
+            If _safeMode Then
+                ShowBanner(
+                    "SAFE MODE — plugins, automation, Discord and node polling are disabled.",
+                    BannerSeverity.Warning, "Restart Normally", AddressOf RestartNormally)
+            End If
         End Sub
 
         Private Sub MainForm_Shown(sender As Object, e As EventArgs)
-            ' Configure splitter after the form has its final size.
-            ' Doing this at construction time can throw because the
-            ' SplitContainer's Width isn't large enough yet to satisfy
-            ' Panel1MinSize + Panel2MinSize + SplitterWidth.
+            ' Configure the splitter after the form has its final
+            ' size. Restore the user's last splitter width (Phase
+            ' 5m-1b), falling back to a sensible default on first run.
+            ' If the form started minimized the container isn't laid
+            ' out yet, so ApplySplitterDistance returns False and we
+            ' stash the target for the first restore to apply.
+            Dim target = 280
             Try
-                _splitContainer.Panel1MinSize = 200
-                _splitContainer.Panel2MinSize = 300
-                ' Tree panel width — enough for longer node / installation /
-                ' instance names without losing much content-panel real estate.
-                Dim desiredWidth = 280
-                Dim maxAllowed = _splitContainer.Width - _splitContainer.Panel2MinSize - _splitContainer.SplitterWidth
-                If desiredWidth > maxAllowed Then desiredWidth = maxAllowed
-                If desiredWidth < _splitContainer.Panel1MinSize Then desiredWidth = _splitContainer.Panel1MinSize
-                _splitContainer.SplitterDistance = desiredWidth
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    target = db.GetSettingInt(GsmDataExtensions.SettingKeys.SplitterDistance, 280)
+                End Using
             Catch
-                ' Non-fatal — splitter stays at whatever default width
-                ' it got; user can still drag to resize.
+                ' Fall back to the default target.
             End Try
+            If Not ApplySplitterDistance(target) Then _pendingSplitterDistance = target
 
             ' Start the status-icon refresh ticker. UI-thread Timer
             ' so the Tick handler can touch TreeNode properties
@@ -199,6 +299,276 @@ Namespace GSM.Manager.UI
             AddHandler _statusRefreshTimer.Tick, Sub(s, ev) RefreshStatusIcons()
             _statusRefreshTimer.Start()
             RefreshStatusIcons()
+
+            ' Phase 5m-1b — start-minimized into the tray. Relying on
+            ' the initial Resize to hide is unreliable: a form born
+            ' minimized (WindowState set in the constructor) may not
+            ' raise Resize on first show, which left the window on the
+            ' taskbar. Hide explicitly here, after the first show, when
+            ' both prefs are on. (Start-minimized without minimize-to-
+            ' tray stays an ordinary taskbar-minimized window.)
+            If _startMinimized AndAlso _minimizeToTray Then Me.Hide()
+
+            ' Phase 5m-2e — surface any orphaned installations/instances
+            ' (a referenced GameId with no loaded plugin) loudly at
+            ' startup. No-op in safe mode (everything's orphaned by
+            ' design; the SAFE MODE banner covers it).
+            RefreshOrphanWarning(showDialogIfFound:=True)
+
+            ' Phase 5l-1 — install-writeability probe. Self-update can
+            ' only swap binaries if the install folder is writable;
+            ' warn once and show a persistent indicator when it isn't.
+            CheckInstallWriteability()
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5m-1b — apply a splitter distance to the tree /
+        ''' content split, clamped to the panel min-sizes for the
+        ''' current container width. Returns False (changing nothing)
+        ''' when the container isn't laid out wide enough yet — e.g.
+        ''' the form is still minimized — so the caller can retry once
+        ''' the window has a real size.
+        ''' </summary>
+        Private Function ApplySplitterDistance(target As Integer) As Boolean
+            Try
+                _splitContainer.Panel1MinSize = 200
+                _splitContainer.Panel2MinSize = 300
+                Dim maxAllowed = _splitContainer.Width - _splitContainer.Panel2MinSize - _splitContainer.SplitterWidth
+                If maxAllowed < _splitContainer.Panel1MinSize Then Return False
+                If target > maxAllowed Then target = maxAllowed
+                If target < _splitContainer.Panel1MinSize Then target = _splitContainer.Panel1MinSize
+                _splitContainer.SplitterDistance = target
+                Return True
+            Catch
+                Return False
+            End Try
+        End Function
+
+        ' ============================================================
+        '  Notification banner + safe mode (Phase 5m-2b)
+        ' ============================================================
+
+        Private Sub BuildBanner()
+            _bannerPanel = New Panel() With {
+                .Dock = DockStyle.Top,
+                .Height = 30,
+                .Visible = False,
+                .Padding = New Padding(10, 0, 8, 0)
+            }
+            _bannerLabel = New Label() With {
+                .Dock = DockStyle.Fill,
+                .TextAlign = ContentAlignment.MiddleLeft,
+                .AutoEllipsis = True,
+                .Font = New Font("Segoe UI", 9, FontStyle.Bold)
+            }
+            _bannerActionLink = New LinkLabel() With {
+                .Dock = DockStyle.Right,
+                .AutoSize = False,
+                .Width = 150,
+                .TextAlign = ContentAlignment.MiddleRight,
+                .Visible = False,
+                .Font = New Font("Segoe UI", 9, FontStyle.Bold)
+            }
+            AddHandler _bannerActionLink.LinkClicked, Sub(s, e) _bannerAction?.Invoke()
+            ' Label added first (fills leftover), link last (reserves
+            ' the right edge) — WinForms docks last-added first.
+            _bannerPanel.Controls.Add(_bannerLabel)
+            _bannerPanel.Controls.Add(_bannerActionLink)
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5m-2b — show the banner strip beneath the menu with a
+        ''' severity colour and an optional action link. Reused for
+        ''' SAFE MODE and (5m-2e) orphaned-plugin alerts.
+        ''' </summary>
+        Public Sub ShowBanner(text As String, severity As BannerSeverity,
+                              Optional actionText As String = Nothing,
+                              Optional action As Action = Nothing)
+            If _bannerPanel Is Nothing Then Return
+            Select Case severity
+                Case BannerSeverity.Critical
+                    _bannerPanel.BackColor = Color.FromArgb(176, 0, 32)
+                Case BannerSeverity.Warning
+                    _bannerPanel.BackColor = Color.FromArgb(196, 120, 0)
+                Case Else
+                    _bannerPanel.BackColor = Color.FromArgb(40, 90, 160)
+            End Select
+            _bannerLabel.ForeColor = Color.White
+            _bannerLabel.Text = text
+            If String.IsNullOrEmpty(actionText) Then
+                _bannerActionLink.Visible = False
+                _bannerAction = Nothing
+            Else
+                _bannerActionLink.Text = actionText
+                _bannerActionLink.LinkColor = Color.White
+                _bannerActionLink.ActiveLinkColor = Color.Gainsboro
+                _bannerAction = action
+                _bannerActionLink.Visible = True
+            End If
+            _bannerPanel.Visible = True
+        End Sub
+
+        ''' <summary>Phase 5m-2b — hide the banner strip.</summary>
+        Public Sub HideBanner()
+            If _bannerPanel IsNot Nothing Then
+                _bannerPanel.Visible = False
+                _bannerAction = Nothing
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5m-2b — request a relaunch into safe mode and close.
+        ''' The relaunch itself happens in ManagerProgram after this
+        ''' instance shuts down cleanly, so the new one starts with no
+        ''' stale crash marker and no contention with the outgoing
+        ''' process.
+        ''' </summary>
+        Public Sub RestartInSafeMode()
+            RequestedRelaunch = RelaunchRequest.SafeMode
+            _reallyExit = True
+            Me.Close()
+        End Sub
+
+        ''' <summary>Phase 5m-2b — request a normal relaunch and close.</summary>
+        Public Sub RestartNormally()
+            RequestedRelaunch = RelaunchRequest.Normal
+            _reallyExit = True
+            Me.Close()
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5m-2c — open the safe-mode "Re-enable Features" panel.
+        ''' After it closes, refresh the tree in case plugins were
+        ''' re-enabled (install methods / icons may have changed).
+        ''' </summary>
+        Private Sub OnSafeModeFeatures()
+            Using dlg As New SafeModeFeaturesForm()
+                dlg.ShowDialog(Me)
+            End Using
+            Try
+                RefreshNodeTree()
+            Catch
+            End Try
+        End Sub
+
+        ' ============================================================
+        '  Orphaned-plugin warning (Phase 5m-2e)
+        ' ============================================================
+
+        ''' <summary>
+        ''' Reconcile installations/instances against loaded plugins and
+        ''' surface any orphans (a GameId with no loaded plugin) loudly:
+        ''' a persistent banner, and optionally a details dialog. An
+        ''' orphaned instance that's actually running escalates to
+        ''' Critical — the node keeps the process alive but the Manager
+        ''' can't parse it, so its activity isn't being recorded.
+        ''' Suppressed in safe mode, where everything is orphaned by
+        ''' design and the SAFE MODE banner already explains why.
+        ''' </summary>
+        Public Sub RefreshOrphanWarning(Optional showDialogIfFound As Boolean = False)
+            If _safeMode Then Return
+            Try
+                Dim report As OrphanReport
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim registry = scope.ServiceProvider.GetRequiredService(Of PluginRegistry)()
+                    Dim detector = scope.ServiceProvider.GetRequiredService(Of PluginOrphanDetector)()
+                    report = detector.BuildOrphanReport(registry.GetLoadedGameIds())
+                End Using
+
+                ' Phase 5m-2e — refresh the cached orphan ID sets the
+                ' tree-badge resolvers consult, then repaint badges so
+                ' DarkRed appears/clears immediately rather than waiting
+                ' for the 2s tick. Rebuilt even in the no-orphan case so
+                ' a fixed reload clears stale badges.
+                _orphanedInstallationIds = New HashSet(Of String)(
+                    report.Installations.Select(Function(r) r.Id), StringComparer.Ordinal)
+                _orphanedInstanceIds = New HashSet(Of String)(
+                    report.Instances.Select(Function(r) r.Id), StringComparer.Ordinal)
+                RefreshStatusIcons()
+
+                If Not report.HasAny Then
+                    ' Nothing orphaned — clear any prior orphan banner.
+                    ' Safe to hide unconditionally: in normal mode the
+                    ' banner is only ever the orphan warning (the SAFE
+                    ' MODE banner exists only in safe mode, handled by
+                    ' the early return above).
+                    HideBanner()
+                    Return
+                End If
+
+                Dim runningOrphans = CountRunningOrphanInstances(report)
+                Dim severity = If(runningOrphans > 0, BannerSeverity.Critical, BannerSeverity.Warning)
+                ShowBanner(BuildOrphanBannerText(report, runningOrphans), severity,
+                           "Details", Sub() ShowOrphanDetailsDialog(report, runningOrphans))
+                If showDialogIfFound Then ShowOrphanDetailsDialog(report, runningOrphans)
+            Catch
+                ' Best-effort — a reconciliation hiccup must never block
+                ' the UI from coming up.
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Count orphaned instances the node currently reports as
+        ''' Running — the data-integrity case (running with no plugin to
+        ''' parse it).
+        ''' </summary>
+        Private Function CountRunningOrphanInstances(report As OrphanReport) As Integer
+            Dim instMgr = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If instMgr Is Nothing Then Return 0
+            Dim count = 0
+            For Each r In report.Instances
+                Try
+                    Dim live = instMgr.GetLiveState(r.Id)
+                    If live IsNot Nothing AndAlso live.CurrentState = InstanceState.Running Then
+                        count += 1
+                    End If
+                Catch
+                End Try
+            Next
+            Return count
+        End Function
+
+        Private Function BuildOrphanBannerText(report As OrphanReport, runningOrphans As Integer) As String
+            Dim gids = String.Join(", ", report.MissingGameIds)
+            Dim text =
+                $"Missing plugin(s) for {gids} — {report.Installations.Count} installation(s) and " &
+                $"{report.Instances.Count} instance(s) can't be managed until the plugin is restored."
+            If runningOrphans > 0 Then
+                text = $"{text}  {runningOrphans} running and NOT being tracked."
+            End If
+            Return text
+        End Function
+
+        Private Sub ShowOrphanDetailsDialog(report As OrphanReport, runningOrphans As Integer)
+            Dim sb As New System.Text.StringBuilder()
+            sb.AppendLine("One or more installations/instances reference a game plugin that isn't loaded.")
+            sb.AppendLine()
+            sb.AppendLine("Missing plugin GameId(s): " & String.Join(", ", report.MissingGameIds))
+            sb.AppendLine()
+            If report.Installations.Count > 0 Then
+                sb.AppendLine($"Affected installations ({report.Installations.Count}):")
+                For Each r In report.Installations
+                    sb.AppendLine($"   - {r.DisplayName}  ({r.GameId})")
+                Next
+                sb.AppendLine()
+            End If
+            If report.Instances.Count > 0 Then
+                sb.AppendLine($"Affected instances ({report.Instances.Count}):")
+                For Each r In report.Instances
+                    sb.AppendLine($"   - {r.DisplayName}  ({r.GameId})")
+                Next
+                sb.AppendLine()
+            End If
+            If runningOrphans > 0 Then
+                sb.AppendLine($"WARNING: {runningOrphans} affected instance(s) are currently running on their node.")
+                sb.AppendLine("The node keeps them alive, but with no plugin loaded the Manager cannot parse")
+                sb.AppendLine("their logs — player activity and history are NOT being recorded for them.")
+                sb.AppendLine()
+            End If
+            sb.AppendLine("Restore the plugin file to the Plugins folder (or re-enable it), then use")
+            sb.AppendLine("Tools -> Reload Plugins.")
+            Dim icon = If(runningOrphans > 0, MessageBoxIcon.Error, MessageBoxIcon.Warning)
+            MessageBox.Show(sb.ToString(), "PowerGSM — Missing Plugins", MessageBoxButtons.OK, icon)
         End Sub
 
         Private Sub InitializeComponent()
@@ -211,7 +581,24 @@ Namespace GSM.Manager.UI
             _menuStrip = New MenuStrip()
 
             Dim fileMenu As New ToolStripMenuItem("&File")
-            Dim exitItem As New ToolStripMenuItem("E&xit", Nothing, Sub(s, e) Me.Close())
+            ' Phase 5m-2b — restart into / out of safe mode (label and
+            ' action depend on the current mode).
+            Dim restartModeItem As ToolStripMenuItem
+            If _safeMode Then
+                restartModeItem = New ToolStripMenuItem("Restart &Normally", Nothing, Sub(s, e) RestartNormally())
+            Else
+                restartModeItem = New ToolStripMenuItem("Restart in &Safe Mode", Nothing, Sub(s, e) RestartInSafeMode())
+            End If
+            fileMenu.DropDownItems.Add(restartModeItem)
+            ' Phase 5m-2c — in safe mode, offer per-feature re-enable so
+            ' a subsystem can be brought back up for fix-and-test without
+            ' leaving safe mode.
+            If _safeMode Then
+                fileMenu.DropDownItems.Add(
+                    New ToolStripMenuItem("Re-enable &Features…", Nothing, Sub(s, e) OnSafeModeFeatures()))
+            End If
+            fileMenu.DropDownItems.Add(New ToolStripSeparator())
+            Dim exitItem As New ToolStripMenuItem("E&xit", Nothing, Sub(s, e) ExitFromTray())
             exitItem.ShortcutKeys = Keys.Alt Or Keys.F4
             fileMenu.DropDownItems.Add(exitItem)
 
@@ -220,16 +607,22 @@ Namespace GSM.Manager.UI
                 Sub(s, e) OnAddNode())
             Dim newInstallItem As New ToolStripMenuItem("New &Installation...", Nothing,
                 Sub(s, e) OnNewInstallation())
+            Dim updateNodesItem As New ToolStripMenuItem("&Update Nodes...", Nothing,
+                Sub(s, e) OnUpdateNodes())
             nodesMenu.DropDownItems.Add(addNodeItem)
             nodesMenu.DropDownItems.Add(newInstallItem)
+            nodesMenu.DropDownItems.Add(New ToolStripSeparator())
+            nodesMenu.DropDownItems.Add(updateNodesItem)
 
             Dim toolsMenu As New ToolStripMenuItem("&Tools")
             Dim historyItem As New ToolStripMenuItem("&History...", Nothing,
                 Sub(s, e) OnOpenHistory(Nothing))
+            Dim purgeRebuildItem As New ToolStripMenuItem("Purge && Re&build History...", Nothing,
+                Sub(s, e) OnPurgeAndRebuildHistory())
             Dim reloadPluginsItem As New ToolStripMenuItem("&Reload Plugins", Nothing,
                 Sub(s, e) OnReloadPlugins())
-            Dim pluginStatusItem As New ToolStripMenuItem("&Plugin Status...", Nothing,
-                Sub(s, e) OnPluginStatus())
+            Dim managePluginsItem As New ToolStripMenuItem("Manage &Plugins...", Nothing,
+                Sub(s, e) OnManagePlugins())
             Dim steamCredsItem As New ToolStripMenuItem("&Steam Credentials...", Nothing,
                 Sub(s, e) OnSteamCredentials())
             Dim sharedConfigItem As New ToolStripMenuItem("S&hared Resources...", Nothing,
@@ -243,9 +636,10 @@ Namespace GSM.Manager.UI
             Dim settingsItem As New ToolStripMenuItem("S&ettings...", Nothing,
                 Sub(s, e) OnSettings())
             toolsMenu.DropDownItems.Add(historyItem)
+            toolsMenu.DropDownItems.Add(purgeRebuildItem)
             toolsMenu.DropDownItems.Add(New ToolStripSeparator())
             toolsMenu.DropDownItems.Add(reloadPluginsItem)
-            toolsMenu.DropDownItems.Add(pluginStatusItem)
+            toolsMenu.DropDownItems.Add(managePluginsItem)
             Dim openPluginsFolderItem As New ToolStripMenuItem("Open Plugins &Folder", Nothing,
                 Sub(s, e) OnOpenPluginsFolder())
             toolsMenu.DropDownItems.Add(openPluginsFolderItem)
@@ -266,6 +660,13 @@ Namespace GSM.Manager.UI
             ' future entries (online docs, check for updates, report
             ' a bug) can join it without restructuring.
             Dim helpMenu As New ToolStripMenuItem("&Help")
+            Dim checkUpdatesItem As New ToolStripMenuItem("Check for &updates...", Nothing,
+                Sub(s, e) OnCheckForUpdates())
+            helpMenu.DropDownItems.Add(checkUpdatesItem)
+            Dim updateHistoryItem As New ToolStripMenuItem("Update &History...", Nothing,
+                Sub(s, e) OnUpdateHistory())
+            helpMenu.DropDownItems.Add(updateHistoryItem)
+            helpMenu.DropDownItems.Add(New ToolStripSeparator())
             Dim aboutItem As New ToolStripMenuItem("&About PowerGSM...", Nothing,
                 Sub(s, e) OnAbout())
             helpMenu.DropDownItems.Add(aboutItem)
@@ -286,6 +687,33 @@ Namespace GSM.Manager.UI
             _statusLabel.Spring = True
             _statusLabel.TextAlign = ContentAlignment.MiddleLeft
             _statusStrip.Items.Add(_statusLabel)
+
+            ' Phase 5l-1 — persistent "read-only install" indicator.
+            ' Hidden unless the startup writeability probe fails; then
+            ' it stays visible for the session as a reminder that
+            ' self-update can't work from this folder.
+            _readOnlyInstallLabel = New ToolStripStatusLabel("⚠ read-only install") With {
+                .Spring = False,
+                .Visible = False,
+                .Margin = New Padding(0, 0, 12, 0),
+                .ForeColor = Color.FromArgb(160, 90, 0),
+                .ToolTipText = "PowerGSM is installed in a folder it can't write to, so automatic updates won't work. Move it to a writable folder to enable them."
+            }
+            _statusStrip.Items.Add(_readOnlyInstallLabel)
+
+            ' Phase 5l-1 — self-update indicator. Hidden until a check
+            ' finds a newer, non-skipped version; click opens the
+            ' update dialog. Sits between the spring status text and
+            ' the version label.
+            _updateStatusLabel = New ToolStripStatusLabel("") With {
+                .Spring = False,
+                .IsLink = True,
+                .Visible = False,
+                .Margin = New Padding(0, 0, 12, 0),
+                .LinkColor = Color.FromArgb(0, 102, 170)
+            }
+            AddHandler _updateStatusLabel.Click, Sub(s, e) OnUpdateIndicatorClicked()
+            _statusStrip.Items.Add(_updateStatusLabel)
 
             _versionStatusLabel = New ToolStripStatusLabel(GetVersionStatusText())
             _versionStatusLabel.Spring = False
@@ -333,9 +761,16 @@ Namespace GSM.Manager.UI
             _contentPanel.Padding = New Padding(8)
             _splitContainer.Panel2.Controls.Add(_contentPanel)
 
+            ' ---- Notification banner (Phase 5m-2b) ----
+            BuildBanner()
+
             ' ---- Assembly ----
+            ' Dock order matters: the menu is added last so it sits at
+            ' the very top; the banner is added just before it so it
+            ' docks directly beneath the menu and above the split.
             Me.Controls.Add(_splitContainer)
             Me.Controls.Add(_statusStrip)
+            Me.Controls.Add(_bannerPanel)
             Me.Controls.Add(_menuStrip)
         End Sub
 
@@ -416,6 +851,17 @@ Namespace GSM.Manager.UI
         ''' produce a flurry of DB writes.
         ''' </summary>
         Private Sub MainForm_FormClosing(sender As Object, e As FormClosingEventArgs)
+            ' Phase 5m-1b — close-to-tray. A user-initiated close (the
+            ' X) with the preference on hides to tray instead of
+            ' exiting, UNLESS a deliberate exit set _reallyExit (tray
+            ' Exit / File -> Exit). Other close reasons (Windows
+            ' shutdown, Application.Exit) always pass through.
+            If e.CloseReason = CloseReason.UserClosing AndAlso _closeToTray AndAlso Not _reallyExit Then
+                e.Cancel = True
+                Me.Hide()
+                Return
+            End If
+
             Try
                 Dim tags As New HashSet(Of String)(StringComparer.Ordinal)
                 CollectExpandedTags(_treeView.Nodes, tags)
@@ -427,6 +873,15 @@ Namespace GSM.Manager.UI
                     Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
                     db.SetSetting(GsmDataExtensions.SettingKeys.TreeExpandedTags,
                                    JsonSerializer.Serialize(tags.ToList()))
+                    ' Persist the splitter width so the tree/content
+                    ' split is restored next launch (Phase 5m-1b).
+                    ' Guard against a 0/uninitialised distance (e.g.
+                    ' closed while never properly shown) clobbering a
+                    ' good saved width.
+                    If _splitContainer.SplitterDistance >= _splitContainer.Panel1MinSize Then
+                        db.SetSetting(GsmDataExtensions.SettingKeys.SplitterDistance,
+                                       _splitContainer.SplitterDistance.ToString())
+                    End If
                     db.SaveChanges()
                 End Using
             Catch
@@ -445,6 +900,89 @@ Namespace GSM.Manager.UI
                     _statusRefreshTimer = Nothing
                 End If
             Catch
+            End Try
+        End Sub
+
+        ' ============================================================
+        '  System tray (Phase 5m-1)
+        ' ============================================================
+
+        ''' <summary>
+        ''' Restore the window from the tray — used by the tray's
+        ''' Open menu item and double-click. Handles both the
+        ''' minimized and the hidden-to-tray (5m-1b) cases.
+        ''' </summary>
+        Public Sub RestoreFromTray()
+            If Not Me.Visible Then Me.Show()
+            If Me.WindowState = FormWindowState.Minimized Then
+                Me.WindowState = FormWindowState.Normal
+            End If
+            Me.Activate()
+            Me.BringToFront()
+        End Sub
+
+        ''' <summary>
+        ''' Perform a real application exit from the tray. Sets the
+        ''' explicit-exit flag so the close-to-tray interceptor
+        ''' (added in 5m-1b) lets this through rather than hiding the
+        ''' window, then closes the form.
+        ''' </summary>
+        Public Sub ExitFromTray()
+            _reallyExit = True
+            Me.Close()
+        End Sub
+
+        ''' <summary>
+        ''' Dispose the tray icon once the form has actually closed.
+        ''' Done in FormClosed (not FormClosing) so that when the
+        ''' close-to-tray interceptor (5m-1b) cancels a close to hide
+        ''' to tray instead, the icon survives — FormClosed only
+        ''' fires on a real close.
+        ''' </summary>
+        Private Sub MainForm_FormClosed(sender As Object, e As FormClosedEventArgs)
+            _tray?.Dispose()
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5m-1b — minimize-to-tray. When the window is
+        ''' minimized and the preference is on, hide it so the taskbar
+        ''' button disappears; the tray icon is the way back (Open /
+        ''' double-click → RestoreFromTray). No-op when the preference
+        ''' is off (ordinary minimize to taskbar).
+        ''' </summary>
+        Private Sub MainForm_Resize(sender As Object, e As EventArgs)
+            If _minimizeToTray AndAlso Me.WindowState = FormWindowState.Minimized Then
+                Me.Hide()
+                Return
+            End If
+
+            ' Phase 5m-1b — if the saved splitter width couldn't be
+            ' applied at Shown (form started minimized), apply it now
+            ' that the window has a real size. One-shot: cleared once
+            ' applied so it never fights a later user drag.
+            If _pendingSplitterDistance >= 0 AndAlso Me.WindowState = FormWindowState.Normal Then
+                If ApplySplitterDistance(_pendingSplitterDistance) Then
+                    _pendingSplitterDistance = -1
+                End If
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5m-1b — load the three tray preferences from
+        ''' AppSettings into fields. Defaults: minimize-to-tray on,
+        ''' close-to-tray off, start-minimized off. Best-effort; on any
+        ''' DB failure the field defaults stand.
+        ''' </summary>
+        Private Sub LoadTrayPreferences()
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    _minimizeToTray = db.GetSettingBool(GsmDataExtensions.SettingKeys.MinimizeToTray, True)
+                    _closeToTray = db.GetSettingBool(GsmDataExtensions.SettingKeys.CloseToTray, False)
+                    _startMinimized = db.GetSettingBool(GsmDataExtensions.SettingKeys.StartMinimized, False)
+                End Using
+            Catch
+                ' Defaults already set on the fields.
             End Try
         End Sub
 
@@ -749,6 +1287,173 @@ Namespace GSM.Manager.UI
             End Try
         End Function
 
+        ' ============================================================
+        '  Phase 5l-1 — self-update indicator + check
+        ' ============================================================
+
+        ''' <summary>
+        ''' Subscribe to the release checker and show any already-known
+        ''' update in the status bar. Read-only; safe in all modes.
+        ''' </summary>
+        Private Sub InitUpdateIndicator()
+            Try
+                Dim checker = ManagerProgram.Services.GetService(Of GitHubReleaseChecker)()
+                If checker Is Nothing Then Return
+                AddHandler checker.StatusChanged, AddressOf OnUpdateStatusChanged
+                ApplyUpdateStatus(checker.GetPersistedStatus())
+            Catch
+                ' Indicator is best-effort; never block startup.
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' StatusChanged fires on a background thread; marshal to the
+        ''' UI thread before touching the status strip.
+        ''' </summary>
+        Private Sub OnUpdateStatusChanged(sender As Object, status As UpdateStatus)
+            Try
+                If Me.IsHandleCreated AndAlso Not Me.IsDisposed Then
+                    Me.BeginInvoke(New Action(Sub() ApplyUpdateStatus(status)))
+                End If
+            Catch
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Show/hide the status-bar indicator. Shown only when an
+        ''' update is available AND it isn't the version the user chose
+        ''' to skip.
+        ''' </summary>
+        Private Sub ApplyUpdateStatus(status As UpdateStatus)
+            Try
+                If _updateStatusLabel Is Nothing Then Return
+                Dim show = status IsNot Nothing AndAlso status.IsUpdateAvailable AndAlso
+                           Not String.Equals(status.LatestVersion, status.SkippedVersion,
+                                             StringComparison.OrdinalIgnoreCase)
+                If show Then
+                    Dim tag = If(String.IsNullOrEmpty(status.LatestTag),
+                                 "v" & status.LatestVersion, status.LatestTag)
+                    _updateStatusLabel.Text = $"Update available: {tag} →"
+                    _updateStatusLabel.Visible = True
+                Else
+                    _updateStatusLabel.Visible = False
+                End If
+            Catch
+            End Try
+        End Sub
+
+        Private Sub OnUpdateIndicatorClicked()
+            ShowUpdateDialog(Nothing)
+        End Sub
+
+        ''' <summary>
+        ''' Help → Update History. Read-only view of past self-update
+        ''' apply attempts (success + failure), newest first.
+        ''' </summary>
+        Private Sub OnUpdateHistory()
+            Dim orch = ManagerProgram.Services.GetService(Of UpdateOrchestrator)()
+            If orch Is Nothing Then
+                MessageBox.Show(Me, "Update history isn't available.", "Update History",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Return
+            End If
+            Using dlg As New UpdateHistoryDialog(orch)
+                dlg.ShowDialog(Me)
+            End Using
+        End Sub
+
+        ''' <summary>
+        ''' Help → Check for updates. Forces an immediate poll
+        ''' (bypassing the interval throttle), then shows the dialog
+        ''' regardless of the result.
+        ''' </summary>
+        Private Async Sub OnCheckForUpdates()
+            Dim checker = ManagerProgram.Services.GetService(Of GitHubReleaseChecker)()
+            If checker Is Nothing Then
+                MessageBox.Show(Me, "Update checking isn't available.", "Check for updates",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Return
+            End If
+
+            SetStatus("Checking for updates...")
+            Dim status As UpdateStatus = Nothing
+            Try
+                Me.UseWaitCursor = True
+                status = Await checker.CheckNowAsync(System.Threading.CancellationToken.None)
+            Catch
+                ' CheckNowAsync folds its own errors into the status;
+                ' guard here anyway.
+            Finally
+                Me.UseWaitCursor = False
+            End Try
+            SetStatus("Ready")
+            ApplyUpdateStatus(status)
+            ShowUpdateDialog(status)
+        End Sub
+
+        ''' <summary>
+        ''' Open the passive update dialog for the given status (or the
+        ''' last persisted status if Nothing). Applies a "skip this
+        ''' version" choice on return.
+        ''' </summary>
+        Private Sub ShowUpdateDialog(status As UpdateStatus)
+            Dim checker = ManagerProgram.Services.GetService(Of GitHubReleaseChecker)()
+            If status Is Nothing AndAlso checker IsNot Nothing Then
+                status = checker.GetPersistedStatus()
+            End If
+            If status Is Nothing Then Return
+
+            Using dlg As New UpdateDialog(status, InstallEnvironment.IsInstallWritable())
+                dlg.ShowDialog(Me)
+                If dlg.SkipRequested AndAlso Not String.IsNullOrEmpty(status.LatestVersion) Then
+                    PersistSkippedVersion(status.LatestVersion)
+                    If checker IsNot Nothing Then ApplyUpdateStatus(checker.GetPersistedStatus())
+                End If
+                If dlg.ApplyRequested Then
+                    ' apply.cmd is staged. Closing the Manager lets
+                    ' ManagerProgram spawn it on exit and quit cleanly:
+                    ' the watchdog stands down (exit 0) and apply.cmd
+                    ' performs the binary swap + relaunch.
+                    Me.Close()
+                End If
+            End Using
+        End Sub
+
+        Private Sub PersistSkippedVersion(version As String)
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    db.SetSetting(GsmDataExtensions.SettingKeys.UpdateSkippedVersion, version)
+                    db.SaveChanges()
+                End Using
+            Catch
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5l-1 — probe whether the install folder is writable.
+        ''' Toggles the persistent status-bar indicator and, when not
+        ''' writable, shows a one-time dismissable warning. Never
+        ''' blocks any other functionality.
+        ''' </summary>
+        Private Sub CheckInstallWriteability()
+            Try
+                Dim writable = InstallEnvironment.IsInstallWritable()
+                If _readOnlyInstallLabel IsNot Nothing Then _readOnlyInstallLabel.Visible = Not writable
+                If Not writable Then
+                    MessageBox.Show(Me,
+                        "PowerGSM is installed in a location this account can't write to:" & vbCrLf & vbCrLf &
+                        InstallEnvironment.InstallDirectory() & vbCrLf & vbCrLf &
+                        "Automatic updates won't work from here. To enable them, move PowerGSM to a writable " &
+                        "folder such as %USERPROFILE%\PowerGSM and run it from there. You can still update " &
+                        "manually from the Releases page.",
+                        "Read-only install location",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                End If
+            Catch
+            End Try
+        End Sub
+
         ''' <summary>
         ''' Open the modal Help → About dialog. Reachable from the
         ''' Help menu and from clicking the version label in the
@@ -837,12 +1542,26 @@ Namespace GSM.Manager.UI
             Dim orphanDetector = ManagerProgram.Services.GetService(Of PluginOrphanDetector)()
             Dim summary = registry.ReloadAll(orphanDetector)
             SetStatus($"Plugins reloaded: {summary.LoadedPlugins.Count} loaded, {summary.CompilationErrors.Count} errors")
+
+            ' Phase 5m-2e — re-run the orphan reconciliation now that the
+            ' loaded-plugin set may have changed: surfaces newly-orphaned
+            ' entities (a plugin removed/disabled) and clears the banner +
+            ' badges when a restored plugin fixes them.
+            RefreshOrphanWarning(showDialogIfFound:=True)
         End Sub
 
-        Private Sub OnPluginStatus()
-            Using dlg As New PluginStatusForm()
+        ''' <summary>
+        ''' Phase 6-4 — Tools → Manage Plugins: one tabbed window
+        ''' hosting Plugin Status, Sources, and Updates. Anything done
+        ''' inside (install, update, uninstall, enable/disable, reload)
+        ''' can change the orphan set, so refresh the banner + tree
+        ''' badges when it closes.
+        ''' </summary>
+        Private Sub OnManagePlugins()
+            Using dlg As New ManagePluginsForm()
                 dlg.ShowDialog(Me)
             End Using
+            RefreshOrphanWarning()
         End Sub
 
         Private Sub OnOpenPluginsFolder()
@@ -936,6 +1655,9 @@ Namespace GSM.Manager.UI
             Using dlg As New SettingsForm()
                 dlg.ShowDialog(Me)
             End Using
+            ' Phase 5m-1b — pick up any tray-preference changes made
+            ' in Settings without requiring a restart.
+            LoadTrayPreferences()
         End Sub
 
         ''' <summary>
@@ -950,6 +1672,76 @@ Namespace GSM.Manager.UI
             ' being minimized / backgrounded. User can freely switch
             ' between this and other windows.
             win.Show()
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5j-2 — Tools → Purge & Rebuild History handler.
+        ''' Walks the three-form dialog flow:
+        '''
+        '''   1. PurgeAndRebuildHistoryForm — modal confirmation
+        '''      with explicit "what survives / what doesn't"
+        '''      disclosure, affected-instances preview, and a
+        '''      typed-REBUILD gate before Confirm enables.
+        '''   2. PurgeAndRebuildProgressForm — modeless progress
+        '''      dialog updated from the IProgress(Of String)
+        '''      callback while the awaited service call runs.
+        '''   3. PurgeAndRebuildResultForm — modal results summary
+        '''      with row counts and warning list.
+        '''
+        ''' Why modeless progress + disabled-owner instead of
+        ''' ShowDialog: a ShowDialog-modal progress form would
+        ''' have to start the work from its own Shown event and
+        ''' close itself when the task completes, which means
+        ''' threading the result back to the caller through form
+        ''' state — awkward and easy to get wrong. Modeless
+        ''' plus Me.Enabled = False achieves the same "operator
+        ''' can't do anything else right now" effect while letting
+        ''' the caller's Async Sub await the task linearly.
+        ''' </summary>
+        Private Async Sub OnPurgeAndRebuildHistory()
+            Using confirm As New PurgeAndRebuildHistoryForm()
+                If confirm.ShowDialog(Me) <> DialogResult.OK Then Return
+            End Using
+
+            Dim instMgr = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If instMgr Is Nothing Then
+                MessageBox.Show(Me,
+                    "Instance manager service is not available. This shouldn't happen — try restarting the Manager.",
+                    "Purge & Rebuild History",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error)
+                Return
+            End If
+
+            Dim result As PurgeAndRebuildResult = Nothing
+            Dim progressForm As New PurgeAndRebuildProgressForm()
+            Try
+                Dim progress As IProgress(Of String) = New Progress(Of String)(
+                    Sub(msg) progressForm.UpdateMessage(msg))
+                progressForm.Show(Me)
+                progressForm.BringToFront()
+                Me.Enabled = False
+                Try
+                    result = Await instMgr.PurgeAndRebuildHistoryAsync(progress)
+                Finally
+                    Me.Enabled = True
+                End Try
+            Finally
+                Try
+                    If Not progressForm.IsDisposed Then progressForm.Close()
+                Catch
+                End Try
+                Try
+                    progressForm.Dispose()
+                Catch
+                End Try
+                Me.Activate()
+            End Try
+
+            If result IsNot Nothing Then
+                Using resForm As New PurgeAndRebuildResultForm(result)
+                    resForm.ShowDialog(Me)
+                End Using
+            End If
         End Sub
 
         ' ============================================================
@@ -1026,12 +1818,28 @@ Namespace GSM.Manager.UI
                         Sub(s, ev) OnDeleteInstallation(entityId))
 
                 Case "instance"
-                    menu.Items.Add("Start", Nothing,
+                    ' Phase 5m-2e — Start/Restart are blocked for an
+                    ' orphaned instance (no loaded plugin): starting it
+                    ' would launch an unmanageable, untracked process.
+                    ' Stop stays enabled so a still-running orphan can
+                    ' be brought down. The InstanceManager start guard
+                    ' is the real backstop; this just greys the menu.
+                    Dim instanceOrphaned = _orphanedInstanceIds.Contains(entityId)
+                    Dim orphanTip = "The game plugin for this instance isn't loaded — restore it and reload plugins before starting."
+                    Dim startItem As New ToolStripMenuItem("Start", Nothing,
                         Async Sub(s, ev) Await OnStartInstance(entityId))
+                    Dim restartItem As New ToolStripMenuItem("Restart", Nothing,
+                        Async Sub(s, ev) Await OnRestartInstance(entityId))
+                    If instanceOrphaned Then
+                        startItem.Enabled = False
+                        startItem.ToolTipText = orphanTip
+                        restartItem.Enabled = False
+                        restartItem.ToolTipText = orphanTip
+                    End If
+                    menu.Items.Add(startItem)
                     menu.Items.Add("Stop", Nothing,
                         Async Sub(s, ev) Await OnStopInstance(entityId))
-                    menu.Items.Add("Restart", Nothing,
-                        Async Sub(s, ev) Await OnRestartInstance(entityId))
+                    menu.Items.Add(restartItem)
                     menu.Items.Add(New ToolStripSeparator())
                     menu.Items.Add("View Logs", Nothing,
                         Sub(s, ev)
@@ -1065,6 +1873,12 @@ Namespace GSM.Manager.UI
         ' ============================================================
         '  Node CRUD
         ' ============================================================
+
+        Private Sub OnUpdateNodes()
+            Using dlg As New NodeUpdatesForm()
+                dlg.ShowDialog(Me)
+            End Using
+        End Sub
 
         Private Sub OnEditNode(nodeId As String)
             Using dlg As New NodeSetupForm(nodeId)
@@ -1787,6 +2601,10 @@ Namespace GSM.Manager.UI
         Private Function ResolveInstanceIcon(instanceId As String) As StatusIcon
             If String.IsNullOrEmpty(instanceId) Then Return StatusIcon.None
 
+            ' Phase 5m-2e — orphaned (no loaded plugin) outranks every
+            ' live state; the instance can't be managed at all.
+            If _orphanedInstanceIds.Contains(instanceId) Then Return StatusIcon.DarkRed
+
             Dim instMgr = ManagerProgram.Services.GetService(Of InstanceManager)()
             If instMgr Is Nothing Then Return StatusIcon.Gray
 
@@ -1836,6 +2654,10 @@ Namespace GSM.Manager.UI
         ''' </summary>
         Private Function ResolveInstallationIcon(installationId As String) As StatusIcon
             If String.IsNullOrEmpty(installationId) Then Return StatusIcon.None
+
+            ' Phase 5m-2e — orphaned (no loaded plugin) outranks every
+            ' other state; the installation can't be managed at all.
+            If _orphanedInstallationIds.Contains(installationId) Then Return StatusIcon.DarkRed
 
             Dim installMgr = ManagerProgram.Services.GetService(Of InstallationManager)()
             If installMgr IsNot Nothing AndAlso installMgr.IsActive(installationId) Then

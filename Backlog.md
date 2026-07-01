@@ -11,6 +11,142 @@ doc (or open a new mini-plan), then delete from here.
 
 ## Hardening & QoL
 
+### Conan world-stable identity
+
+**Surfaced:** Phase 5g-2d planning, May 2026.
+**Priority:** Low-medium. Improves Conan-specific identity
+scoping in the IdentityResolver; not blocking the resolver
+itself (which is designed to treat `SessionIdentity` as
+opaque).
+
+**Background:** Phase 5g-2d's IdentityResolver scopes player
+identity by `(gameId, SessionScope, ...)` where `SessionScope`
+is a plugin-emitted opaque string. For LO this is
+`lastoasis:{realmId}` — the LO backend exposes a stable realm
+identifier in log lines, so the scope tracks the actual world
+regardless of which install hosts it. For Conan, the equivalent
+stable world identifier is not exposed in log output; the plugin
+falls back to `conanexiles:{installId}`, which is fine for the
+common case but bleeds identity across worlds if an operator
+swaps `game.db` files between worlds without moving installs.
+
+The two ugly options forced by Conan's design:
+
+- Accept install-scope bleed and document "run Purge & Rebuild
+  after world swap" as the recovery story (current v1 default).
+- Find a stable identifier inside `game.db` itself and have the
+  Conan plugin read it at instance start, emitting as part of
+  `SessionIdentity`.
+
+**What to do:** Inspect a `game.db` file (Funcom Conan Exiles
+server databases are SQLite) and look for:
+
+- A `game_settings` or `server_settings` table with a UUID or
+  unique persistent name
+- A `worlds` or equivalent table with metadata (creation
+  timestamp + world seed combo is stable across saves)
+- A "server name" / "world name" field, even if user-editable
+  (rename is rare; rename + game.db swap rarer still)
+- Some kind of internal Funcom UUID stamped at world-generation
+
+If a stable identifier exists, update the Conan plugin to read
+it at instance start and include it in the emitted
+`SessionIdentity` string (e.g., `conanexiles:{worldUuid}`).
+Resolver behaviour is unchanged — only the Conan plugin's scope-
+emission rule needs updating.
+
+**Inspection result (2026-05-27):** No built-in stable world
+identifier anywhere in `game.db`. Checked `dw_settings`
+(migration-state key-value table, 8 rows, all game-version-stable
+but not world-unique), SQLite pragmas (all zero), `static_buildables`
+(reveals map name e.g. Siptah but not unique identity),
+`characters.id` / `account.id` (world-local but content-dependent
+and not a fingerprint). The two original ugly options stand, but
+a better third option emerged:
+
+**Option C: Synthesize-on-first-observation.** Conan plugin
+reads `dw_settings` at instance bootstrap. If a row
+`(name='gsm_world_uuid', value=<uuid>)` exists, use it. If not,
+generate a fresh UUID and INSERT it into `dw_settings` before
+Conan launches (we own the db file at that moment, no locking
+concerns). UUID rides every save, every backup, every restore;
+travels with the world data not the install (copy game.db to
+another install → same UUID → resolver correctly recognises the
+same world); differs across distinct worlds (new world = new
+db = no row = fresh UUID). Minor edge case: rollback to a
+backup predating the injection gets a fresh UUID on next
+start, which is arguably correct since that rollback is
+identity-discontinuous with the rolled-forward state.
+
+This is the recommended v2 approach. v1 ships with install-scope
+as the default until Conan plugin work is prioritised.
+
+**Why deferred:** Implementation requires Conan plugin updates
+plus careful db-write timing (only during instance bootstrap,
+before Conan launches). The resolver design works correctly
+with install-scope as a fallback, so this is a quality
+improvement rather than a blocker.
+
+**Pickup notes:** v2 implementation outline:
+1. Conan plugin gains a pre-launch step: open `game.db` (use
+   `Microsoft.Data.Sqlite`, already in the Manager's NuGet),
+   `SELECT value FROM dw_settings WHERE name='gsm_world_uuid'`
+2. If no row: `INSERT INTO dw_settings VALUES('gsm_world_uuid', <new-guid>)`, commit, close
+3. Whichever path, emit `SessionIdentity` as
+   `conanexiles:{worldUuid}` instead of
+   `conanexiles:{installId}`
+4. Handle migration: existing PlayerActivity rows for this
+   instance with `SessionIdentity` of the old install-scope form
+   need either a one-time UPDATE to the new scope value, OR a
+   resolver-side alias entry so old and new keys collide into
+   one identity. Easier: write a small migration helper that
+   reassigns SessionIdentity for the historical rows the first
+   time the Conan plugin detects it just made the transition.
+
+### Conan authoritative identity hydration from game.db
+
+**Surfaced:** Phase 5g-2d planning, 2026-05-27 (during the
+world-identity investigation above).
+**Priority:** Medium-high. Replaces the 5g-2c temporal-
+heuristic / cid-stash workaround with authoritative server-side
+data.
+
+**Background:** Conan's `game.db` contains authoritative
+player-identity mappings that the 5g-2c work had to reconstruct
+from log patterns + timing heuristics. Specifically:
+
+```
+account.platformId  →  account.id  →  characters.playerId  →  characters.char_name
+76561197986549670   →  1           →  1                    →  blingess
+76561198023980280   →  2           →  2                    →  Gina
+```
+
+A JOIN of the two tables gives us Steam ID ↔ character name
+directly, no log scraping or temporal heuristics required. The
+cid-stash logic from 5g-2c becomes a fallback for the brief
+window before the first db read, not the primary mechanism.
+
+**What to do:** Conan plugin reads `account JOIN characters`
+on instance start and periodically (every few minutes, or on
+each `/players` poll). For each row, fires an Observe call on
+the Manager's IdentityResolver with `(PlatformUserId=platformId,
+CharacterId=characters.id, DisplayName=char_name)`. The resolver
+merges with whatever it has, and consumers (Overview panel,
+Discord display, History) get accurate identity from cold start
+— no warm-up period required.
+
+**Why deferred:** Depends on 5g-2d (IdentityResolver) shipping
+first, and on the Conan plugin's instance-start hook gaining a
+db-read step. Both are modest changes individually but make
+sense to land together after the resolver exists.
+
+**Pickup notes:** Read concurrency is fine — SQLite handles
+multiple readers, and Conan only writes during gameplay
+(periodic saves). Use `FileShare.ReadWrite Or FileShare.Delete`
+as with the LO log tailer pattern. Polling cadence should match
+the Overview panel's refresh (so observations land just before
+the panel renders).
+
 ### Player-list ghost on misrouted connection
 
 **Surfaced:** Phase 5g planning, May 2026.

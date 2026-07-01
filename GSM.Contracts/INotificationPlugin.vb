@@ -226,6 +226,23 @@ Namespace GSM.Notification
         Public Property Tokens As NotificationTokens
         Public Property Metadata As Dictionary(Of String, String)
         Public Property Timestamp As DateTime
+
+        ''' <summary>
+        ''' Scope fan-out (Phase 5n): every instance ID this event
+        ''' pertains to. One entry for instance-level events; for
+        ''' installation-level events (e.g. updates) it is every
+        ''' instance under the installation, so an instance- or
+        ''' set-scoped destination still matches. Empty when neither
+        ''' applies. Used by notification scope matching, not templates.
+        ''' </summary>
+        Public Property ScopeInstanceIds As List(Of String)
+
+        ''' <summary>
+        ''' Scope fan-out (Phase 5n): the distinct non-empty instance
+        ''' set tags of the instances in ScopeInstanceIds. Matched
+        ''' case-sensitively against the instance-set scope filter.
+        ''' </summary>
+        Public Property ScopeInstanceSetTags As List(Of String)
     End Class
 
     ''' <summary>
@@ -270,6 +287,16 @@ Namespace GSM.Notification
         ''' the MapPath. Token: {TileName}.
         ''' </summary>
         Public Property TileName As String
+
+        ''' <summary>
+        ''' The instance's free-form set tag
+        ''' (InstanceEntity.InstanceSetTag) at the time the event
+        ''' fired, consumed by notification scope's instance-set
+        ''' dimension. Empty when the event isn't tied to a specific
+        ''' instance (e.g. installation-level events). Token:
+        ''' {InstanceSetTag}.
+        ''' </summary>
+        Public Property InstanceSetTag As String
 
         Public Property CustomTokens As Dictionary(Of String, String)
     End Class

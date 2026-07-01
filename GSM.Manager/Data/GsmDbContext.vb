@@ -353,6 +353,65 @@ Namespace GSM.Manager.Data
     End Class
 
     ''' <summary>
+    ''' Phase 5l-3 — one row per self-update apply attempt. Powers
+    ''' Help → Update history. Written by UpdateOrchestrator: a
+    ''' Success row on the post-update startup, a Failed row when a
+    ''' prior apply left an apply-error.log behind.
+    ''' </summary>
+    Public Class UpdateHistoryEntity
+        Public Property HistoryId As String
+        Public Property AppliedAtUtc As DateTime
+        Public Property FromVersion As String
+        Public Property ToVersion As String
+        ''' <summary>"Success" or "Failed".</summary>
+        Public Property Outcome As String
+        ''' <summary>Optional detail — error text for failures.</summary>
+        Public Property Detail As String
+    End Class
+
+    ''' <summary>
+    ''' Phase 6-2 — a GitHub location the Manager can browse for
+    ''' plugins (.vb files whose inline &lt;plugin&gt; manifests are
+    ''' parsed into a catalog). The official source (siteml/PowerGSM
+    ''' at GSM.PluginsSource/) is seeded on first run and cannot be
+    ''' deleted, only disabled.
+    ''' </summary>
+    Public Class PluginSourceEntity
+        Public Property SourceId As String
+        Public Property DisplayName As String
+        ''' <summary>GitHub owner (user or org), e.g. "siteml".</summary>
+        Public Property Owner As String
+        Public Property Repo As String
+        ''' <summary>Folder within the repo holding plugin .vb files
+        ''' (empty = repo root).</summary>
+        Public Property RepoPath As String
+        ''' <summary>Branch to read from, e.g. "master".</summary>
+        Public Property Branch As String
+        ''' <summary>True only for the seeded official source — its
+        ''' plugins may use bare ids; it can't be deleted.</summary>
+        Public Property IsOfficial As Boolean
+        Public Property IsEnabled As Boolean
+        Public Property LastFetchedUtc As DateTime?
+    End Class
+
+    ''' <summary>
+    ''' A shared web session held by the Manager on behalf of utility
+    ''' plugins (Phase 7-5). Keyed by a plugin-chosen convention
+    ''' "{site}:{account}" (e.g. "myrealm:default"); the cookie
+    ''' header is DPAPI-encrypted at rest (CurrentUser scope, same as
+    ''' Steam credentials).
+    ''' </summary>
+    Public Class WebSessionEntity
+        Public Property SessionKey As String
+        Public Property EncryptedCookieHeader As Byte()
+        Public Property CapturedAtUtc As DateTime
+        ''' <summary>Plugin id that performed the capture — audit
+        ''' only; any web-capture plugin may read the session.</summary>
+        Public Property CapturedByPluginId As String
+        Public Property LastUsedUtc As DateTime?
+    End Class
+
+    ''' <summary>
     ''' A named set of fields that notifications are ALLOWED to expose.
     ''' Destinations reference a profile to decide how much detail their
     ''' messages contain — e.g. a Public profile strips IPs, paths, keys;
@@ -401,6 +460,23 @@ Namespace GSM.Manager.Data
         ''' filter — an event must pass both to be sent.
         ''' </summary>
         Public Property InstanceFilterJson As String
+
+        ''' <summary>
+        ''' Phase 5n — JSON array of node IDs this destination cares
+        ''' about. Part of the union-of-includes scope model: an event
+        ''' is in scope if it matches ANY populated scope dimension
+        ''' (node / installation / instance / set); all four empty =
+        ''' all instances. Honoured at send time from Phase 5n-2 on.
+        ''' </summary>
+        Public Property NodeFilterJson As String
+
+        ''' <summary>
+        ''' Phase 5n — JSON array of InstanceSetTag values this
+        ''' destination cares about. Case-sensitive match (parity with
+        ''' RuleScope.InstanceSet). Part of the union-of-includes scope
+        ''' model (see NodeFilterJson).
+        ''' </summary>
+        Public Property InstanceSetFilterJson As String
 
         Public Property VisibilityProfileId As String
 
@@ -519,6 +595,17 @@ Namespace GSM.Manager.Data
         Public Property MessageId As String
 
         Public Property DisplayName As String
+
+        ''' <summary>
+        ''' Panel kind discriminator (Phase 5k). "InstanceManager"
+        ''' (default) renders the instance status / Manage panel;
+        ''' "PlayerList" renders the online-players roster panel.
+        ''' Short string for the same reason as ScopeKind / GroupingKind
+        ''' (no EF int-enum coupling). Defaults to "InstanceManager" so
+        ''' every pre-5k row reads as the original panel kind.
+        ''' </summary>
+        Public Property PanelKind As String = "InstanceManager"
+
         Public Property ScopeKind As String
         Public Property ScopeTargetId As String
 
@@ -560,6 +647,31 @@ Namespace GSM.Manager.Data
         ''' grouped — the two decisions are orthogonal.
         ''' </summary>
         Public Property GroupingKind As String = "None"
+
+        ''' <summary>
+        ''' Player-list panels (PanelKind = "PlayerList") hide instance
+        ''' groups with nobody online by default, so empty servers don't
+        ''' waste vertical space. Set True to show every in-scope
+        ''' instance regardless of occupancy. Ignored by InstanceManager
+        ''' panels. Defaults False (hide empties).
+        ''' </summary>
+        Public Property ShowEmptyGroups As Boolean = False
+
+        ''' <summary>
+        ''' Player-list panels: when True, each player row also shows
+        ''' the player's join time as a relative Discord timestamp
+        ''' ("joined <t:…:R>"), sourced from PlayerSession.JoinedUtc.
+        ''' Ignored by InstanceManager panels. Defaults False.
+        ''' </summary>
+        Public Property ShowJoinTime As Boolean = False
+
+        ''' <summary>
+        ''' Player-list panels: when True, the total online count is
+        ''' appended to the panel title ("Players online (12)") on top
+        ''' of the footer total. Ignored by InstanceManager panels.
+        ''' Defaults False.
+        ''' </summary>
+        Public Property ShowTotalInTitle As Boolean = False
 
         Public Property CreatedUtc As DateTime
         Public Property UpdatedUtc As DateTime
@@ -945,6 +1057,9 @@ Namespace GSM.Manager.Data
         Public Property PlayerActivity As DbSet(Of PlayerActivityEntity)
         Public Property AppSettings As DbSet(Of AppSettingEntity)
         Public Property SharedConfigGroups As DbSet(Of SharedConfigGroupEntity)
+        Public Property UpdateHistory As DbSet(Of UpdateHistoryEntity)
+        Public Property PluginSources As DbSet(Of PluginSourceEntity)
+        Public Property WebSessions As DbSet(Of WebSessionEntity)
 
         Protected Overrides Sub OnModelCreating(modelBuilder As ModelBuilder)
             modelBuilder.ApplyConfiguration(New NodeEntityConfig())
@@ -966,6 +1081,9 @@ Namespace GSM.Manager.Data
             modelBuilder.ApplyConfiguration(New PlayerActivityEntityConfig())
             modelBuilder.ApplyConfiguration(New AppSettingEntityConfig())
             modelBuilder.ApplyConfiguration(New SharedConfigGroupEntityConfig())
+            modelBuilder.ApplyConfiguration(New UpdateHistoryEntityConfig())
+            modelBuilder.ApplyConfiguration(New PluginSourceEntityConfig())
+            modelBuilder.ApplyConfiguration(New WebSessionEntityConfig())
         End Sub
 
     End Class
@@ -1168,6 +1286,20 @@ Namespace GSM.Manager.Data
             ' ScopeKind. "None" / "ByNode" / "ByGame" /
             ' "ByNodeThenGame". 40 chars matches the convention.
             builder.Property(Function(e) e.GroupingKind).IsRequired().HasMaxLength(40)
+            ' PanelKind discriminator (Phase 5k): "InstanceManager" /
+            ' "PlayerList". Same short-string shape as ScopeKind; the
+            ' DB-level default backfills pre-5k rows to the original
+            ' kind on migration.
+            builder.Property(Function(e) e.PanelKind).
+                IsRequired().HasMaxLength(40).HasDefaultValue("InstanceManager")
+            ' ShowEmptyGroups (Phase 5k): player-list hide-empty toggle;
+            ' DB default False = hide empty instance groups.
+            builder.Property(Function(e) e.ShowEmptyGroups).HasDefaultValue(False)
+            ' ShowJoinTime / ShowTotalInTitle (Phase 5k-2c): player-list
+            ' display toggles; DB default False so pre-5k-2c rows keep
+            ' the original look (no join time, count only in footer).
+            builder.Property(Function(e) e.ShowJoinTime).HasDefaultValue(False)
+            builder.Property(Function(e) e.ShowTotalInTitle).HasDefaultValue(False)
             ' LayoutJson is intentionally uncapped TEXT — it's a
             ' structured JSON document whose size grows with the
             ' element catalogue. Nullable: NULL = use the default
@@ -1350,6 +1482,43 @@ Namespace GSM.Manager.Data
         End Sub
     End Class
 
+    Public Class UpdateHistoryEntityConfig
+        Implements IEntityTypeConfiguration(Of UpdateHistoryEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of UpdateHistoryEntity)) Implements IEntityTypeConfiguration(Of UpdateHistoryEntity).Configure
+            builder.HasKey(Function(e) e.HistoryId)
+            builder.Property(Function(e) e.Outcome).IsRequired().HasMaxLength(40)
+            builder.Property(Function(e) e.FromVersion).HasMaxLength(100)
+            builder.Property(Function(e) e.ToVersion).HasMaxLength(100)
+            builder.HasIndex(Function(e) e.AppliedAtUtc)
+        End Sub
+    End Class
+
+    Public Class PluginSourceEntityConfig
+        Implements IEntityTypeConfiguration(Of PluginSourceEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of PluginSourceEntity)) Implements IEntityTypeConfiguration(Of PluginSourceEntity).Configure
+            builder.HasKey(Function(e) e.SourceId)
+            builder.Property(Function(e) e.DisplayName).IsRequired().HasMaxLength(200)
+            builder.Property(Function(e) e.Owner).IsRequired().HasMaxLength(100)
+            builder.Property(Function(e) e.Repo).IsRequired().HasMaxLength(100)
+            builder.Property(Function(e) e.RepoPath).HasMaxLength(300)
+            builder.Property(Function(e) e.Branch).HasMaxLength(100)
+            builder.HasIndex(Function(e) New With {e.Owner, e.Repo, e.RepoPath}).IsUnique()
+        End Sub
+    End Class
+
+    Public Class WebSessionEntityConfig
+        Implements IEntityTypeConfiguration(Of WebSessionEntity)
+
+        Public Sub Configure(builder As EntityTypeBuilder(Of WebSessionEntity)) Implements IEntityTypeConfiguration(Of WebSessionEntity).Configure
+            builder.HasKey(Function(e) e.SessionKey)
+            builder.Property(Function(e) e.SessionKey).HasMaxLength(200)
+            builder.Property(Function(e) e.EncryptedCookieHeader).IsRequired()
+            builder.Property(Function(e) e.CapturedByPluginId).HasMaxLength(100)
+        End Sub
+    End Class
+
     ' ============================================================
     '  Design-time factory (for EF migrations)
     ' ============================================================
@@ -1448,11 +1617,43 @@ Namespace GSM.Manager.Data
         End Sub
 
         ''' <summary>
+        ''' Read a boolean setting, stored as "1"/"0" (the int
+        ''' convention GetSettingInt uses). Returns defaultValue if
+        ''' the key is absent or unparseable. Phase 5m-1.
+        ''' </summary>
+        <Runtime.CompilerServices.Extension>
+        Public Function GetSettingBool(db As GsmDbContext,
+                                       key As String,
+                                       defaultValue As Boolean) As Boolean
+            Return db.GetSettingInt(key, If(defaultValue, 1, 0)) <> 0
+        End Function
+
+        ''' <summary>
+        ''' Write a boolean setting as "1"/"0". Caller is responsible
+        ''' for SaveChanges. Phase 5m-1.
+        ''' </summary>
+        <Runtime.CompilerServices.Extension>
+        Public Sub SetSettingBool(db As GsmDbContext, key As String, value As Boolean)
+            db.SetSetting(key, If(value, "1", "0"))
+        End Sub
+
+        ''' <summary>
         ''' Well-known setting keys. Use these instead of string
         ''' literals so typos are compile errors.
         ''' </summary>
         Public Class SettingKeys
             Public Const ChatRetentionDays As String = "ChatRetentionDays"
+            ''' <summary>Phase 5m-1 tray preferences (0/1 ints).
+            ''' MinimizeToTray hides the window on minimize;
+            ''' CloseToTray hides it on the X instead of exiting;
+            ''' StartMinimized launches minimized (→ straight to the
+            ''' tray when MinimizeToTray is also on).</summary>
+            Public Const MinimizeToTray As String = "ui.minimizeToTray"
+            Public Const CloseToTray As String = "ui.closeToTray"
+            Public Const StartMinimized As String = "ui.startMinimized"
+            ''' <summary>Phase 5m-1b — last tree/content splitter width
+            ''' in px; restored on next launch.</summary>
+            Public Const SplitterDistance As String = "ui.splitterDistance"
             ''' <summary>
             ''' JSON array of TreeNode.Tag values that were expanded
             ''' when the Manager last closed. Restored on next start so
@@ -1461,6 +1662,31 @@ Namespace GSM.Manager.Data
             ''' future tag formats.
             ''' </summary>
             Public Const TreeExpandedTags As String = "TreeExpandedTags"
+            ''' <summary>
+            ''' Phase 5l-1 — self-update. State keys (written by the
+            ''' update checker as it polls) and config keys (set in
+            ''' Settings). Versions are stored as the raw semver string
+            ''' (e.g. "0.4.0" or "0.4.0-rc1"); the tag keeps its
+            ''' leading "v". Source is "owner/repo".
+            ''' </summary>
+            Public Const UpdateLastCheckUtc As String = "update.lastCheckUtc"
+            Public Const UpdateLatestVersion As String = "update.latestVersion"
+            Public Const UpdateLatestTag As String = "update.latestTag"
+            Public Const UpdateReleaseBody As String = "update.releaseBody"
+            Public Const UpdateReleaseUrl As String = "update.releaseUrl"
+            Public Const UpdateSkippedVersion As String = "update.skippedVersion"
+            Public Const UpdateIncludePrereleases As String = "update.includePrereleases"
+            Public Const UpdateCheckIntervalHours As String = "update.checkIntervalHours"
+            Public Const UpdateSource As String = "update.source"
+            ' Phase 5l-2 — version currently downloaded + extracted under
+            ' <AppDir>\.updates\{version}\extracted, ready to apply.
+            Public Const UpdateStagedVersion As String = "update.stagedVersion"
+            ' Phase 5l-3 — running version captured at apply time so the
+            ' post-update binary can record from→to in update history.
+            Public Const UpdatePendingFromVersion As String = "update.pendingFromVersion"
+            ' Phase 6-3 — JSON list of staged (downloaded + validated,
+            ' not yet installed) plugins; see PluginStageService.
+            Public Const PluginsStaged As String = "plugins.staged"
         End Class
 
         ''' <summary>
@@ -1469,6 +1695,15 @@ Namespace GSM.Manager.Data
         ''' per-install via the settings UI in Round D.
         ''' </summary>
         Public Const DefaultChatRetentionDays As Integer = 90
+
+        ''' <summary>
+        ''' Phase 5l-1 — self-update defaults, used when the AppSetting
+        ''' rows are absent. Source is the official "owner/repo";
+        ''' check interval is in hours (GitHub's unauthenticated API
+        ''' allows 60 req/hr/IP, so 4h — ~6/day — is far under budget).
+        ''' </summary>
+        Public Const DefaultUpdateSource As String = "siteml/PowerGSM"
+        Public Const DefaultUpdateCheckIntervalHours As Integer = 4
 
         ' ============================================================
         '  SortOrder helpers

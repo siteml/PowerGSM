@@ -59,7 +59,8 @@ Public Module ServiceManager
     ''' SCP/SFTP from a Windows publish typically arrive at mode 0644,
     ''' which prevents systemd (and the user) from running them. This
     ''' setup tool is already running so it has +x on itself; from here
-    ''' we can fix its sibling Node binary in one shot.
+    ''' we can fix its sibling Node and per-instance GSM.Shim binaries in
+    ''' one shot.
     '''
     ''' Uses File.SetUnixFileMode (.NET 7+). No-op on Windows. Best
     ''' effort — a chmod failure isn't fatal because the operator can
@@ -69,17 +70,47 @@ Public Module ServiceManager
     Public Sub EnsureNodeExecutable()
         If ConfigHelpers.RunningOnWindows() Then Return
 
-        Dim nodePath = GetNodeExecutablePath()
-        If Not File.Exists(nodePath) Then Return
+        EnsureExecutable(GetNodeExecutablePath())
+        EnsureShimsExecutable()
+    End Sub
 
+    ''' <summary>
+    ''' Sets +x on every deployed GSM.Shim binary. The node launches a
+    ''' per-instance shim from GSM.Shim/&lt;version&gt;/GSM.Shim (highest
+    ''' version wins), and like the Node binary these arrive at mode 0644
+    ''' from a Windows SCP/SFTP publish, which makes the node's launch fail
+    ''' with a permission error that surfaces as "shim spawn failed". We
+    ''' chmod every version folder present, not just the newest, since it's
+    ''' cheap and avoids a surprise if an older one is ever selected.
+    ''' </summary>
+    Private Sub EnsureShimsExecutable()
         Try
-            Dim currentMode = File.GetUnixFileMode(nodePath)
+            Dim shimRoot = Path.Combine(AppContext.BaseDirectory, "GSM.Shim")
+            If Not Directory.Exists(shimRoot) Then Return
+            For Each verDir In Directory.EnumerateDirectories(shimRoot)
+                Dim shimPath = Path.Combine(verDir, "GSM.Shim")
+                If File.Exists(shimPath) Then EnsureExecutable(shimPath)
+            Next
+        Catch
+            ' Best effort; the operator can still chmod manually.
+        End Try
+    End Sub
+
+    ''' <summary>
+    ''' Adds the execute bit (user/group/other) to a single file if it
+    ''' isn't already set. No-op when the file is missing or on any error
+    ''' (the operator can still chmod manually). Caller guarantees Linux.
+    ''' </summary>
+    Private Sub EnsureExecutable(path As String)
+        If Not File.Exists(path) Then Return
+        Try
+            Dim currentMode = File.GetUnixFileMode(path)
             Dim newMode = currentMode Or
                           UnixFileMode.UserExecute Or
                           UnixFileMode.GroupExecute Or
                           UnixFileMode.OtherExecute
             If currentMode <> newMode Then
-                File.SetUnixFileMode(nodePath, newMode)
+                File.SetUnixFileMode(path, newMode)
             End If
         Catch
             ' Best effort; the operator can still chmod manually.
@@ -226,6 +257,62 @@ Public Module ServiceManager
         Return "Unknown"
     End Function
 
+    ''' <summary>
+    ''' Starts the GSMNode Windows service via `sc start`. Used by the
+    ''' self-update relauncher (SelfUpdateApply) after it has swapped the new
+    ''' binary into place. On Windows only. Treats sc error 1056 ("an instance
+    ''' of the service is already running") as success, since for the relaunch
+    ''' use case an already-running service is the desired end state.
+    ''' </summary>
+    Public Function StartWindowsService(serviceName As String) As ServiceResult
+        If Not ConfigHelpers.RunningOnWindows() Then
+            Return New ServiceResult With {.Success = False, .Message = "Not on Windows."}
+        End If
+        If String.IsNullOrWhiteSpace(serviceName) Then serviceName = DefaultServiceName
+
+        Dim out As String = Nothing
+        Dim ok = RunSc({"start", serviceName}, out)
+        If Not ok AndAlso out IsNot Nothing AndAlso out.Contains("1056") Then
+            ok = True
+        End If
+
+        Return New ServiceResult With {
+            .Success = ok,
+            .Message = If(ok,
+                          $"Service '{serviceName}' start requested.",
+                          $"Failed to start service '{serviceName}'."),
+            .Output = out
+        }
+    End Function
+
+    ''' <summary>
+    ''' Stops the GSMNode Windows service via `sc stop`. Used by the self-update
+    ''' relauncher's rollback path (SelfUpdateApply) to release the running
+    ''' binary before swapping the previous one back. On Windows only. Treats sc
+    ''' error 1062 ("the service has not been started") as success, since a
+    ''' not-running service is the desired end state for a rollback.
+    ''' </summary>
+    Public Function StopWindowsService(serviceName As String) As ServiceResult
+        If Not ConfigHelpers.RunningOnWindows() Then
+            Return New ServiceResult With {.Success = False, .Message = "Not on Windows."}
+        End If
+        If String.IsNullOrWhiteSpace(serviceName) Then serviceName = DefaultServiceName
+
+        Dim out As String = Nothing
+        Dim ok = RunSc({"stop", serviceName}, out)
+        If Not ok AndAlso out IsNot Nothing AndAlso out.Contains("1062") Then
+            ok = True
+        End If
+
+        Return New ServiceResult With {
+            .Success = ok,
+            .Message = If(ok,
+                          $"Service '{serviceName}' stop requested.",
+                          $"Failed to stop service '{serviceName}'."),
+            .Output = out
+        }
+    End Function
+
     Private Function RunSc(args As String(), ByRef output As String) As Boolean
         Try
             Dim psi As New ProcessStartInfo("sc.exe") With {
@@ -257,23 +344,81 @@ Public Module ServiceManager
 
     ''' <summary>
     ''' Builds a systemd unit file as a string. The service is configured
-    ''' as Type=simple (the node runs in the foreground), restarts on
-    ''' failure, and runs as the supplied user. If runAsUser is empty the
+    ''' as Type=notify (so systemd knows when the node is actually ready —
+    ''' the node calls UseSystemd() and sends READY=1 on startup), restarts
+    ''' on failure, and runs as the supplied user. If runAsUser is empty the
     ''' unit is generated WITHOUT a User= line, letting the admin set it
-    ''' before installing.
+    ''' before installing. Emits KillMode=process so the per-instance
+    ''' GSM.Shim supervisors and their game servers survive a node restart
+    ''' (the node re-adopts them) instead of being cgroup-killed along with
+    ''' the service on `systemctl stop`.
+    '''
+    ''' ExecStartPre is an apply-or-revert step (Phase 8-2 slices 6 + 8b-2):
+    ''' a staged GSM.Node.new is applied (keeping the previous binary as
+    ''' GSM.Node.old) and marked GSM.Node.update-pending; if a later start
+    ''' still sees that marker — i.e. the applied update never became healthy
+    ''' and cleared it — the unit rolls GSM.Node.old back over the bad binary
+    ''' (quarantined as GSM.Node.failed). StartLimit* bounds the restart loop
+    ''' so a hopeless binary stops thrashing once the rollback has had its
+    ''' chance.
     ''' </summary>
     Public Function BuildSystemdUnit(runAsUser As String) As String
         Dim nodePath = GetNodeExecutablePath()
         Dim workingDir = Path.GetDirectoryName(nodePath)
+        ' Phase 8-2 self-update: the node stages an update next to itself as
+        ' "<node>.new" and exits; this unit swaps it into place on the next
+        ' start, keeping the previous binary as "<node>.old" for rollback.
+        ' 8b-2 adds a health gate: applying a .new drops a ".update-pending"
+        ' marker that the node clears once healthy; a marker that outlives a
+        ' start means the update failed, so we revert .old and quarantine the
+        ' bad binary as ".failed".
+        Dim stagedNewPath = nodePath & ".new"
+        Dim keptOldPath = nodePath & ".old"
+        Dim quarantinedPath = nodePath & ".failed"
+        Dim pendingMarker = nodePath & ".update-pending"
 
         Dim sb As New StringBuilder()
         sb.AppendLine("[Unit]")
         sb.AppendLine("Description=PowerGSM Node — game server management agent")
         sb.AppendLine("After=network-online.target")
         sb.AppendLine("Wants=network-online.target")
+        ' Bound the restart loop so a binary that can't come up (or a failed
+        ' rollback) stops thrashing. The 8b-2 revert needs ~2 starts (bad ->
+        ' rollback -> good), well within the burst; this only trips on a
+        ' genuinely hopeless loop.
+        sb.AppendLine("StartLimitIntervalSec=200")
+        sb.AppendLine("StartLimitBurst=5")
         sb.AppendLine()
         sb.AppendLine("[Service]")
-        sb.AppendLine("Type=simple")
+        ' Type=notify: the node integrates systemd (UseSystemd()) and sends
+        ' READY=1 once the host is listening, so a binary that starts but never
+        ' becomes ready counts as a FAILED start (Restart=on-failure fires) —
+        ' the "hung but alive" case Type=simple can't detect. This is what lets
+        ' the 8b-2 health gate catch an update that comes up broken.
+        sb.AppendLine("Type=notify")
+        sb.AppendLine("NotifyAccess=main")
+        ' Idempotent apply-or-revert, runs before every ExecStart:
+        '   * If GSM.Node.new is staged (Phase 8-2): move the live binary aside
+        '     to GSM.Node.old, the staged one into place, re-mark it +x (a
+        '     freshly-written .new may arrive 0644), and drop a .update-pending
+        '     marker. The node deletes that marker once it has been healthy for
+        '     a grace period (NodeProgram).
+        '   * Else if a .update-pending marker is still here AND a .old exists
+        '     (8b-2): the last applied update never confirmed healthy, so roll
+        '     back — quarantine the bad live binary as .failed, restore .old,
+        '     +x, and clear the marker. Restart=on-failure drives the restart
+        '     that reaches this branch; StartLimit* stops a hopeless loop.
+        '   * Else: no-op (every normal start).
+        ' The presence of .new is the entire forward-update state, so a
+        ' staged-but-unapplied update (crash/reboot/power-loss mid-update) is
+        ' simply applied on the next start. All renames are within the node's
+        ' own powergsm-owned directory (no extra privilege) and atomic within
+        ' one filesystem, so the binary is only ever old/new/failed, never torn.
+        ' No `set -e`, and each branch ends on an exit-0 command, so an
+        ' interruption self-heals next start and ExecStartPre never blocks
+        ' ExecStart.
+        sb.AppendLine(
+            $"ExecStartPre=/bin/sh -c 'if [ -f ""{stagedNewPath}"" ]; then mv -f ""{nodePath}"" ""{keptOldPath}""; mv -f ""{stagedNewPath}"" ""{nodePath}""; chmod +x ""{nodePath}""; touch ""{pendingMarker}""; elif [ -f ""{pendingMarker}"" ] && [ -f ""{keptOldPath}"" ]; then mv -f ""{nodePath}"" ""{quarantinedPath}""; mv -f ""{keptOldPath}"" ""{nodePath}""; chmod +x ""{nodePath}""; rm -f ""{pendingMarker}""; fi'")
         sb.AppendLine("ExecStart=" & nodePath)
         sb.AppendLine("WorkingDirectory=" & workingDir)
         If Not String.IsNullOrWhiteSpace(runAsUser) Then
@@ -281,6 +426,19 @@ Public Module ServiceManager
         End If
         sb.AppendLine("Restart=on-failure")
         sb.AppendLine("RestartSec=5")
+        ' KillMode=process is load-bearing for restart-survivable instances.
+        ' The node launches a per-instance GSM.Shim that owns the actual game
+        ' process; both live in this unit's cgroup. Under the systemd default
+        ' (KillMode=control-group), `systemctl stop` SIGKILLs the entire
+        ' cgroup - node, shim, AND game - so a node bounce takes every server
+        ' down. process mode signals only the main node; the shim + game
+        ' (reparented to PID 1) survive, and the next node re-adopts them over
+        ' their sockets. Trade-off: `systemctl stop gsmnode` now leaves games
+        ' running by design - stop instances from the manager first for a
+        ' full teardown.
+        sb.AppendLine("# Signal only the node on stop so the per-instance shims")
+        sb.AppendLine("# and their game servers survive a node restart (re-adopted).")
+        sb.AppendLine("KillMode=process")
         sb.AppendLine("StandardOutput=journal")
         sb.AppendLine("StandardError=journal")
         sb.AppendLine()

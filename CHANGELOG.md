@@ -9,7 +9,1125 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-01
+
+### Added
+
+- **Windrose Slice 4 — player-event tracking + server-state surface.** Plugins
+  only (`GSM.PluginsSource\WindrosePlugin.vb`); `GSM.Contracts`, Node, and
+  Manager untouched. Verified against real `Windrose R5.log` captures
+  (UE5.6.1 / project R5).
+  - **Two halves, both required (matching Conan / LO / Factorio).** The plugin
+    shipped through Slice 1 with `CreateLogParser` returning `Nothing`, so
+    player join/leave never reached the Manager's History — the node populated
+    `/players` but nothing turned that into History rows.
+    - **Node-side `GetLogParseRules`** — declarative regex rules the node's
+      `EventStore` applies to keep `/players` + server-state authoritative
+      (survives Manager offline). Player connect binds `AccountId` + IP on one
+      `VerifyUeCredentials` line; roster-dump line enriches the in-game name;
+      farewell / disconnect resolve the leave. `AccountId` (32-char hex) maps to
+      **CharacterId**, not PlatformUserId — the node's `players` table is keyed
+      by `character_id` and `PersistPlayer` no-ops on an empty one, so a
+      pid-only session was tracked live but never persisted. Server-ready +
+      world identity land via `TileLoaded` (MapPath, short TileName, IslandId →
+      TileId); listen port, max tick rate, and shutdown reason are harvested as
+      `Custom_*` fields; the exit-reason rule ignores the redundant second
+      `EngineExit()` line.
+    - **Manager-side `WindroseLogParser` (`ILogParser`)** — drives live
+      join/leave into `PlayerActivity` (History) + join/leave notifications.
+      Join anchors on the canonical `LogNet: Join succeeded: <name>` (same line
+      Conan uses). The leave lines carry only `AccountId`, so the parser
+      harvests an `AccountId → Name` binding from the roster-dump lines and
+      resolves leave names through it (same shape as Conan's IP→name binding,
+      keyed on AccountId since Windrose leave lines have no IP).
+
+- **Phase 8-2 slices 7b / 7c — shim + NodeSetup co-update (the Manager can now
+  push a new shim or a new NodeSetup to a node, not just the node binary).**
+  Node + Manager; `GSM.Contracts` untouched (the staged-binary transport already
+  carried an arbitrary `target` + `version`).
+  - **Node — three target *shapes* (`GSM.Node\SelfUpdate.vb`).** `ResolveTarget`
+    now maps `node` / `nodesetup` / `shim` to a shape: **SwapWithSurvivor**
+    (node — stage `.new`, a survivor swaps it over live and relaunches on exit,
+    as before), **SwapInPlace** (nodesetup — stage `.new`, the node swaps its
+    *idle* NodeSetup binary in place keeping `.old`; the node does **not**
+    bounce, and there is no auto-revert — a bad NodeSetup is only exercised on
+    the next node apply, `.old` kept for manual restore), and
+    **VersionedInstall** (shim — the verified bytes are installed straight into
+    `GSM.Shim\<version>\GSM.Shim[.exe]` at commit; no `.new`, no swap, no exit).
+    `apply-update` dispatches on shape and only stops the host for the node
+    target (`ApplyResult.RequiresExit`).
+  - **Shim place is lock-safe, then fail-clean.** A brand-new version folder is
+    conflict-free. A same-version RE-push (e.g. replacing a corrupted shim)
+    tries to free the destination — delete if idle, else rename the live exe
+    aside (`*.superseded-*`, swept on next node start) — and if the OS pins it
+    (a running shim the OS/AV/indexer won't release) the **commit fails cleanly
+    with 409** ("restart the instances on that shim version, or push a higher
+    version"), leaving the verified `.part` for the sweep. Nothing is ever
+    half-applied or torn. Renaming an in-use file within a volume is usually
+    permitted on Windows but is treated as best-effort, not relied upon.
+  - **Shim version is path-sanitized** (`[0-9A-Za-z.+-]`, no `..` / separators);
+    a shim push without a usable version is refused at `begin` (400).
+  - **Manager — Target selector wired (`NodeUpdatesForm` + `NodeReleaseSource`).**
+    The Nodes → Update Nodes dialog's Target dropdown (Node / Shim / NodeSetup)
+    now drives the push. Node stages → applies → polls for relaunch; shim /
+    nodesetup stage → apply → "Installed" (the node stays up). Manual-pick and
+    feed modes both source the right binary from the **same node zip** — node /
+    nodesetup at the zip root, shim from its `GSM.Shim\<ver>\` folder — with the
+    download+extract reused across targets for a (version, rid). Shim versions
+    are stripped at `+` so the node's version folder parses. Confirm prompts
+    describe the actual per-target effect (only Node goes briefly offline).
+
+- **Phase 8-2 slice 8 — self-update health gate + auto-rollback (a bad node
+  update now reverts itself instead of bricking the node).** Three layers of
+  defense around the slice-6 / 7a stage → apply → relaunch path; all node-side,
+  `GSM.Contracts` untouched.
+  - **8a — commit-time OS-match guard (`GSM.Node\SelfUpdate.vb`).** Before a
+    staged upload is promoted to `.new`, the node sniffs its magic bytes
+    (`0x7F ELF` / `MZ` PE) and refuses (422, deleting the `.part`) a binary that
+    is a recognized executable for the *wrong* OS — so a wrong-platform push can
+    never reach the swap. Mirrors the Manager-side picker guard; only a definite
+    mismatch is blocked (an unrecognized format passes through to the health
+    gate). The Manager already blocks this at file selection, so the node guard
+    is defense-in-depth for direct-API / future-bug callers.
+  - **8b-1 — NodeSetup survivor health gate + revert
+    (`GSM.NodeSetup\SelfUpdateApply.vb`).** On the Windows-service /
+    Windows-bare / Linux-bare relaunch paths, after applying an update the
+    survivor polls `http://127.0.0.1:<port>/api/version` (port from
+    `nodesettings.json`; unauthenticated) for up to 60 s. If the new node never
+    answers it **rolls back**: stop the bad node (`sc stop`, or kill just the
+    node PID for direct launch — shims/games survive), quarantine the bad binary
+    as `.failed`, restore `.old`, relaunch the previous binary, and re-confirm
+    it. New exit codes 5 (rolled back) / 6 (rollback itself failed).
+    `ServiceManager` gained `StopWindowsService`.
+  - **8b-2 — systemd survivor health gate + revert (`GSM.NodeSetup\
+    ServiceManager.vb` unit + `GSM.Node\NodeProgram.vb`).** The generated unit
+    becomes `Type=notify` (the node already sends `READY=1` via `UseSystemd()`,
+    so a binary that starts but never goes ready now counts as a *failed* start
+    — the "hung but alive" case `Type=simple` misses), gains
+    `StartLimitIntervalSec=200` / `StartLimitBurst=5` to bound the loop, and its
+    `ExecStartPre` becomes apply-**or**-revert: applying a `.new` drops a
+    `.update-pending` marker that the node deletes once it has been healthy for
+    15 s; a marker that outlives a start (with a `.old` present) triggers a
+    rollback — quarantine the bad binary as `.failed`, restore `.old`, clear the
+    marker. Survives crash / reboot / power-loss mid-update.
+  - **Deployment note:** the systemd half lives in the unit file, so an existing
+    systemd node only gets 8b-2 once its unit is regenerated (re-run NodeSetup
+    install / rewrite `gsmnode.service` + `daemon-reload`); the marker-clear half
+    ships with the next node binary. Both halves are needed.
+
+- **Phase 8-2 slice 7a — Manager → node binary push (the Manager can now
+  *pitch* an update to a node, not just catch one).** Slice 6 gave the node the
+  receive / apply / survive machinery; 7a is the Manager side that drives it.
+  **Verified working end-to-end against the live Linux node** (stage → apply →
+  survivor swap → relaunch → shim re-adopt, game PID unchanged). Manager-only —
+  `GSM.Contracts` untouched.
+  - **Push transport on `NodeHttpClient`** (concrete-only, deliberately *not* on
+    `INodeClient`, following the `TryGetCachedVersion` precedent — no full-
+    solution Contracts rebuild; promote later if a second caller needs it).
+    `StageBinaryAsync(target, localFile, version, ct)` SHA-256 + sizes the file,
+    then walks the node's `staged-binary` endpoint — `begin` → `chunk*` (8 MB,
+    append-only, offset-validated; a 409 re-seeks to the node's reported offset
+    and resumes) → `commit` (the node re-verifies size + SHA-256 over the whole
+    file before renaming `.part` to the target's `.new`). Runs on a one-shot
+    infinite-timeout `HttpClient` (same rationale as `UploadFileAsync`) so a
+    tens-of-MB push isn't chopped by the shared 30 s timeout.
+    `ApplyUpdateAsync(target, ct)` POSTs `apply-update` and returns the survivor
+    (202) or throws `NodeApiException(Conflict)` when nothing is staged. Sourcing
+    is decoupled: the caller supplies a local file; release-feed download/verify
+    is a later slice.
+  - **Permanent UI: Nodes → "Update Nodes…"** (`NodeUpdatesForm`, modelled on
+    `PluginUpdatesForm`). A checkbox list of every configured node — display
+    name, address, current build + platform + reachability (probed concurrently,
+    each ~8 s-bounded so one unreachable node doesn't stall the list), and a
+    per-node Result. Multi-select, then **Update…** stages → applies → polls
+    `/api/version` until the node relaunches (≤60 s), writing the outcome into
+    each row. Every node is handled **independently** — an unreachable, detached,
+    or failing node never blocks the rest.
+  - **OS-match guard.** The picked file's actual format is sniffed from its magic
+    bytes (`0x7F ELF` → Linux, `MZ` → Windows), independent of filename, and must
+    match each target node's reported OS. A **mixed-platform selection pops one
+    file selector per platform present** (a Linux binary *and* a Windows binary)
+    and routes each node to the build it can run; a wrong-format pick offers
+    Retry/Cancel; an unrecognised file warns before proceeding; a node whose OS
+    was never reported (`Unknown`) is skipped in a typed push.
+  - **Manual push is a first-class, permanent path** — the operator may push a
+    release build *or* their own build; they own the versioning and the
+    consequences, with the node's commit-time SHA-256 + size check and the
+    survivor relaunch as the integrity backstops. The optional Version field is
+    prefilled from the file's `ProductVersion` when blank (metadata for the node
+    target; structural for the shim target later).
+  - **Target selector (Node / Shim / NodeSetup)** is present from day one with
+    only **Node** wired; Shim and NodeSetup snap back with a "later version"
+    note, making the **per-target separation** explicit. Node, shim, and
+    NodeSetup updates are deliberately **decoupled from the Manager's own
+    self-update** (Help → Check for updates) **and from each other** — multi-node
+    fleets routinely have a node that's offline, mid-session, or not one the
+    operator wants to touch yet.
+
+- **Phase 8-2 slice 7-source — feed-driven node sourcing (push *the latest
+  release* to a node without hand-picking a file).** Builds on 7a's manual
+  push: the Manager can now show what the newest release is and source the
+  per-platform node binary from the GitHub release feed itself. Manager-only —
+  `GSM.Contracts` untouched.
+  - **7-source-a — Latest column.** `NodeUpdatesForm` resolves the newest
+    release once per load (the background `GitHubReleaseChecker`'s persisted
+    result, or one bounded live check if nothing's cached) and adds a **Latest**
+    column comparing each reachable node's installed build against it
+    (`SemanticVersion`): a node behind the release reads `X (update)` and its row
+    is tinted; a current node reads `current`. The status line gains a
+    `· latest release X` note.
+  - **7-source-b — one-click feed sourcing.** A **Latest release** checkbox
+    swaps the per-platform file picker for a download. New `NodeReleaseSource`
+    (`GSM.Manager.Core`) takes a platform + release tag, finds that release's
+    `PowerGSM-Node-{ver}-{rid}.zip`, downloads it, **SHA-256 verifies it against
+    the release `SHA256SUMS`**, extracts the inner `GSM.Node[.exe]`, and hands
+    back the local path — which then feeds the *same* stage → apply → relaunch
+    loop the manual push uses. One download per platform is cached and shared
+    across same-platform nodes in a batch (a 5-Linux-node update fetches once);
+    the cache lives under `<install>\.node-updates\<ver>\<rid>\` and re-checks
+    `File.Exists` before reuse. Trust chain: release `SHA256SUMS` → verified zip
+    → extracted binary → the existing push (which re-SHAs on the wire) → the
+    node's commit-time re-verify. Unknown-platform nodes have no release asset to
+    match and are skipped; the manual file-pick path is unchanged and remains
+    first-class. The node zip also carries `GSM.Shim/` + `GSM.NodeSetup`, so the
+    later shim (7b) / NodeSetup (7c) co-updates source from the same download.
+  - **Shared release-asset helpers.** The asset-fetch / find-URL / parse-sums /
+    SHA-256 / download-with-progress helpers (and the `ReleaseWithAssets` /
+    `ReleaseAsset` DTOs) that drive the Manager's own self-update were lifted out
+    of `UpdateOrchestrator` into a shared `ReleaseAssetHelpers` (`ReleaseAssets.vb`)
+    so node sourcing and Manager self-update share one verified-download path.
+
+- **Phase 8-3 — shim rediscovery + `node.db` hardening (`node.db` becomes a
+  cache, not a source of truth).** A lost or corrupt `node.db` no longer orphans
+  running games. **Built clean on all targets; runtime verification deferred
+  (build-only this pass).** See `Phase8-3_Plan.md`.
+  - **Shim rediscovery sweep** (`ProcessManager.SweepAdoptLiveShims` +
+    `EnumerateShimEndpoints` + `TryLeanAdoptShim`, called after `AdoptSnapshots`
+    in `NodeProgram`). The shim endpoint is a pure function of the instance id
+    (`pipe:powergsm-shim-<id>` / `unix:<dataDir>/shims/<id>.sock`), so after the
+    snapshot pass the node enumerates the OS shim namespace (named pipes on
+    Windows, the socket dir on Linux), probes each
+    (`ShimSession.ProbeEndpointAsync` — connect, handshake, read, close;
+    time-boxed, never throws), and **lean-adopts any live shim whose id isn't
+    already adopted**. The snapshot pass runs first, so snapshot-backed
+    instances keep their full recovery payload; the sweep only fills the gaps (a
+    wiped/corrupt `node.db`, or a snapshot row that failed to adopt while its
+    shim is alive). The sweep always runs and no-ops cheaply on already-adopted
+    ids.
+  - **Shim reports its own identity + tail paths in the handshake.**
+    `HelloAckMessage` gains `InstanceId` (the sweep recovers the true id from
+    the shim — `SanitizeId` is lossy, so the pipe/socket name can't be reversed)
+    and `LogFilePaths`; `SpawnSpec` gains `LogFilePaths`. The node hands the
+    shim the resolved tail paths at spawn; the shim remembers them and echoes
+    them on every later handshake. Both additions are append-only (no
+    `ProtocolVersion` bump). A **pre-8-3 shim answers without them and is skipped
+    by the sweep** (logged "older shim") — only relevant on the `node.db`-loss
+    path, since the snapshot path still adopts older shims.
+  - **Lean adopt** (`TryLeanAdoptShim`) registers EventStore with an empty rule
+    set (so the instance is a valid push target — `UpdateParseRules` ignores
+    unregistered instances) with `hydrateState:=True`, recovers the log paths the
+    shim echoed and starts file tailers (`skipResume:=True`, switching
+    `CaptureStdout` off since the file is authoritative), and sets
+    `CrashPolicy = NeverRestart` (there's no `StartInfo` to rebuild a
+    `SpawnSpec`). Net: a lean-adopted game is statused, stoppable,
+    stdout/exit-relayed, and file-tailed — so player/chat/server-state tracking
+    resumes go-forward — and the Manager's existing stream-health reconnect
+    re-pushes the real parse rules within ~3s. **Residual gap (by design):** no
+    crash-restart until the instance is fully restarted (closing it needs the
+    shim to echo the full `SpawnSpec` — deferred Tier-3 work). Adopt tailers
+    start from end (`skipResume`), so recovery is go-forward, not a historical
+    rebuild of the current player list — identical to a normal node restart.
+  - **Corrupt-`node.db` self-heal** (`NodeDatabase`). The DDL body moved to
+    `EnsureCreatedCore`; `EnsureCreated` wraps it and, on `SqliteException` with
+    `SqliteErrorCode` 11 (`SQLITE_CORRUPT`) or 26 (`SQLITE_NOTADB`) **only**,
+    clears the connection pool, renames the bad file aside
+    (`node.db.corrupt-<timestamp>`, surfaced via `LastCorruptionBackup`), drops
+    the `-wal`/`-shm`/`-journal` sidecars, and recreates empty — then `Main`
+    logs the reset at Warning once the logger exists. Any other SqliteException
+    (locked, busy, readonly, …) is not corruption and propagates unchanged.
+    Previously a corrupt file threw out of `Main` before `app.Run()` and
+    crash-looped the node (under systemd, until StartLimit gave up). Combined
+    with the sweep: corrupt `node.db` → reset empty → sweep re-adopts the live
+    shims → nothing orphaned.
+
+- **Phase 8-2 (slice 6) — node self-update (staging + external swap
+  survivors).** The node can now receive a new binary, stage it, and bounce
+  itself into it without losing the games it supervises — the swap is performed
+  by something that *outlives* the node, since a process can't replace the
+  image it's executing. **Verified end to end on all four survivor paths —
+  Linux (systemd + bare-exe) and Windows (service + bare-exe)** — game PID
+  unchanged across the bounce in each. Manager-driven push, version detection,
+  and NodeSetup/shim co-update are slice 7. See `Phase8-2_Plan.md`.
+  - **Chunked staging endpoint** (`SelfUpdate.vb`, `SystemEndpoints`) —
+    `POST /api/system/staged-binary/{begin,{uploadId}/chunk,{uploadId}/commit}`:
+    a begin/chunk/commit session streams the binary append-only to a temp
+    `.part` (offset-validated per chunk, so it resumes from the last good
+    offset), then commit verifies SHA-256 + declared size over the whole file
+    and atomic-renames `.part` → `GSM.Node.new` beside the live binary
+    (`GSM.Node.exe.new` on Windows), `+x` on Linux. Bearer-gated like every
+    `/api/*` route; the chunk endpoint lifts its own request-body cap. The
+    chunk shape (rather than a single streamed PUT) keeps each request under
+    Kestrel's body limit and gives the Manager progress/resume/cancel for free.
+    The node only verifies the bytes the Manager declares — the trust boundary
+    is the Manager's verified push (slice 7), not the node.
+  - **Graceful update-exit** (`POST /api/system/apply-update`) — refuses with
+    409 if nothing is staged; otherwise picks a survivor and exits through the
+    *normal* graceful path (`IHostApplicationLifetime.StopApplication()` →
+    `ApplicationStopping` → `DetachShimsForShutdown`, so the shim-backed games
+    survive), never a hard `Environment.Exit`. The 202 flushes before the host
+    tears down.
+  - **Universal-fallback survivor model.** The node picks its survivor at exit
+    from the supervision signal it already has
+    (`SystemdHelpers.IsSystemdService()`): **only a node actually running under
+    systemd** defers the swap to the unit's new idempotent `ExecStartPre`
+    (`.new` → live, keep `.old`, re-`chmod +x`, guarded so it's a no-op on a
+    normal start) and the relaunch to `Restart=on-failure`; **everything else
+    — Windows service, Windows bare, *and Linux bare* — spawns a detached
+    `GSM.NodeSetup --apply-update --wait-pid <self>`** (`SelfUpdateApply.vb`)
+    that waits for the node PID to die, swaps `.new` over the live binary
+    (keeping `.old`, retrying on a transient lock), and relaunches via
+    `sc start` if the service is installed or a direct exec otherwise. This
+    closes the gap where a Linux node run as a plain foreground exe (no systemd)
+    would otherwise stage an update with no one to apply it. On Windows the
+    detached spawn uses `CreateProcessW` with
+    `CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+    (falling back to `Process.Start` if breakaway is refused) so the SCM/job
+    can't reap the survivor with the service.
+  - **Exit-code predicate.** The node exits non-zero (code 10) *iff* it's
+    relying on systemd's `Restart=on-failure` to relaunch it; otherwise it
+    exits 0, because NodeSetup owns the relaunch and a non-zero exit from a
+    Windows service would race SCM recovery. (A clean exit, not a signal, so
+    journald doesn't read the systemd case as a crash.) The flag is read from a
+    reference captured *before* `app.Run()` — the host's DI container is
+    disposed when `Run` returns, so resolving the service afterwards throws and
+    would silently drop the node back to exit 0.
+  - **`--self-update-dry-run` harness** (`SelfUpdateDryRun.vb`) — exercises the
+    whole path with no Manager and no hand-driven HTTP, modelled on the
+    `--shim-self-test` / `--shim-reconnect-test` harnesses. Stages the running
+    binary through the real begin/chunk/commit code, then (unless
+    `--stage-only`) POSTs apply-update to the running node over loopback
+    (reading port + token from `nodesettings.json`). Transcript to console and
+    `self-update-dryrun-result.txt`; the survivor leaf logs to
+    `nodesetup-apply.log`.
+
+- **Phase 8-1 (in progress) — per-instance shim supervisor (Strategy A).**
+  Groundwork so a Node restart stops severing a stdout-piped game's output:
+  each Strategy-A instance now runs its game under a tiny per-instance
+  `GSM.Shim` process that owns the game's stdin/stdout/stderr and relays them
+  to the Node over a named pipe (Windows) / Unix socket (Linux) — the Node
+  never holds the game's pipes. **Build-verified on Windows; the live game
+  test runs on the Linux node.** See `Phase8_Plan.md`.
+  - New projects `GSM.Shim.Protocol` (versioned, append-only frame protocol)
+    and `GSM.Shim` (self-contained .NET 8, native spawn — `CreateProcessW` on
+    Windows, `posix_spawn`/`pipe2` on Linux, the Linux path starting the game
+    in a new session via `POSIX_SPAWN_SETSID` so a terminal Ctrl+C can't
+    reach it; passes `GSM.Shim --self-test` on the Linux node);
+    the shim binary deploys side-by-side at `GSM.Shim\{version}\`.
+  - Node-side `ShimSession` client + `ProcessManager` routing: Strategy A
+    (stdout-captured) instances start / stop / restart through the shim,
+    with stdout lines flowing into the same ring buffer / EventStore as
+    before. Strategy B/C (Windows hidden-console games like LO and Factorio)
+    also route through the shim now — spawned with their own hidden console
+    (cmd-wrapped for Factorio); the Node tails their log files as before.
+    Optional `nodesettings` `Node:DisableShim` kill-switch
+    (default off). New optional `InstanceStatusResponse.SupervisorPid`
+    surfaces the shim PID; the reported `Pid` stays the game.
+  - **Restart-survivable (Strategy A).** The shim keeps its game + output
+    ring alive across a Node disconnect and replays buffered output to the
+    next Node that reconnects; on startup the Node re-adopts shim instances
+    by reconnecting to the live shim (by saved endpoint) rather than
+    re-deriving a process handle, and sends `Detach` on a clean shutdown so a
+    deliberate Node restart leaves the game running. The reconnect mechanism
+    is proven on Windows (`--shim-reconnect-test`: same game pid + shim pid +
+    replayed output across a detach/re-adopt); end-to-end restart survival
+    with a live game is verified on the Linux node.
+  - **Graceful stop + Ctrl+C.** Stopping a shim-mode game now sends the real
+    shutdown signal first — `CTRL_C_EVENT` (Windows, via `GSM.CtrlCSender`) /
+    `SIGTERM` (Linux), delivered straight to the game by PID — and only
+    escalates to a hard kill if it doesn't exit in time; the shim flushes the
+    game's final output before reporting the exit, so a clean shutdown's last
+    log lines (world save, "shutdown complete") aren't lost. Separately,
+    **Ctrl+C in the Node console once again closes the Node** (it had been
+    suppressed so a game-stop signal couldn't bounce back and kill the Node):
+    the suppression is now scoped to just the moment the Node is firing that
+    signal, so a user Ctrl+C shuts the Node down gracefully — detaching the
+    shims so the games keep running, and the next start re-adopts them.
+
+- **Startup config render (`IStartupFileProvider`).** A third
+  field→runtime bridge alongside launch args and user-triggered file
+  generation: the Manager renders selected instance-config values into a
+  game's **own** config file just before launch, preserving everything
+  else in the file. Closes two gaps — file-only games (no launch args)
+  couldn't receive an allocator-assigned port, and arg-garbling text
+  values (Conan's server name / password) corrupted through the command
+  line but read clean from a config file. See
+  `StartupConfigRender_Plan.md`.
+  - **Contract + Manager hook** — new opt-in side-interface
+    `IStartupFileProvider` (`GetStartupFiles` / `RenderStartupFile`) in
+    `GSM.Contracts`; `ContractsVersion` unchanged at 2 (the still-in-dev
+    v2 surface was never released, so the render folds in without a
+    bump; adopting plugins declare `requiresContracts="2"`).
+    `InstanceManager.ApplyStartupFileRendersAsync` runs inside
+    `StartInstanceAsync` after the config-layer merge and before the
+    start request, reusing the file editor's node download/upload
+    endpoints (404 → empty, write only on a diff). **Proceed-and-warn:**
+    a render read/write hiccup logs a warning and the launch continues
+    with the file's last values. **Single-ownership:** a value rendered
+    at start is removed from the file-editor schema for the same file,
+    so the editor and the Configuration tab never fight.
+  - **Windrose** — `UseDirectConnection` + `DirectConnectionServerPort`
+    (`IsPort`, now allocator-managed) moved from the
+    `ServerDescription.json` editor to the Configuration tab and
+    rendered into `ServerDescription_Persistent` at launch (skipped on
+    first launch so the server creates the file; port stamped only in
+    direct mode). Verified live: a freshly-allocated port bound by the
+    engine in direct mode with no config on the command line.
+  - **Conan Exiles** — `ServerName` (off the launch URL) and
+    `ServerPassword` (off the Engine.ini editor) are now Configuration
+    fields rendered into `Engine.ini` `[OnlineSubsystem]`; the
+    "Network (Engine.ini)" structured editor tab is removed (raw
+    `Engine.ini` still editable via the `.ini` browser). `ServerName`
+    always writes (blank → default name). `ServerPassword` is
+    **set / keep / clear** via a new **Clear server password** checkbox:
+    a non-empty field writes it, blank-with-checkbox-unticked preserves
+    the existing file value, blank-with-checkbox-ticked writes an empty
+    password (open server). The INI section-writer was extracted into a
+    shared `WriteIniSection` used by both the editor and the render.
+    **Migration:** a Conan instance whose password was set via the old
+    Engine.ini editor keeps that password (blank field + unticked
+    checkbox preserves it); re-enter it on the Configuration tab only if
+    you want PowerGSM to manage it going forward.
+
+- **Phase 5n — Notification scope rework (UI + schema).** The
+  `NotificationsForm` scope section is rebuilt around a
+  **union-of-includes** model across four dimensions — Node,
+  Installation, Instance, and Instance-set — replacing the old
+  two-widget AND-narrowing whose "leave deselected = all" rule was
+  invisible and whose instances panel read as broken on open. An
+  instance is in scope if it matches **any** checked dimension; only
+  the all-empty state means "all instances." Sets reuse the existing
+  per-instance `InstanceSetTag` (no new entity, no set-management UI —
+  the form only consumes the tag). See `Phase5n_Plan.md`.
+  - **Schema + editor (5n-1)** — `NotificationDestinationEntity` gains
+    `NodeFilterJson` and `InstanceSetFilterJson` (additive TEXT
+    columns; forward-only migration `NotificationScopeDimensions`);
+    `DestinationEdit` round-trips all four filters (the set filter is
+    `Ordinal`, matching `RuleScope.InstanceSet`; the ID filters stay
+    `OrdinalIgnoreCase`). The editor is a four-section collapsible
+    accordion (Nodes / Installations / Instances / Instance sets), each
+    header carrying a live "N of M selected" summary, with a persistent
+    "Matches N of M instance(s)" readout. The scope sections, Events,
+    and Visibility now share one dock-stacked column that grows to fit
+    its content and is scrolled by the details panel as a whole: each
+    section's list grows to show every row (no nested list scrollbar),
+    and the lists forward the mouse wheel to the panel so scrolling
+    works with the pointer over a section. *At this slice the new
+    Node/Set filters persisted but stayed inert — runtime still used
+    the prior AND on the original two filters; 5n-2 wires them in.*
+  - **Runtime union + scope fan-out (5n-2)** — both Discord transports
+    (webhook and bot) now evaluate the four filters as a
+    **union-of-includes** at send time, replacing the old AND-narrowing
+    on the original two filters: an event is in scope if it matches
+    **any** populated dimension, and the all-empty destination still
+    matches everything. Because installation-level events (the three
+    Update events, emitted with no instance) carry no instance or set
+    tag of their own, they are **fanned out** at emit time across every
+    instance under the installation — so a destination scoped to an
+    instance, or to an instance-set tag carried by one of those
+    instances, now receives that installation's update notifications
+    instead of silently missing them. The model is "an event carries
+    every scope identifier it relates to; a filter matches on
+    intersection." `NotificationContext` gains `ScopeInstanceIds` /
+    `ScopeInstanceSetTags` (matching-only collections, populated in the
+    emitter) and `NotificationTokens` gains `InstanceSetTag`
+    (`{InstanceSetTag}` is now a substitutable template token); all
+    three are additive, so `ContractsVersion` is unchanged. *The
+    `{InstanceSetTag}` token stays single-valued and renders empty on
+    installation-level update events (no single instance to name) —
+    fan-out affects matching, not substitution.* **Back-compat:**
+    destinations saved before the rework that relied on the old
+    AND-narrowing are left as-is and must be reconfigured once against
+    the union model.
+  - **Panel ID surfacing (5n-3)** — `NodePanel`, `InstallationPanel`,
+    and `InstancePanel` show their `NodeId` / `InstallationId` /
+    `InstanceId` as a dim sub-label with a right-click **Copy ID**, via
+    a shared `PanelIdLabel` helper, so the GUIDs behind history/log
+    lines are identifiable when display names aren't.
+
+- **Phase 7 — Utility plugins (Manager-side, headless).** A second
+  plugin kind alongside game plugins: `IUtilityPlugin` plugins
+  aren't tied to a game and don't manage installations or
+  instances — they react to Manager-wide events and act through a
+  capability-gated context. They ride the same Phase 6 pipeline
+  (inline manifest, Roslyn compile, sources/stage/consent/install,
+  hot-reload) with two extra rules: a `<plugin>` manifest is
+  REQUIRED (no legacy leniency) and `IUtilityPlugin.PluginId` must
+  match the manifest id. Contracts surface lives in the new
+  `GSM.Utility` namespace; `ContractsVersion` bumped 1 → 2 (a
+  documented exception to the breaking-only rule — a new
+  plugin-facing surface bumps so plugins that require it fail fast
+  on an older Manager; v1 game plugins load unchanged). See
+  `Phase7_Plan.md`.
+  - **Discovery + Status (7-1)** — utility plugins are discovered
+    in the same per-file compile; the Plugin Status list renames
+    "Game ID" → "Plugin ID" and adds a **Kind** column (Game /
+    Utility).
+  - **Host + event dispatch (7-2)** — a `UtilityPluginHost`
+    (driven by a new `PluginRegistry.Reloaded` event) gives each
+    plugin lifecycle (Initialize/Shutdown) and a per-plugin bounded
+    queue drained on a background task, so a slow or throwing
+    plugin can never block the Manager. Repeated failures suspend a
+    plugin's delivery (shown as "Suspended" in Status) until the
+    next reload. Events tap `NotificationEmitter.Emitted`:
+    PlayerJoin / PlayerLeave / InstanceStarted / InstanceStopped /
+    InstanceCrashed. Plugins declare interest via `SubscribedEvents`
+    (ChatMessage / ServerStateChange delivery is deferred to 7-4a).
+  - **Capabilities + consent + gating (7-3)** — plugins declare
+    capabilities in a manifest `requires="..."` attribute
+    (`events`, `identity-read`, `identity-write`, `notifications`,
+    `network`, `config`, `web-capture`); the install/update consent
+    prompts list them, and the runtime context throws a
+    descriptive error on undeclared access. Real gated services:
+    broadcast notifications, identity resolve/contribute (through
+    IdentityResolver), a per-plugin config bag, and a **Configure...**
+    dialog in the Status tab (renders `GetConfigSchema()` via
+    SchemaFormBuilder). Honest scoping: this is informed consent +
+    convenience-API gating, NOT a sandbox.
+  - **Embedded-browser session capture (7-3 r2, Decision 7a)** —
+    `IUtilityContext.CaptureWebSessionAsync` shows a Manager-owned
+    **WebView2** dialog where the user performs a real third-party
+    login (genuine portal + Steam Guard; PowerGSM never sees
+    credentials), then harvests the resulting session cookies via
+    `CookieManager.GetCookiesAsync` — HttpOnly cookies included.
+    Runs on a dedicated STA thread; degrades gracefully when the
+    WebView2 runtime is absent; browser state lives in a wipeable
+    per-plugin folder. `Microsoft.Web.WebView2` is a Manager-only
+    dependency — plugins never reference it.
+  - **Static enforcement ratchet (7-3b)** — because the Manager
+    compiles every plugin, two cheap gates: a capability-declaring
+    plugin without `network` is compiled WITHOUT the `System.Net.*`
+    reference assemblies (undeclared network use becomes a compile
+    error naming the capability; game plugins are unaffected), and
+    a stage-time `PluginSourceAudit` flags DllImport / Process.Start
+    / reflection / undeclared-network as advisory notes in the
+    install consent. Determined obfuscation is out of scope by
+    design.
+  - **Event tap — identity-rich player/chat/state events (7-4a)** —
+    PlayerJoin/PlayerLeave events are now sourced from the
+    Manager's identity-resolution path rather than the notification
+    emitter, so they arrive carrying the fully-resolved
+    `CharacterId` / `PlatformUserId` / `Platform` / `CharacterName`
+    plus the instance's `SessionIdentity` (`lastoasis:{realm}:{tile}`
+    on LO, a `{gameId}:{instanceId}` fallback elsewhere) — not just
+    a display label. `ChatMessage` (from the Manager's chat mirror,
+    ~5s cursor-deduped) and `ServerStateChange` (LO tile
+    bind/unbind) delivery are added, completing the kinds deferred
+    in 7-2. `UtilityEvent` gains `SessionIdentity` + `CharacterName`
+    (additive; no `ContractsVersion` bump). `PlayerName` now carries
+    the RAW persona with the resolved character name in the new
+    field. One behaviour change: synthetic leaves (instance-stop
+    flush, Manager-downtime reconcile) now reach utility plugins —
+    correct for programmatic consumers, where the emitter suppressed
+    them only to avoid Discord noise. Game plugins are untouched
+    (the LO/Conan/Factorio source is source-compatible; only the
+    Manager plumbing moved).
+  - **lo-myrealm reference plugin (7-4b)** — first first-party
+    utility plugin (ships in `GSM.PluginsSource` as
+    `LoMyrealmPlugin.vb`, id `lo-myrealm`; renamed from the working
+    title "SteamSessionPlugin" once it was clear the held session is
+    a myrealm/GPORTAL portal session and the logic is LO-specific).
+    On a PlayerJoin/PlayerLeave whose LO CharacterId the resolver
+    can't yet name, it reads the authoritative current character
+    name from the myrealm rename page
+    (`/realm/{realm_id}/Characters/{character_id}/Rename`, realm_id
+    off the event's SessionIdentity) and contributes it back through
+    the resolver — filling the naming window before the first
+    Persisting tick. **Verify-on-join** (default on) re-reads on
+    join to catch portal renames (never prompts, ≥5 min/character).
+    A one-shot **"Sign in at next plugin reload"** config flag
+    triggers the login manually, since the automatic prompt only
+    fires on a genuine naming gap (which never occurs on a realm the
+    resolver already fully knows). Expiry is handled structurally
+    (no-redirect GET; redirect or served sign-in page → invalidate +
+    notify once → next gap re-prompts), so the unknown session
+    lifetime is moot.
+  - **Shared web-session store (7-5)** — session capture/persist/
+    expiry moves out of the plugin and into the Manager so future
+    portal plugins don't each reimplement it. Two additive
+    `IUtilityContext` members (gated by `web-capture`):
+    `GetOrCaptureWebSessionAsync(sessionKey, …, allowPrompt)` and
+    `InvalidateWebSession(sessionKey)`. A new `WebSessionStore`
+    (Manager Core) holds sessions keyed by a plugin convention
+    (`"{site}:{account}"`, e.g. `myrealm:default`), cookie headers
+    **DPAPI-encrypted at rest** via `CredentialService` in a new
+    `web_sessions` table (EF migration `AddWebSessions`) — retiring
+    7-4b's plaintext-in-plugin-config cookie. The host owns
+    once-per-key prompt throttling and in-flight dedup (concurrent
+    requests for one key share a single dialog; a cancelled capture
+    blocks further prompts until invalidation or restart). Plugins
+    sharing a key share the session — the cross-plugin provision
+    mechanism, with no plugin→plugin references. lo-myrealm migrates
+    onto the store as the reference consumer (drops its own cookie
+    persistence entirely). No `ContractsVersion` bump: additive
+    members on an existing interface whose only consumer ships with
+    them.
+  - **Web Sessions UI + liveness validation (7-5b)** — a fourth
+    **Web Sessions** tab in Manage Plugins lists each stored session
+    (key / captured-by plugin / captured / last-used — never the
+    cookie) with **Revoke** (also the cleanup path for a session
+    orphaned by uninstalling its owning plugin) and **Validate**.
+    Validation routes to a new opt-in `IWebSessionValidator`
+    side-interface (additive, same pattern as ILogParser/IModManager;
+    adding to IUtilityPlugin itself would fail-compile every existing
+    plugin) — `CanValidateWebSession` + `ValidateWebSessionAsync`
+    return Valid / Expired / Failed, invoked outside the plugin's
+    event queue (thread-safe, classify-only; the UI offers the
+    revoke on Expired). lo-myrealm implements it by probing the
+    realm's `General/UpdateName` page (exists for the life of the
+    realm), and — when no realm has been learned from gameplay yet —
+    **discovers one from the portal itself**: GET the authenticated
+    landing page, harvest every `/customer/{id}` link (owned +
+    admin'd realms), walk to the first `/realm/{id}`. So Validate
+    works seconds after sign-in with no running instance. A
+    customer with no realm configured yet reports Valid ("signed in;
+    no realm configured yet"), not a failure. The realm-page probe
+    also reads back the realm name, surfaced as `realm "…"
+    reachable`.
+
+  - **myrealm realm onboarding & import (7-6)** — onboard a realm
+    end-to-end from the Manager instead of hand-entering its keys:
+    Shared Resources → Realms grows an **Import…** button that signs
+    in to the myrealm portal (reusing the 7-5 shared session),
+    scrapes every realm the account owns or admins, and turns each
+    into a Realm shared-config group. Read-only against the portal —
+    it GETs realm identity (realm_id, name, Customer Key, provider
+    keys) and writes only PowerGSM's own group store; realm
+    administration (anything that POSTs) stays out, parked as Phase
+    10. The scrape→group channel is generic: a new
+    `IWebPortalDataProvider` side-interface (in `GSM.Utility`, opt-in
+    like `IWebSessionValidator`) returns `WebPortalImportRecord`s
+    tagged with their target game plugin + shared-config key, the
+    identity fields that define them (`MatchFieldKeys`), and a
+    plugin-composed display name — the Manager's new
+    `PortalImportService` matches each record against existing groups
+    on ALL identity fields (decrypted plaintext, Ordinal) to classify
+    New / Update / Unchanged, never hard-coding a game field name. A
+    checkbox dialog shows the plan (New/Update pre-checked, Unchanged
+    inert) before anything is written. **Per-provider-key model:**
+    lo-myrealm emits one record per (CustomerKey, ProviderKey) pair —
+    a realm hosted from several providers becomes several groups
+    sharing a RealmName but differing by ProviderKey, so no
+    list-typed shared-config schema is needed. The group DisplayName
+    carries a `"{RealmName} ({UsedBy})"` provider suffix for pickers
+    while the History **Source** column (and the History session-
+    filter dropdown) reads the canonical RealmName field (new
+    non-sensitive `SharedConfigFields` on `SourceLabelContext`,
+    surfaced via a `SharedConfigService` plaintext-only read that
+    never decrypts the keys), so the per-provider entries of one
+    realm render identically in History.
+    lo-myrealm self-captures its session inside discovery
+    (re-prompting when a stored session has gone stale) so
+    onboarding's no-session-yet case just works. All additive:
+    `WebSessionCaptureResult` gains `CompletionUrl`,
+    `WebPortalImportRecord` / `SourceLabelContext` / `IUtilityPlugin`
+    gain members, no `ContractsVersion` bump.
+  - **Multiple myrealm accounts + per-realm failover (7-7)** — the
+    operator can sign in to several myrealm accounts and PowerGSM
+    uses them all automatically. Two payoffs: discovery/import (7-6)
+    now spans every signed-in account (owner + admins), deduplicated
+    by `(CustomerKey, ProviderKey)` to one group per realm; and
+    lo-myrealm's characterID → name enrichment survives an expired
+    account by failing over to any other live session that can reach
+    the realm. Account key is `myrealm:{accountName}`, derived from
+    the portal landing greeting; the host gains `StoreWebSession` /
+    `ListWebSessions` context verbs (web-capture gated) and an
+    `IWebPortalDataProvider.AddAccountAsync`, surfaced as an **Add
+    account…** button in the Web Sessions form. Discovery enumerates
+    every `myrealm:*` account and dedups in the plugin; character
+    lookup keeps an in-memory `realmId → session` cache that
+    self-heals (a redirected / expired / forbidden read walks the
+    other live accounts, uses the first that reaches the realm, and
+    re-homes), logging `served by` / `failed over from … to …` on
+    each (re)home. `myrealm:default` participates as just another
+    account. All additive: new `WebSessionSummary` type + additive
+    context / interface members, no `ContractsVersion` bump.
+
+- **Phase 6 — Plugin sources, manifests, and updates.** Plugins are
+  now managed artifacts instead of hand-copied files. Each plugin
+  self-describes via an inline manifest comment —
+  `' <plugin id="..." name="..." version="..." author="..."
+  requiresContracts="...">` plus an optional `' <dependencies>`
+  block — parsed before compile, with the legacy
+  `' <RequiresContracts: N>` comment still honoured (legacy-only
+  files load as untracked local plugins; `author` is pure credit and
+  never used for trust or origin). A new **Tools → Manage Plugins**
+  window consolidates three tabs:
+  - **Status** — the existing Plugin Status view, now with Version /
+    Author / Source columns from the manifest, plus an **Uninstall**
+    button (deletes the plugin file after a consent prompt spelling
+    out the orphan consequences; data and configuration are kept).
+  - **Sources** — manage the GitHub repos the Manager browses for
+    plugins (the official `siteml/PowerGSM` @ `GSM.PluginsSource`
+    source is seeded on first run and can be disabled but never
+    deleted or impersonated), and browse each source's live catalog
+    (contents-API listing + raw manifest parse; only files declaring
+    a `<plugin>` block are catalogued). **Install...** downloads the
+    chosen plugin to a staging area (`.plugin-updates\{id}\`),
+    re-parses the downloaded copy as authoritative, blocks on
+    missing/too-old declared dependencies, warns (with explicit
+    consent) on a bare third-party id or a collision with an
+    installed plugin — third-party plugins are expected to use ids
+    prefixed with their source's GitHub owner — then copies it into
+    `Plugins\` and hot-reloads. No restart needed; the live
+    `Plugins\` folder is never touched until the verified install
+    step.
+  - **Updates** — compares every installed, version-carrying plugin
+    against the best version across all enabled sources and lists
+    installed → latest; **Update...** runs the same stage → consent
+    → install → reload path. Never auto-applies.
+  All three surfaces support **batch operations via checkbox
+  selection** (with a Select-all toggle): check any number of
+  catalog entries, pending updates, or plugin files and Install /
+  Update / Enable / Disable / Uninstall them in one pass — one
+  combined consent listing every item (with per-plugin warnings
+  inlined), one plugin reload at the end, one summary. Buttons are
+  count-labelled (e.g. "Install (3)...") and state-aware (Enable
+  counts only checked disabled files, and vice versa).
+  New `PluginSources` table (EF migration `PluginSources`); staged
+  plugins persist in settings. See `Phase6_Plan.md`.
+
+- **Phase 5l-3 — Apply updates (pre-flight + binary swap + history).**
+  The **Apply update** button is now live on the "Update ready"
+  dialog. Applying first refuses downgrades, then runs informed-
+  consent pre-flight prompts when relevant: one if an automation rule
+  is mid-execution (it names the rule and warns it won't resume), and
+  one if instances are running (reassuring that the game servers run
+  on the node and keep running — only the Manager's live log streams
+  blink, and the new Manager reconnects and catches up on everything
+  that happened while it was down: joins, leaves, server state, chat).
+  A plugin-compatibility check then dry-run-compiles every plugin
+  against the *staged* `GSM.Contracts.dll` (a green/red report;
+  incompatibilities are a soft warning gated by an acknowledgement
+  checkbox) as the final confirmation. It then closes PowerGSM and
+  swaps the binaries via a generated `apply.cmd`: it waits for the
+  Manager to exit, backs up the current `GSM.Manager.exe` +
+  `GSM.Contracts.dll` to `.updates\rollback\`, copies the staged
+  binaries in, and relaunches (`--post-update`). The Manager exits
+  cleanly (code 0) so the watchdog stands down rather than racing the
+  swap; only the two binaries are touched (never the database,
+  settings, plugins, logs, or the watchdog). A failed swap is logged
+  to `.updates\apply-error.log` and surfaced on the next launch. Every
+  apply attempt — success or failure — is recorded to an update-
+  history table, viewable under **Help → Update History** (when /
+  from → to / outcome / detail). See `Phase5l_Plan.md`.
+
+- **Phase 5l-2 — Download + stage updates.** Builds on 5l-1: the
+  update dialog now has a **Download update** button (when an update
+  is available and the install folder is writable). It resolves the
+  release's assets, downloads `SHA256SUMS` + the Manager zip with a
+  cancellable progress dialog (live %/MB while downloading,
+  indeterminate for the verify/extract phases), verifies the zip's
+  SHA-256 against the sums file, and extracts it into
+  `<install>\.updates\{version}\extracted\`. Nothing touches the
+  running install — staging is fully reversible. After a successful
+  download the dialog flips to an **Update ready** state with a
+  (disabled, pending 5l-3) **Apply update** button and a **Discard
+  download** button that wipes the staged folder. Releases predating
+  the `SHA256SUMS` pipeline step stage without checksum verification
+  (logged). Applying a staged update is Phase 5l-3. See
+  `Phase5l_Plan.md`.
+
+- **Phase 5l-1 — Update notifications (detection + notify only).**
+  PowerGSM now checks GitHub for newer releases on a background
+  schedule and tells you when one is available — it never downloads
+  or installs anything (staging and one-click apply are later
+  sub-phases). A status-bar indicator appears when a newer,
+  non-skipped release exists and opens a passive **update dialog** on
+  click; **Help → Check for updates...** forces an immediate check.
+  The dialog shows the current→latest versions and the release notes
+  rendered GitHub-style (headings, bullets, inline `code`, links)
+  with **View on GitHub** / **Skip this version** / **Close**.
+  Release-notes rendering uses `HtmlRenderer.WinForms` fed by a small
+  in-house Markdown→HTML converter, degrading safely to a RichTextBox
+  renderer and then plain text so a render hiccup can never break the
+  dialog. **Settings → Updates** adds an "Include pre-release
+  versions" toggle and a configurable check interval. On startup a
+  writeability probe warns once (and shows a persistent "read-only
+  install" indicator) when PowerGSM lives in a folder it can't write
+  to, since automatic updates couldn't apply there. See
+  `Phase5l_Plan.md`.
+
+- **Phase 5m-3 — Watchdog (auto-restart + start at sign-in).** A tiny
+  standalone supervisor (`GSM.Watchdog`) whose only job is to keep the
+  Manager running: it launches the Manager, relaunches it if it exits
+  unexpectedly, escalates to safe mode after repeated fast crashes
+  (2 within 60s), and gives up after a rapid-restart limit (5 within
+  300s) so a hard-broken Manager doesn't spin forever. Manager and
+  watchdog are decoupled — no shared assembly — communicating only via
+  process launch, a shared named-mutex *name*, and an exit-code
+  contract: the Manager, when launched by the watchdog
+  (`POWERGSM_WATCHDOG=1`), defers its in-app **Restart Normally / Restart
+  in Safe Mode** to the watchdog via exit codes 20/21 instead of
+  self-spawning, so the replacement stays supervised; a clean quit
+  (0) stands the watchdog down. The Manager is now **single-instance**
+  (named mutex): a second launch signals the running one to come
+  forward (restoring from the tray) and bows out — exiting with a
+  dedicated *deferred* code when watched so the watchdog monitors the
+  existing instance rather than reading the quick exit as a crash. The
+  watchdog is headless (`WinExe`, no console; logs to `watchdog.log`)
+  and is co-located next to `GSM.Manager.exe` automatically by the
+  Manager's build/publish (framework-dependent on Build for dev,
+  self-contained single-file on Publish). **Settings → Startup** has a
+  "Start PowerGSM automatically when I sign in" toggle that installs a
+  per-user Task Scheduler logon task (`LeastPrivilege` +
+  `InteractiveToken` → no UAC, GUI visible, per-user/DPAPI scope
+  unchanged), created from an XML definition with a restart-on-failure
+  backstop; the checkbox reflects the live task state and disables
+  itself if the watchdog isn't co-located. See `Phase5m_Plan.md`.
+
+- **Phase 5m-2e — Missing-plugin detection + start enforcement.**
+  Guards against an installation/instance whose game plugin isn't
+  loaded (deleted between sessions, failed to compile, or disabled).
+  Detection is *reconciliation-based* — every installation/instance's
+  GameId is checked against the loaded-plugin set — so unlike the
+  existing hot-reload diff it catches orphans at startup and across
+  sessions, not just plugins removed mid-session. Surfaced loudly: a
+  startup details dialog, a persistent `MainForm` banner (Warning,
+  escalating to **Critical** red when an orphaned instance is actually
+  running on its node — the data-integrity case, where the Manager
+  can't parse its logs so player/activity history silently stops), and
+  a DarkRed tree badge on each affected installation/instance. Re-runs
+  after every manual **Reload Plugins** so removing/restoring a plugin
+  updates the warning + badges live. Suppressed in safe mode
+  (everything is orphaned by design there). **Enforcement:**
+  `InstanceManager.StartInstanceAsync` now hard-refuses to start an
+  instance whose plugin isn't loaded — closing a footgun where a
+  persisted `ExeOverride` from a prior (plugin-loaded) start let the
+  node launch the bare executable with empty arguments and no parse
+  rules, producing an unmanageable, untracked, crash-looping process.
+  The guard covers every start path (panel, tree menu, autostart,
+  scheduled restart); the panel and tree-menu Start/Restart actions
+  are also disabled for orphaned instances, with Stop left enabled so
+  a running orphan can be brought down. See `Phase5m_Plan.md`.
+
+- **Phase 5m-2 — Safe mode.** A recovery mode that boots the Manager
+  with the surfaces most likely to carry broken code disabled — plugin
+  compilation, the automation engine, notifications/Discord,
+  version-check, chat-retention pruning, and node background polling —
+  while keeping the DB, node clients, and basic instance ops alive so
+  the operator can investigate and fix. Three entry points: the
+  `--safe-mode` CLI flag, an automatic offer when the previous run
+  didn't exit cleanly (a crash marker written in the binary directory
+  at startup and deleted on clean shutdown), and "Restart in Safe
+  Mode" in both the File and tray menus. In safe mode a persistent
+  amber banner names what's disabled with a "Restart Normally" link;
+  the File/tray entries mirror it. Restart-into-mode relaunches the
+  exe with/without the flag *after* the outgoing instance has shut
+  down cleanly and cleared its marker, so an intentional restart never
+  trips the crash-recovery offer. See `Phase5m_Plan.md`.
+
+- **Phase 5m-2c — Safe-mode feature re-enable.** A "Re-enable
+  Features…" panel (File menu, safe mode only) that turns the
+  individually-gated subsystems — plugins, node polling, Discord,
+  automation, version-check, chat pruner — back on at runtime without
+  leaving safe mode, for iterative fix-and-test (notably: fix a runaway
+  automation rule, then re-enable just the engine to verify while still
+  in the safe harbour). Backed by a subsystem-start controller in
+  `ManagerProgram` mirroring Main's per-subsystem start steps;
+  re-enable only (restart safe mode to turn something back off),
+  idempotent, and version-check pulls the automation engine up first
+  since it raises events into it. See `Phase5m_Plan.md`.
+
+- **Phase 5m-2d — Plugin enable/disable.** The Plugin Status form
+  gained a "Plugin files" list (every `.vb` in `Plugins\`, plus
+  disabled ones in `Plugins\Disabled\`) with Enable/Disable buttons.
+  Disabling moves the file into the `Disabled\` subfolder and reloads;
+  enabling moves it back. The subfolder approach (rather than an
+  extension rename) lets `ReloadAll`'s top-directory `*.vb` scan skip
+  it cleanly, with no dependence on Windows' short-extension glob
+  quirk; a disabled plugin — being unloaded — is surfaced from the file
+  list since it can't appear in the loaded-plugins list. Disable warns
+  that dependent installations/instances will be orphaned. Closing the
+  form refreshes the orphan banner + tree badges, so a disable→reload
+  immediately reflects in the warnings (and the start guard) — also
+  fixing a gap where reloads done inside that form previously didn't.
+  See `Phase5m_Plan.md`.
+
+- **Phase 5m-1 — System tray + window-state persistence.** The Manager
+  owns a tray icon (Open / Exit, double-click to restore) and honours
+  three preferences (Settings → Window): minimize-to-tray (default
+  on), close-to-tray (default off), and start-minimized (default off).
+  The tree/content splitter width is persisted and restored across
+  launches. Settings now shows the database and plugins directory
+  paths as read-only, selectable text boxes with Copy buttons instead
+  of truncated labels. See `Phase5m_Plan.md`.
+
+- **Phase 5k-2 — Player-list panel polish + grouping fix.** Three
+  refinements on top of 5k-1. **(2a)** Fixed a grouping-header bleed in
+  the instance-manager panel: under "by node, then game" the game
+  sub-header rendered as bold — identical to the bold instance rows
+  beneath it, so the two levels ran together. Headers are now three
+  distinct levels: node `## __underlined H2__`, game `### H3`, instance
+  rows bold. **(2b)** Player panels now honour the same Group-by
+  setting (none / by node / by game / by node-then-game), reusing that
+  level scheme above each instance's player block; the editor's
+  grouping combo is enabled for both panel kinds (the layout-
+  composition controls stay gated off for player panels). **(2c)** Two
+  new per-panel display toggles, both gated to the player-list kind:
+  `ShowJoinTime` appends each player's join time as a relative
+  timestamp (`PlayerSession.JoinedUtc`), and `ShowTotalInTitle`
+  appends the online count to the panel title. Schema adds the two
+  bool columns (migration `Phase5k2c_PlayerPanelToggles`, both default
+  False). See `Phase5k_Plan.md`.
+
+- **Phase 5k-1 — Player-list Discord panel (core).** A new panel kind
+  that renders a live online-players roster instead of the instance-
+  manage table. Reuses the panel infrastructure wholesale: the same
+  `DiscordPanelEntity` (new `PanelKind` discriminator), the same scope
+  mechanism (all-instances / game / installation / instance-set), the
+  same per-panel refresh loop + join/leave event-push, and the same
+  plain-content full-width rendering. `BuildPanelMessage` branches on
+  `PanelKind`; the `PlayerList` branch groups currently-online players
+  by instance (a header per instance with its tile/save context + the
+  online count), renders each player in the 5d-6 identity format via
+  the resolver (`EnrichPlayers`, the same path `/players` uses), and is
+  read-only (no Manage button). Instances with nobody online are hidden
+  by default; a per-panel `ShowEmptyGroups` toggle shows them all.
+  Player lists are length-capped with a truncation marker (multi-page
+  deferred). The panel editor gained a Panel-kind selector and the
+  show-empty toggle, gating off the layout-composition + grouping
+  controls that don't apply to a fixed-layout roster. The enriched
+  player list is stashed on the per-instance panel runtime from the
+  same `GetPlayersAsync` fetch that already fed the player count, so
+  there are no extra node round-trips. Schema: `PanelKind` (default
+  "InstanceManager") + `ShowEmptyGroups` (default False) columns,
+  migration `Phase5k_PlayerListPanel`, both defaulted so existing
+  panels are unchanged. Polish — per-group counts in the title,
+  grouping options, per-row join time, empty-whole-panel state — is the
+  5k-2 follow-on. See `Phase5k_Plan.md`.
+
+- **Phase 5d-8 — `/lastseen` Discord slash command.** Operators can
+  ask when and where a player was last seen, or list who's been on
+  recently. Three modes: a **player lookup**
+  (`/lastseen player:<name>`) reports whether the player is **active
+  now** or **offline** — derived from their most recent join/leave —
+  with a relative timestamp and the same tile/realm/node Source label
+  the History grid shows (reuses `HistoryQueryService` — no schema
+  change); an optional **scope filter** (`instance` / `game` /
+  `installation`, mutually exclusive) narrows the lookup, resolving
+  game/installation to an instance set via the Instances table
+  intersected with the guild-visible set; and a **roster mode**
+  (scope only, no player) lists the most-recently-seen players in
+  that scope, deduped by identity, each flagged active-now or offline. Gated at `ServerOperator` through
+  the shared command catalogue (appears in `/help`, permission-
+  checked like `/players`), guild-scoped to instances exposed via
+  this server's panels, and ephemeral.
+
+  Identity-aware: the typed name is resolved through the
+  `IdentityResolver` (exact match on any facet — persona, character
+  name, character id, platform id) and the lookup runs against the
+  resolved persona, so searching by the in-game character name finds
+  the same history a Steam-handle search would; the "also matched"
+  disambiguation groups by identity facets rather than display
+  string, so a single player rendered under both a resolved character
+  name and a raw persona no longer lists itself. Three new
+  autocomplete providers back the arguments (player names, games,
+  installations; instance reuses the existing one). Built in four
+  rounds — command shape, identity-awareness, scope filters, roster.
+  See `Phase5d-8_Plan.md`.
+
+- **Phase 5g-2d — Manager-side IdentityResolver.** Centralised
+  in-memory cache that promotes the Manager to system-of-record
+  for resolved player identity, closing the asymmetry between
+  surfaces that showed the character name (History via leave-time
+  inheritance + chat-fallback) and surfaces that didn't (Overview
+  panel showing the raw persona, Discord showing the Steam handle).
+  Solves the "schizophrenic keys" problem — identity observations
+  arrive piecemeal from different sources (Login URL gives
+  PlatformUserId, Persisting line gives DisplayName, /players
+  snapshot gives PlatformPersona) — using a small union-find: each
+  `IdentityRecord` carries a set of alias keys, any new observation
+  matching an existing key merges into that record, and observations
+  that bridge previously-separate records fuse them. Field-level
+  merge rules: PlatformUserId / CharacterId / Platform are stable
+  per identity (fill-if-empty, warn-and-keep on the
+  should-never-happen conflict); DisplayName / PlatformPersona are
+  newest-write-wins to support legitimate renames. Scope keys are
+  opaque to the resolver — plugins decide what `SessionIdentity`
+  means for their game (LO: `lastoasis:{realmId}` backend-stable;
+  Conan: `conanexiles:{installId}` for v1 with documented
+  bleed-on-world-swap; Factorio: `factorio:{installId}`).
+
+  Hydrates at Manager startup from the most recent 5000
+  PlayerActivity rows in the last 30 days carrying any identity
+  facet, so the cache is warm from the first Enrich call — no
+  cold-start window. Continuously fed by three write-through
+  paths: `PersistPlayerObservationAsync` (every live join/leave),
+  `ResyncActivePlayersFromNodeAsync` (on stream reconnect /
+  poll-loop health check), and `BackfillIdentitiesForInstanceAsync`
+  (the 10s identity-backfill pass, no extra round-trips). The
+  persist path also *consults* the resolver as a write-time
+  fallback when /players misses — the common PlayerLeave case
+  where the Node has already evicted the session — so new
+  PlayerActivity rows get stamped with the resolved identity at
+  write time instead of leaning on render-time inheritance.
+
+  Five read consumers now enrich through the resolver: the
+  Overview panel (`InstancePanel.ApplyPlayers` via
+  `InstanceManager.EnrichPlayers`), the History timeline
+  (`HistoryQueryService.LoadTimeline` as primary fallback, with the
+  existing chat-fallback as secondary for cases the resolver can't
+  help), the Discord `/players` slash command, and both Discord
+  notification paths (join/leave label composition via
+  `PlayerLabelForNotification`, hitting both webhook and bot since
+  it sits at the emitter input). `GetPlayersAsync` deliberately
+  stays raw — enrichment is opt-in per consumer rather than a
+  hidden side effect of fetching.
+
+  `Platform` is tracked as a carried attribute (not an alias key —
+  a platform name identifies no one), surfaced through `Enrich` for
+  consumers that want to render `character (Platform: persona)`.
+  One documented behaviour worth knowing: `PlayerActivity` has no
+  Platform column, so hydration can't supply it — Platform fills
+  from live observations within ~10s of a player being online (the
+  next backfill pass, or the join's persist write-through). A
+  brand-new player's very first join notification after a Manager
+  restart may render `character (persona)` without the Steam:
+  prefix; the leave and all subsequent joins show the full format.
+  Self-corrects automatically.
+
+  Thread safety via `ReaderWriterLockSlim` — writes are rare
+  (one per observation), reads dominate (every render). All
+  consumers receive copies via `Enrich` / `FindByKey` /
+  `GetAllRecords`; the cache's records are never directly
+  mutable from outside. Diagnostic surface (`RecordCount`,
+  `GetAllRecords`, `IsHydrated`) is in place for a future Tools
+  menu `View IdentityResolver cache...` UI; the UI itself is
+  deferred. See `Phase5g-2d_Plan.md` for the full architectural
+  framing and the six resolved planning decisions.
+
+- **Tools → Purge && Rebuild History...** lets the operator
+  wipe the Manager's history tables (PlayerActivity,
+  PlayerSessions, SessionHosts, ChatMessages) and re-derive
+  them from the Node's authoritative current state for every
+  currently-running instance on an attached node. Two use
+  cases: cleaning up rows produced by a parsing-logic bug
+  that's since been fixed (e.g. the LO false-leave fix below),
+  and establishing a clean baseline for test→prod migration
+  or recovery from a corrupted Manager DB. Currently-connected
+  players' real `JoinedUtc` timestamps are preserved from the
+  Node's in-memory session state; no fake "now" timestamps
+  are written. Chat is filtered to only include lines from
+  currently-connected players, only since each player's most
+  recent join, to keep the rebuilt timeline coherent. Whole
+  purge+rebuild runs in a single EF transaction — a mid-flight
+  failure rolls back cleanly. Dialog flow: confirmation form
+  with explicit "what's preserved / what's removed" disclosure
+  plus typed-REBUILD gate, modeless progress dialog with
+  live status updates while the work runs, and a result
+  summary showing row counts, filtered-out chat count, and
+  any non-fatal warnings. See `Phase5j_Plan.md` for the full
+  design.
+
 ### Fixed
+
+- **Shim-supervised games were killed and spuriously crash-restarted on a
+  graceful node shutdown (most visibly a Windows self-update), instead of
+  surviving for re-adoption.** (Phase 8-1 bug, surfaced by 8-2 slice 6.) The
+  clean-shutdown path sends each shim a `Detach` frame — the shim then keeps
+  its game and waits for the next node — but the node-side `ShimSession` didn't
+  mark the session as intentionally detached, so when the shim closed its end
+  of the pipe the node's own read loop saw the drop, fired its exit callback,
+  and routed into `HandleProcessExited`. Because a detach never sets
+  `StopIntentPending`, that handler treated the drop as an unexpected exit: it
+  disposed the `ShimSession` — whose `Dispose` still ran `TryKillShim` with
+  `_ownsShim` True, so `Kill(entireProcessTree:=True)` took down the live shim
+  *and the game under it* in one go — and then scheduled a crash-restart that
+  spawned a throwaway fresh shim+game. On a self-update the net effect was the
+  game vanishing the instant the node began its update-exit (while the node was
+  still alive), a throwaway restart, then the real swap+relaunch landing on the
+  wrong process. Linux dodged it only on timing — the bare node there exits
+  promptly enough that the read-loop drop never runs the cascade; the ~30s
+  graceful-shutdown lingering on Windows (a live SSE log stream holding Kestrel
+  open to its drain timeout) gave it the window every time. Fixed in
+  `ShimSession`: a deliberate `Detach` (both `SendDetachAsync`, used by the
+  shutdown hook, and `DetachAsync`) now sets a `_detaching` flag and clears
+  `_ownsShim` *before* the frame is sent, and `SignalExit` skips the `onExited`
+  cascade when `_detaching` is set — so a post-detach link drop is benign, the
+  game is left running, and the next node re-adopts it by saved endpoint.
+  Verified on all four survivor paths (Linux systemd + bare, Windows service +
+  bare): game PID unchanged across the bounce. The lesson: a deliberate detach
+  must suppress the node's own exit handling, or the node tears down and
+  crash-restarts the very game it just chose to leave running.
+
+- **Last Oasis player Leave dropped — and subsequent sessions
+  mis-paired — when a player was connected across a Manager
+  log-stream reconnect or restart.** The LO parser turns an
+  address-only close line (`UChannel::Close` / `UNetConnection::Close`
+  carry a RemoteAddr, not a name) into a *named* leave by looking
+  the address up in a per-parser RemoteAddr→name table built at
+  `Join succeeded`. That table lives on the parser instance, which
+  the Manager recreates on every log-stream reconnect — and a full
+  Manager restart starts a fresh process with an empty table. So a
+  player who joined before the reconnect/restart had no binding, and
+  their eventual disconnect — most visibly a `UChannel::Close`-only
+  idle-kick/timeout, which has no `UNetConnection::Close` for the
+  Manager's nameless-leave heuristic to fall back on — no-matched at
+  the parser and produced no Leave. Worse, the miss **cascaded**
+  through the name-keyed `_activePlayers` dedup bucket: with the
+  stale name still in the bucket, the player's *next* reconnect Join
+  was suppressed as a duplicate (no History row, no Discord
+  notification), and that reconnect's close then fired a Leave that
+  closed the *prior* still-open session — collapsing several real
+  log sessions into one mis-paired History entry.
+
+  Fixed in three parts. (1) New opt-in `IConnectionBindingAware`
+  contract interface (implemented only by the LO parser) lets the
+  Manager own the RemoteAddr→name table per instance and inject the
+  same dictionary on every parser (re)creation, so bindings survive
+  in-process stream reconnects; the store is cleared only on a real
+  instance stop, not on reconnect. (2) On resync the Manager now
+  rehydrates that table from the Node's authoritative `/players`
+  `RemoteAddress` — which the Node already tracks and returns — so
+  bindings are restored after a full Manager restart too; the
+  parser's first post-restart close then resolves normally, fires
+  the Leave, and clears the bucket so the next Join is no longer
+  suppressed. (3) No Node change required — the fix consumes the
+  existing `PlayerSession.RemoteAddress` wire field, which the Node
+  already populates (it's the Overview tab's IP Address column).
+
+  Follow-on (now also handled): a player who leaves *entirely while
+  the Manager is offline* produces no close line at all, so the
+  parser-binding fix above can't see them. The resync now also runs a
+  `/players`-diff leave-reconcile — any player whose most-recent
+  activity row on an instance is a Join but who is absent from that
+  instance's authoritative `/players` is synthesised a Leave
+  (persist-only; no Discord ping, since the departure is in the past).
+  Two guards keep it from firing falsely: it's scoped by InstanceId
+  rather than the realm-wide SessionIdentity (so a player online on a
+  sibling tile isn't reconciled away), and it's gated on Node uptime
+  ≥ 5 min (right after a *Node* restart `/players` under-reports
+  still-connected players, since the Node resumes log tailing from a
+  byte offset and never replays old Join lines). One residual edge
+  remains: a player who stays connected but completely silent across a
+  Node restart never re-appears in `/players` and could eventually be
+  reconciled as left — the same class as the existing node-restart
+  player-state gap; rare and accepted.
+
+- **Duplicate player Join rows in History after a stream reconnect.**
+  `ResyncActivePlayersFromNodeAsync`'s join-synthesis dedup skipped
+  re-synthesizing a join only when the most-recent PlayerActivity
+  row was a join AND its `TimestampUtc` was ≥ the Node's `JoinedUtc`.
+  But the live join row is stamped at the Manager's processing time
+  (`DateTime.UtcNow`) while `JoinedUtc` comes from the Node's clock;
+  when the Manager clock ran slightly behind the Node's, the `>=`
+  failed and the resync synthesized a *second* join (carrying the
+  resolved character name) alongside the live row (still showing the
+  raw persona) — the blank-then-named duplicate pair seen on
+  reconnected sessions. The dedup now treats an open join
+  (most-recent row is a join, regardless of timestamp) as "already
+  represented" and skips synthesis, since synthesis exists only to
+  fill a *missing* join.
 
 - **Last Oasis: false-positive player Leave events in History
   when another player on the same tile disconnected.** When
@@ -36,6 +1154,48 @@ compatibility with the previous version, `PATCH` bumps do not.
   other means.
 
 ### Changed
+
+- **Phase 5d-6 — Discord player display format.** Both Discord
+  surfaces — the `/players` slash command and join/leave
+  notifications — now render player identity as
+  `character (Platform: persona)` when a distinct character name
+  is known (e.g. `site's character (Steam: site_ml)`) and
+  `persona (Platform)` when only the persona is known
+  (e.g. `site_ml (Steam)`), matching one format across both
+  surfaces. The platform parenthetical drops to bare
+  `character (persona)` or `persona` when Platform isn't known
+  yet — see the Platform-hydration note under 5g-2d Added above
+  for when that transient state arises. For `/players` the change
+  lives in `BuildPlayersResponse`; for notifications it lives in
+  the new `PlayerLabelForNotification` helper that hooks the three
+  emit sites in `InstanceManager.HandlePlayerJoin` /
+  `HandlePlayerLeave`, so the composed label flows through the
+  shared notification emitter and reaches both the webhook and bot
+  plugins without per-plugin changes.
+
+- **Manager database path anchored to the binary directory.**
+  The runtime DB connection string resolved `gsm.db` as a
+  relative path, i.e. against the process working directory.
+  For normal launches (double-click, VS debug) the working
+  directory equals the binary's folder, so the DB sat next to
+  the binary as intended — but a launch that sets a different
+  working directory (a shortcut's "Start in", a Task Scheduler
+  entry) would resolve `gsm.db` elsewhere and silently create a
+  fresh empty database, presenting to the operator as total
+  data loss. Surfaced while planning Phase 5m — the watchdog
+  launches the Manager via Task Scheduler, which is exactly the
+  divergent-working-directory case. The runtime DbContext now
+  resolves the path against `AppContext.BaseDirectory` (where
+  logs already go), making it robust regardless of launch
+  method. Existing deployments keep their DB alongside the
+  binary, so this points at the same file — no migration
+  needed. Only affected case: a deployment previously launched
+  with a divergent working directory, whose DB therefore lives
+  somewhere other than the binary folder; that file must be
+  moved next to the binary or the Manager starts fresh. The
+  design-time `GsmDbContextFactory` (Add-Migration in the
+  Package Manager Console) is unchanged — dev tooling, not
+  runtime.
 
 - **Conan Exiles: AdminPassword moved from the Configuration
   tab to the Server Settings (ServerSettings.ini) file editor.**

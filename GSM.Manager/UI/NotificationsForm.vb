@@ -41,8 +41,17 @@ Namespace GSM.Manager.UI
         Private _channelLabel As Label
         Private _channelCombo As ComboBox
         Private _enabledCheckBox As CheckBox
-        Private _installCheckList As CheckedListBox
-        Private _instanceSelectorsContainer As Panel
+        Private _scopeHost As Panel
+        Private _scopeHint As Label
+        Private _lowerHost As Panel
+        Private _lowerHostTop As Integer
+        Private _eventsPanel As Panel
+        Private _visibilityPanel As Panel
+        Private _nodeSection As CollapsibleCheckSection
+        Private _installSection As CollapsibleCheckSection
+        Private _instanceSection As CollapsibleCheckSection
+        Private _setSection As CollapsibleCheckSection
+        Private _matchLabel As Label
         Private _eventChecks As Dictionary(Of NotificationEventType, CheckBox)
         Private _profileCombo As ComboBox
         Private _manageProfilesButton As Button
@@ -215,67 +224,98 @@ Namespace GSM.Manager.UI
             _detailsPanel.Controls.Add(_enabledCheckBox)
             y += 34
 
-            AddSectionHeader("Scope — installations & instances", y) : y += 26
-            Dim hint As New Label() With {
-                .Text = "Check installations below; within each, pick instances (or leave all deselected to include every instance). No installation checked = all installations.",
-                .Location = New Point(20, y), .Size = New Size(600, 32),
-                .ForeColor = Color.DimGray,
-                .Font = New Font("Segoe UI", 8.5F, FontStyle.Italic)
+            ' Phase 5n — scope / events / visibility share one growing,
+            ' panel-scrolled column. The sections dock-stack so they
+            ' reflow as the scope box grows; the details panel scrolls
+            ' the whole column (nothing inside scrolls on its own).
+            _lowerHostTop = y
+            _lowerHost = New Panel() With {.Location = New Point(0, y)}
+            _detailsPanel.Controls.Add(_lowerHost)
+            AddHandler _detailsPanel.SizeChanged, AddressOf OnDetailsResize
+
+            ' Scope intro: header + hint + live match count.
+            Dim scopeIntro As New Panel() With {.Dock = DockStyle.Top, .Height = 66}
+            Dim scopeHeader As New Label() With {
+                .Text = "Scope", .Font = New Font("Segoe UI", 10, FontStyle.Bold),
+                .ForeColor = Color.FromArgb(50, 50, 120), .AutoSize = True,
+                .Location = New Point(0, 2)
             }
-            _detailsPanel.Controls.Add(hint)
-            y += 38
-
-            AddFieldLabel("Installations:", y)
-            _installCheckList = New CheckedListBox() With {
-                .Location = New Point(150, y), .Size = New Size(220, 140),
-                .CheckOnClick = True
+            _scopeHint = New Label() With {
+                .Text = "An event is in scope if it matches any checked dimension below. Nothing checked anywhere = all instances.",
+                .Location = New Point(20, 24), .Size = New Size(540, 16), .AutoSize = False,
+                .ForeColor = Color.DimGray, .Font = New Font("Segoe UI", 8.5F, FontStyle.Italic)
             }
-            AddHandler _installCheckList.ItemCheck, AddressOf OnInstallationChecked
-            _detailsPanel.Controls.Add(_installCheckList)
-
-            Dim instancesLabel As New Label() With {
-                .Text = "Instances:", .AutoSize = True,
-                .Location = New Point(380, y), .Font = New Font("Segoe UI", 9)
+            _matchLabel = New Label() With {
+                .Location = New Point(20, 44), .AutoSize = True,
+                .Font = New Font("Segoe UI", 9, FontStyle.Bold), .ForeColor = Color.FromArgb(50, 50, 120)
             }
-            _detailsPanel.Controls.Add(instancesLabel)
-            _instanceSelectorsContainer = New Panel() With {
-                .Location = New Point(380, y + 18),
-                .Size = New Size(420, 140),
-                .BorderStyle = BorderStyle.FixedSingle,
-                .AutoScroll = True,
-                .BackColor = Color.White
+            scopeIntro.Controls.AddRange(New Control() {scopeHeader, _scopeHint, _matchLabel})
+
+            ' Scope box — grows to fit its four dimension sections.
+            _scopeHost = New Panel() With {
+                .Dock = DockStyle.Top, .Height = 100,
+                .BorderStyle = BorderStyle.FixedSingle, .BackColor = Color.White
             }
-            _detailsPanel.Controls.Add(_instanceSelectorsContainer)
-            y += 150
+            _nodeSection = New CollapsibleCheckSection("Nodes")
+            _installSection = New CollapsibleCheckSection("Installations")
+            _instanceSection = New CollapsibleCheckSection("Instances")
+            _setSection = New CollapsibleCheckSection("Instance sets")
+            AddHandler _nodeSection.CheckedChanged, AddressOf OnScopeNodeChanged
+            AddHandler _installSection.CheckedChanged, AddressOf OnScopeInstallationChanged
+            AddHandler _instanceSection.CheckedChanged, AddressOf OnScopeInstanceChanged
+            AddHandler _setSection.CheckedChanged, AddressOf OnScopeSetChanged
+            AddHandler _nodeSection.ExpandedChanged, AddressOf OnScopeSectionExpanded
+            AddHandler _installSection.ExpandedChanged, AddressOf OnScopeSectionExpanded
+            AddHandler _instanceSection.ExpandedChanged, AddressOf OnScopeSectionExpanded
+            AddHandler _setSection.ExpandedChanged, AddressOf OnScopeSectionExpanded
+            ' Dock.Top stacks in reverse add-order; add bottom-first so
+            ' Nodes ends up on top.
+            _scopeHost.Controls.Add(_setSection)
+            _scopeHost.Controls.Add(_instanceSection)
+            _scopeHost.Controls.Add(_installSection)
+            _scopeHost.Controls.Add(_nodeSection)
 
-            AddSectionHeader("Events", y) : y += 26
-            BuildEventCheckboxes(y)
-            y += 120
+            ' Events panel.
+            _eventsPanel = New Panel() With {.Dock = DockStyle.Top, .Height = 116}
+            Dim eventsHeader As New Label() With {
+                .Text = "Events", .Font = New Font("Segoe UI", 10, FontStyle.Bold),
+                .ForeColor = Color.FromArgb(50, 50, 120), .AutoSize = True, .Location = New Point(0, 8)
+            }
+            _eventsPanel.Controls.Add(eventsHeader)
+            BuildEventCheckboxes(_eventsPanel, 36)
 
-            AddSectionHeader("Visibility & templates", y) : y += 26
-
-            AddFieldLabel("Profile:", y)
+            ' Visibility & templates panel.
+            _visibilityPanel = New Panel() With {.Dock = DockStyle.Top, .Height = 108}
+            Dim visHeader As New Label() With {
+                .Text = "Visibility & templates", .Font = New Font("Segoe UI", 10, FontStyle.Bold),
+                .ForeColor = Color.FromArgb(50, 50, 120), .AutoSize = True, .Location = New Point(0, 8)
+            }
+            _visibilityPanel.Controls.Add(visHeader)
+            Dim profileLbl As New Label() With {.Text = "Profile:", .AutoSize = True, .Location = New Point(20, 42)}
             _profileCombo = New ComboBox() With {
-                .Location = New Point(150, y), .Size = New Size(220, 24),
-                .DropDownStyle = ComboBoxStyle.DropDownList
+                .Location = New Point(150, 38), .Size = New Size(220, 24), .DropDownStyle = ComboBoxStyle.DropDownList
             }
             AddHandler _profileCombo.SelectedIndexChanged, AddressOf OnProfileChanged
-            _detailsPanel.Controls.Add(_profileCombo)
-
             _manageProfilesButton = New Button() With {
-                .Text = "Manage Profiles...", .Location = New Point(380, y - 1), .Size = New Size(140, 26)
+                .Text = "Manage Profiles...", .Location = New Point(380, 37), .Size = New Size(140, 26)
             }
             AddHandler _manageProfilesButton.Click, AddressOf OnManageProfilesClicked
-            _detailsPanel.Controls.Add(_manageProfilesButton)
-            y += 34
-
-            AddFieldLabel("Templates:", y)
+            Dim templatesLbl As New Label() With {.Text = "Templates:", .AutoSize = True, .Location = New Point(20, 76)}
             _customizeTemplatesButton = New Button() With {
-                .Text = "Customize Message Templates...",
-                .Location = New Point(150, y - 1), .Size = New Size(240, 26)
+                .Text = "Customize Message Templates...", .Location = New Point(150, 72), .Size = New Size(240, 26)
             }
             AddHandler _customizeTemplatesButton.Click, AddressOf OnCustomizeTemplatesClicked
-            _detailsPanel.Controls.Add(_customizeTemplatesButton)
+            _visibilityPanel.Controls.AddRange(New Control() {
+                profileLbl, _profileCombo, _manageProfilesButton, templatesLbl, _customizeTemplatesButton})
+
+            ' Dock.Top reverse add-order: intro → Scope → Events → Visibility.
+            _lowerHost.Controls.Add(_visibilityPanel)
+            _lowerHost.Controls.Add(_eventsPanel)
+            _lowerHost.Controls.Add(_scopeHost)
+            _lowerHost.Controls.Add(scopeIntro)
+
+            RelayoutScope()
+            OnDetailsResize(Nothing, EventArgs.Empty)
         End Sub
 
         Private Sub AddSectionHeader(text As String, y As Integer)
@@ -295,7 +335,7 @@ Namespace GSM.Manager.UI
             _detailsPanel.Controls.Add(lbl)
         End Sub
 
-        Private Sub BuildEventCheckboxes(startY As Integer)
+        Private Sub BuildEventCheckboxes(container As Control, startY As Integer)
             _eventChecks = New Dictionary(Of NotificationEventType, CheckBox)
             ' Only the event types the Discord integration currently
             ' cares about — skip Custom / AutomationRule* / UpdateAvailable
@@ -321,7 +361,7 @@ Namespace GSM.Manager.UI
                     .Tag = evt
                 }
                 AddHandler cb.CheckedChanged, AddressOf OnEventCheckChanged
-                _detailsPanel.Controls.Add(cb)
+                container.Controls.Add(cb)
                 _eventChecks(evt) = cb
                 col += 1
                 If col >= 3 Then
@@ -395,11 +435,7 @@ Namespace GSM.Manager.UI
                 End Using
 
                 _suppressEvents = True
-                _installCheckList.Items.Clear()
-                For Each inst In _allInstallations
-                    Dim label = $"{inst.DisplayName} ({If(inst.Node IsNot Nothing, inst.Node.DisplayName, "?")})"
-                    _installCheckList.Items.Add(New InstallationItem(inst.InstallationId, label))
-                Next
+                PopulateScopeItems()
                 _suppressEvents = False
 
                 RefreshDestinationList()
@@ -519,17 +555,14 @@ Namespace GSM.Manager.UI
 
                 _enabledCheckBox.Checked = _selectedDestination.Enabled
 
-                ' Installations
-                For i = 0 To _installCheckList.Items.Count - 1
-                    Dim item = TryCast(_installCheckList.Items(i), InstallationItem)
-                    Dim checked = item IsNot Nothing AndAlso
-                                   _selectedDestination.InstallationFilter.Contains(item.InstallationId)
-                    _installCheckList.SetItemChecked(i, checked)
-                Next
-
-                ' Build the per-installation instance selectors based on
-                ' currently-checked installations.
-                RebuildInstanceSelectors()
+                ' Scope — apply the four filter dimensions to the
+                ' accordion sections (each set's own comparer decides
+                ' membership).
+                _nodeSection.SetCheckedKeys(_selectedDestination.NodeFilter)
+                _installSection.SetCheckedKeys(_selectedDestination.InstallationFilter)
+                _instanceSection.SetCheckedKeys(_selectedDestination.InstanceFilter)
+                _setSection.SetCheckedKeys(_selectedDestination.InstanceSetFilter)
+                UpdateMatchLabel()
 
                 ' Events
                 For Each kvp In _eventChecks
@@ -562,10 +595,11 @@ Namespace GSM.Manager.UI
                 _guildCombo.Items.Clear()
                 _channelCombo.Items.Clear()
                 _enabledCheckBox.Checked = False
-                For i = 0 To _installCheckList.Items.Count - 1
-                    _installCheckList.SetItemChecked(i, False)
-                Next
-                _instanceSelectorsContainer.Controls.Clear()
+                _nodeSection.SetCheckedKeys(Nothing)
+                _installSection.SetCheckedKeys(Nothing)
+                _instanceSection.SetCheckedKeys(Nothing)
+                _setSection.SetCheckedKeys(Nothing)
+                UpdateMatchLabel()
                 For Each cb In _eventChecks.Values
                     cb.Checked = False
                 Next
@@ -675,57 +709,141 @@ Namespace GSM.Manager.UI
 
         ' ---- Instance selectors: per-installation scrolling listbox ----
 
-        Private Sub RebuildInstanceSelectors()
-            _instanceSelectorsContainer.Controls.Clear()
-            If _selectedDestination Is Nothing Then Return
+        ' ---- Phase 5n scope accordion: populate + change wiring ----
 
-            Dim y = 4
-            For i = 0 To _installCheckList.Items.Count - 1
-                If Not _installCheckList.GetItemChecked(i) Then Continue For
-                Dim item = TryCast(_installCheckList.Items(i), InstallationItem)
-                If item Is Nothing Then Continue For
-                Dim installation = _allInstallations.FirstOrDefault(Function(x) x.InstallationId = item.InstallationId)
-                If installation Is Nothing Then Continue For
+        Private Sub PopulateScopeItems()
+            Dim nodeItems As New List(Of KeyedItem)
+            Dim seenNodes As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            Dim installItems As New List(Of KeyedItem)
+            Dim instanceItems As New List(Of KeyedItem)
+            Dim setItems As New List(Of KeyedItem)
+            Dim seenSets As New HashSet(Of String)(StringComparer.Ordinal)
 
-                Dim header As New Label() With {
-                    .Text = installation.DisplayName & ":",
-                    .Font = New Font("Segoe UI", 9, FontStyle.Bold),
-                    .AutoSize = True,
-                    .Location = New Point(6, y)
-                }
-                _instanceSelectorsContainer.Controls.Add(header)
-                y += 18
-
-                Dim listBox As New CheckedListBox() With {
-                    .Location = New Point(6, y),
-                    .Size = New Size(394, 80),
-                    .CheckOnClick = True,
-                    .Tag = installation.InstallationId
-                }
-                If installation.Instances IsNot Nothing Then
-                    For Each inst In installation.Instances
-                        Dim idx = listBox.Items.Add(New InstanceItem(inst.InstanceId, inst.DisplayName))
-                        If _selectedDestination.InstanceFilter.Contains(inst.InstanceId) Then
-                            listBox.SetItemChecked(idx, True)
+            For Each inst In _allInstallations
+                Dim nodeName = If(inst.Node IsNot Nothing, inst.Node.DisplayName, "?")
+                If Not String.IsNullOrEmpty(inst.NodeId) AndAlso seenNodes.Add(inst.NodeId) Then
+                    nodeItems.Add(New KeyedItem(inst.NodeId, nodeName))
+                End If
+                installItems.Add(New KeyedItem(inst.InstallationId, $"{inst.DisplayName} ({nodeName})"))
+                If inst.Instances IsNot Nothing Then
+                    For Each ins In inst.Instances
+                        instanceItems.Add(New KeyedItem(ins.InstanceId, $"{ins.DisplayName}  —  {inst.DisplayName}"))
+                        If Not String.IsNullOrWhiteSpace(ins.InstanceSetTag) AndAlso seenSets.Add(ins.InstanceSetTag) Then
+                            setItems.Add(New KeyedItem(ins.InstanceSetTag, ins.InstanceSetTag))
                         End If
                     Next
                 End If
-                AddHandler listBox.ItemCheck, AddressOf OnInstanceItemChecked
-                _instanceSelectorsContainer.Controls.Add(listBox)
-                y += 86
+            Next
+
+            _nodeSection.SetItems(nodeItems.OrderBy(Function(k) k.Display).ToList())
+            _installSection.SetItems(installItems.OrderBy(Function(k) k.Display).ToList())
+            _instanceSection.SetItems(instanceItems.OrderBy(Function(k) k.Display).ToList())
+            _setSection.SetItems(setItems.OrderBy(Function(k) k.Display).ToList())
+        End Sub
+
+        Private Sub OnScopeNodeChanged(sender As Object, e As EventArgs)
+            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
+            SyncSet(_selectedDestination.NodeFilter, _nodeSection.GetCheckedKeys())
+            UpdateMatchLabel()
+        End Sub
+
+        Private Sub OnScopeInstallationChanged(sender As Object, e As EventArgs)
+            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
+            SyncSet(_selectedDestination.InstallationFilter, _installSection.GetCheckedKeys())
+            UpdateMatchLabel()
+        End Sub
+
+        Private Sub OnScopeInstanceChanged(sender As Object, e As EventArgs)
+            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
+            SyncSet(_selectedDestination.InstanceFilter, _instanceSection.GetCheckedKeys())
+            UpdateMatchLabel()
+        End Sub
+
+        Private Sub OnScopeSetChanged(sender As Object, e As EventArgs)
+            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
+            SyncSet(_selectedDestination.InstanceSetFilter, _setSection.GetCheckedKeys())
+            UpdateMatchLabel()
+        End Sub
+
+        ' Refills target from keys without replacing the HashSet, so the
+        ' set's comparer (Ordinal for InstanceSetFilter, OrdinalIgnoreCase
+        ' for the rest) is preserved.
+        Private Shared Sub SyncSet(target As HashSet(Of String), keys As IEnumerable(Of String))
+            target.Clear()
+            If keys Is Nothing Then Return
+            For Each k In keys
+                target.Add(k)
             Next
         End Sub
 
-        Private Sub OnInstanceItemChecked(sender As Object, e As ItemCheckEventArgs)
-            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
-            Dim lb = DirectCast(sender, CheckedListBox)
-            Dim item = TryCast(lb.Items(e.Index), InstanceItem)
-            If item Is Nothing Then Return
-            If e.NewValue = CheckState.Checked Then
-                _selectedDestination.InstanceFilter.Add(item.InstanceId)
-            Else
-                _selectedDestination.InstanceFilter.Remove(item.InstanceId)
+        ' Live readout previewing the union-of-includes scope (the same
+        ' predicate the send-time matcher adopts in Phase 5n-2).
+        Private Sub UpdateMatchLabel()
+            If _matchLabel Is Nothing Then Return
+            Dim d = _selectedDestination
+            If d Is Nothing Then
+                _matchLabel.Text = ""
+                Return
             End If
+            Dim noFilter = (d.NodeFilter.Count + d.InstallationFilter.Count +
+                            d.InstanceFilter.Count + d.InstanceSetFilter.Count) = 0
+            Dim total = 0
+            Dim inScope = 0
+            For Each inst In _allInstallations
+                If inst.Instances Is Nothing Then Continue For
+                For Each ins In inst.Instances
+                    total += 1
+                    Dim hit As Boolean
+                    If noFilter Then
+                        hit = True
+                    Else
+                        hit = d.NodeFilter.Contains(inst.NodeId) OrElse
+                              d.InstallationFilter.Contains(inst.InstallationId) OrElse
+                              d.InstanceFilter.Contains(ins.InstanceId) OrElse
+                              (Not String.IsNullOrEmpty(ins.InstanceSetTag) AndAlso
+                               d.InstanceSetFilter.Contains(ins.InstanceSetTag))
+                    End If
+                    If hit Then inScope += 1
+                Next
+            Next
+            If noFilter Then
+                _matchLabel.Text = $"Matches all {total} instance(s)"
+            Else
+                _matchLabel.Text = $"Matches {inScope} of {total} instance(s)"
+            End If
+        End Sub
+
+        Private Sub OnDetailsResize(sender As Object, e As EventArgs)
+            If _lowerHost Is Nothing Then Return
+            ' Size the lower column to the panel width; the scope box,
+            ' events and visibility panels dock-fill it (no horizontal
+            ' scroll), and the details panel scrolls the whole column.
+            Dim w = _detailsPanel.ClientSize.Width - _lowerHost.Left - 20
+            If w < 280 Then w = 280
+            _lowerHost.Width = w
+            If _scopeHint IsNot Nothing Then _scopeHint.Width = Math.Max(200, w - 24)
+            RelayoutScope()
+        End Sub
+
+        ' Grows the scope box to fit its (expanded) sections, then sizes
+        ' the lower column to the full stack so the details panel scrolls
+        ' the lot — nothing inside the scope area scrolls on its own.
+        Private Sub RelayoutScope()
+            If _scopeHost Is Nothing OrElse _lowerHost Is Nothing Then Return
+            Dim sh = 0
+            For Each s In {_nodeSection, _installSection, _instanceSection, _setSection}
+                sh += s.Height
+            Next
+            _scopeHost.Height = sh + 4
+            Dim total = 0
+            For Each c As Control In _lowerHost.Controls
+                total += c.Height
+            Next
+            _lowerHost.Height = total + 4
+        End Sub
+
+        Private Sub OnScopeSectionExpanded(sender As Object, e As EventArgs)
+            RelayoutScope()
         End Sub
 
         ' ---- Event handlers ----
@@ -837,29 +955,6 @@ Namespace GSM.Manager.UI
             Next
         End Sub
 
-        Private Sub OnInstallationChecked(sender As Object, e As ItemCheckEventArgs)
-            If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
-            Dim item = TryCast(_installCheckList.Items(e.Index), InstallationItem)
-            If item Is Nothing Then Return
-
-            If e.NewValue = CheckState.Checked Then
-                _selectedDestination.InstallationFilter.Add(item.InstallationId)
-            Else
-                _selectedDestination.InstallationFilter.Remove(item.InstallationId)
-                ' When unchecking an installation, drop its instances
-                ' from the instance filter too — otherwise stale IDs
-                ' leak forward unexpectedly.
-                Dim install = _allInstallations.FirstOrDefault(Function(x) x.InstallationId = item.InstallationId)
-                If install IsNot Nothing AndAlso install.Instances IsNot Nothing Then
-                    For Each inst In install.Instances
-                        _selectedDestination.InstanceFilter.Remove(inst.InstanceId)
-                    Next
-                End If
-            End If
-
-            ' Defer to fire after the check state is actually applied
-            Me.BeginInvoke(Sub() RebuildInstanceSelectors())
-        End Sub
 
         Private Sub OnEventCheckChanged(sender As Object, e As EventArgs)
             If _suppressEvents OrElse _selectedDestination Is Nothing Then Return
@@ -1099,6 +1194,8 @@ Namespace GSM.Manager.UI
                             d.EnabledEventTypes.Select(Function(x) x.ToString()).ToList())
                         ent.InstallationFilterJson = JsonSerializer.Serialize(d.InstallationFilter.ToList())
                         ent.InstanceFilterJson = JsonSerializer.Serialize(d.InstanceFilter.ToList())
+                        ent.NodeFilterJson = JsonSerializer.Serialize(d.NodeFilter.ToList())
+                        ent.InstanceSetFilterJson = JsonSerializer.Serialize(d.InstanceSetFilter.ToList())
                         ent.VisibilityProfileId = d.VisibilityProfileId
                         If d.TemplateOverrides Is Nothing OrElse d.TemplateOverrides.Count = 0 Then
                             ent.TemplateOverridesJson = Nothing
@@ -1154,6 +1251,11 @@ Namespace GSM.Manager.UI
             Public Property EnabledEventTypes As New HashSet(Of NotificationEventType)
             Public Property InstallationFilter As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
             Public Property InstanceFilter As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            ' Phase 5n scope dimensions. NodeFilter holds node IDs;
+            ' InstanceSetFilter holds InstanceSetTag values and is
+            ' case-sensitive (Ordinal) to match RuleScope.InstanceSet.
+            Public Property NodeFilter As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            Public Property InstanceSetFilter As New HashSet(Of String)(StringComparer.Ordinal)
             Public Property TemplateOverrides As Dictionary(Of NotificationEventType, String)
 
             Public Shared Function FromEntity(e As NotificationDestinationEntity) As DestinationEdit
@@ -1190,6 +1292,8 @@ Namespace GSM.Manager.UI
                 edit.EnabledEventTypes = ParseEnumSet(e.EnabledEventTypesJson)
                 edit.InstallationFilter = ParseStringSet(e.InstallationFilterJson)
                 edit.InstanceFilter = ParseStringSet(e.InstanceFilterJson)
+                edit.NodeFilter = ParseStringSet(e.NodeFilterJson)
+                edit.InstanceSetFilter = ParseStringSet(e.InstanceSetFilterJson, StringComparer.Ordinal)
                 edit.TemplateOverrides = ParseTemplateOverrides(e.TemplateOverridesJson)
                 Return edit
             End Function
@@ -1210,8 +1314,11 @@ Namespace GSM.Manager.UI
                 Return result
             End Function
 
-            Private Shared Function ParseStringSet(json As String) As HashSet(Of String)
-                Dim result As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            Private Shared Function ParseStringSet(json As String,
+                                                   Optional comparer As IEqualityComparer(Of String) = Nothing) As HashSet(Of String)
+                Dim cmp As IEqualityComparer(Of String) =
+                    If(comparer, DirectCast(StringComparer.OrdinalIgnoreCase, IEqualityComparer(Of String)))
+                Dim result As New HashSet(Of String)(cmp)
                 If String.IsNullOrEmpty(json) Then Return result
                 Try
                     Dim list = JsonSerializer.Deserialize(Of List(Of String))(json)
@@ -1314,6 +1421,176 @@ Namespace GSM.Manager.UI
             End Function
         End Class
 
+    End Class
+
+    ' ============================================================
+    '  CollapsibleCheckSection — one accordion section for the
+    '  notification scope editor: a clickable header (glyph + title
+    '  + live "N of M selected" summary) over a CheckedListBox.
+    '  Collapsed shows only the header; the summary keeps the
+    '  selection visible while collapsed. Items are KeyedItem
+    '  (Key + Display); membership is keyed on Key.
+    ' ============================================================
+    Friend Class CollapsibleCheckSection
+        Inherits Panel
+
+        Private Const HeaderH As Integer = 24
+
+        Private ReadOnly _title As String
+        Private ReadOnly _header As Label
+        Private ReadOnly _list As CheckedListBox
+        Private _expanded As Boolean
+        Private _suppress As Boolean
+
+        Public Event CheckedChanged As EventHandler
+        Public Event ExpandedChanged As EventHandler
+
+        Public Sub New(title As String)
+            _title = title
+            Me.Dock = DockStyle.Top
+            Me.Height = HeaderH
+
+            ' List added first, header second, so the header docks above
+            ' the list. Both Dock.Top, so width tracks the section (and
+            ' the section tracks its scrolling host) — no fixed width.
+            _list = New CheckedListBox() With {
+                .Dock = DockStyle.Top,
+                .Height = 22,
+                .CheckOnClick = True,
+                .IntegralHeight = False,
+                .Visible = False
+            }
+            AddHandler _list.ItemCheck, AddressOf OnItemCheck
+            AddHandler _list.MouseWheel, AddressOf OnListMouseWheel
+            Me.Controls.Add(_list)
+
+            _header = New Label() With {
+                .Dock = DockStyle.Top,
+                .Height = HeaderH,
+                .Font = New Font("Segoe UI", 9, FontStyle.Bold),
+                .TextAlign = ContentAlignment.MiddleLeft,
+                .Cursor = Cursors.Hand,
+                .BackColor = Color.FromArgb(238, 238, 244)
+            }
+            AddHandler _header.Click, AddressOf OnHeaderClick
+            Me.Controls.Add(_header)
+
+            UpdateHeader()
+        End Sub
+
+        Private Sub OnHeaderClick(sender As Object, e As EventArgs)
+            SetExpanded(Not _expanded)
+        End Sub
+
+        ' The grown list never needs to scroll itself, so forward the
+        ' wheel to the nearest auto-scrolling parent. Otherwise the list
+        ' swallows the wheel and the panel won't scroll while the pointer
+        ' is over a section.
+        Private Sub OnListMouseWheel(sender As Object, e As MouseEventArgs)
+            Dim h = TryCast(e, HandledMouseEventArgs)
+            If h IsNot Nothing Then h.Handled = True
+            Dim p As Control = Me.Parent
+            While p IsNot Nothing
+                Dim sc = TryCast(p, ScrollableControl)
+                If sc IsNot Nothing AndAlso sc.AutoScroll Then
+                    Dim cur = -sc.AutoScrollPosition.Y
+                    sc.AutoScrollPosition = New Point(0, cur - e.Delta)
+                    Return
+                End If
+                p = p.Parent
+            End While
+        End Sub
+
+        Public Sub SetExpanded(value As Boolean)
+            _expanded = value
+            _list.Visible = value
+            Me.Height = If(value, HeaderH + _list.Height, HeaderH)
+            UpdateHeader()
+            RaiseEvent ExpandedChanged(Me, EventArgs.Empty)
+        End Sub
+
+        Public Sub SetItems(items As IEnumerable(Of KeyedItem))
+            _suppress = True
+            _list.Items.Clear()
+            If items IsNot Nothing Then
+                For Each it In items
+                    _list.Items.Add(it)
+                Next
+            End If
+            _suppress = False
+            ResizeListToFit()
+            UpdateHeader()
+        End Sub
+
+        ' Sizes the list to show every row, so an expanded section grows
+        ' to fit its items instead of scrolling internally.
+        Private Sub ResizeListToFit()
+            ' Use the control's own item height (font/DPI-exact), take the
+            ' larger of that and a measured fallback, and add a buffer for
+            ' the list border so rows never trigger an inner scrollbar.
+            Dim rowH = _list.ItemHeight
+            Dim measured = TextRenderer.MeasureText("Wg", _list.Font).Height + 2
+            If rowH < measured Then rowH = measured
+            Dim n = Math.Max(1, _list.Items.Count)
+            _list.Height = n * rowH + 8
+            If _expanded Then Me.Height = HeaderH + _list.Height
+        End Sub
+
+        ' Checks the rows whose Key is in keys, using keys' own equality
+        ' semantics (pass the backing HashSet so its comparer applies).
+        ' Nothing = clear all.
+        Public Sub SetCheckedKeys(keys As ICollection(Of String))
+            _suppress = True
+            For i = 0 To _list.Items.Count - 1
+                Dim it = TryCast(_list.Items(i), KeyedItem)
+                Dim on_ = it IsNot Nothing AndAlso keys IsNot Nothing AndAlso keys.Contains(it.Key)
+                _list.SetItemChecked(i, on_)
+            Next
+            _suppress = False
+            UpdateHeader()
+        End Sub
+
+        Public Function GetCheckedKeys() As List(Of String)
+            Dim result As New List(Of String)
+            For Each o In _list.CheckedItems
+                Dim it = TryCast(o, KeyedItem)
+                If it IsNot Nothing Then result.Add(it.Key)
+            Next
+            Return result
+        End Function
+
+        Private Sub OnItemCheck(sender As Object, e As ItemCheckEventArgs)
+            If _suppress Then Return
+            ' ItemCheck fires before the row's state flips; defer so the
+            ' summary and GetCheckedKeys() see the new state.
+            Me.BeginInvoke(New MethodInvoker(AddressOf RaiseChanged))
+        End Sub
+
+        Private Sub RaiseChanged()
+            UpdateHeader()
+            RaiseEvent CheckedChanged(Me, EventArgs.Empty)
+        End Sub
+
+        Private Sub UpdateHeader()
+            Dim glyph = If(_expanded, "▼", "▶")
+            Dim n = _list.CheckedItems.Count
+            Dim total = _list.Items.Count
+            Dim summary = If(n = 0, "none", n & " of " & total & " selected")
+            _header.Text = glyph & "  " & _title & "   —   " & summary
+        End Sub
+
+    End Class
+
+    Friend Class KeyedItem
+        Public ReadOnly Key As String
+        Public ReadOnly Display As String
+        Public Sub New(key As String, display As String)
+            Me.Key = key
+            Me.Display = display
+        End Sub
+        Public Overrides Function ToString() As String
+            Return Display
+        End Function
     End Class
 
 End Namespace

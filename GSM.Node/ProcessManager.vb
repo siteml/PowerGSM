@@ -9,6 +9,7 @@ Imports System.Threading
 Imports System.Threading.Tasks
 Imports GSM.Plugin
 Imports GSM.Node.Api
+Imports GSM.Shim.Protocol
 Imports Microsoft.Extensions.Logging
 Imports Microsoft.Win32.SafeHandles
 
@@ -105,15 +106,22 @@ Namespace GSM.Node
         Private ReadOnly _logStore As RingBufferStore
         Private ReadOnly _database As NodeDatabase
         Private ReadOnly _eventStore As EventStore
+        Private ReadOnly _nodeConfig As NodeConfiguration
+        Private ReadOnly _shimSocketDir As String
         Private ReadOnly _logger As Microsoft.Extensions.Logging.ILogger(Of ProcessManager)
 
         Public Sub New(logStore As RingBufferStore,
                        database As NodeDatabase,
                        eventStore As EventStore,
+                       nodeConfig As NodeConfiguration,
                        logger As Microsoft.Extensions.Logging.ILogger(Of ProcessManager))
             _logStore = logStore
             _database = database
             _eventStore = eventStore
+            _nodeConfig = nodeConfig
+            ' Linux shim sockets live under {DataDirectory}\shims; unused on
+            ' Windows (named pipes). DataDirectory is already absolute here.
+            _shimSocketDir = IO.Path.Combine(nodeConfig.DataDirectory, "shims")
             _logger = logger
         End Sub
 
@@ -179,15 +187,15 @@ Namespace GSM.Node
         '  Instance lifecycle
         ' ============================================================
 
-        Public Function StartInstanceAsync(request As StartInstanceRequest) As Task(Of InstanceStatusResponse)
+        Public Async Function StartInstanceAsync(request As StartInstanceRequest) As Task(Of InstanceStatusResponse)
 
             ' Check if already tracked
             Dim existing As ManagedInstance = Nothing
             If _instances.TryGetValue(request.InstanceId, existing) Then
                 If existing.State = InstanceState.Running OrElse
                    existing.State = InstanceState.Starting Then
-                    Return Task.FromResult(BuildStatusResponse(existing, NodeErrorCodes.InstanceAlreadyRunning,
-                                               "Instance is already running"))
+                    Return BuildStatusResponse(existing, NodeErrorCodes.InstanceAlreadyRunning,
+                                               "Instance is already running")
                 End If
             End If
 
@@ -283,27 +291,45 @@ Namespace GSM.Node
             End If
 
             Try
-                Dim proc As Process = SpawnGameProcess(managed, psi)
+                ' Every strategy routes through a per-instance GSM.Shim
+                ' supervisor (Phase 8-1) unless the kill-switch is set — A via
+                ' redirected stdio, B/C via the shim's hidden-console spawn. The
+                ' shim owns the game's lifetime, so a Node restart doesn't sever
+                ' the log stream (A) or orphan the process (B/C); adoption
+                ' reconnects to the live shim. DisableShim forces the legacy
+                ' in-Node spawn (Direct mode) for every strategy.
+                Dim useShim As Boolean = Not _nodeConfig.DisableShim
 
-                If proc Is Nothing Then
-                    Return Task.FromResult(BuildErrorResponse(request.InstanceId,
-                                              NodeErrorCodes.ProcessStartFailed,
-                                              "Process spawn failed"))
+                If useShim Then
+                    Dim shimOk As Boolean = Await StartViaShimAsync(managed).ConfigureAwait(False)
+                    If Not shimOk Then
+                        Return BuildErrorResponse(request.InstanceId,
+                                                  NodeErrorCodes.ProcessStartFailed,
+                                                  "Shim spawn failed")
+                    End If
+                    _instances(request.InstanceId) = managed
+                    FinalizeStart(managed, Nothing)
+                Else
+                    Dim proc As Process = SpawnGameProcess(managed, psi)
+                    If proc Is Nothing Then
+                        Return BuildErrorResponse(request.InstanceId,
+                                                  NodeErrorCodes.ProcessStartFailed,
+                                                  "Process spawn failed")
+                    End If
+                    _instances(request.InstanceId) = managed
+                    FinalizeStart(managed, proc)
                 End If
 
-                _instances(request.InstanceId) = managed
-                FinalizeStart(managed, proc)
+                _logger.LogInformation("Started instance {InstanceId} (PID {Pid}, mode={Mode})",
+                                       request.InstanceId, managed.Pid, managed.ExecutionMode)
 
-                _logger.LogInformation("Started instance {InstanceId} (PID {Pid})",
-                                       request.InstanceId, managed.Pid)
-
-                Return Task.FromResult(BuildStatusResponse(managed))
+                Return BuildStatusResponse(managed)
 
             Catch ex As Exception
                 _logger.LogError(ex, "Failed to start instance {InstanceId}", request.InstanceId)
-                Return Task.FromResult(BuildErrorResponse(request.InstanceId,
+                Return BuildErrorResponse(request.InstanceId,
                                           NodeErrorCodes.ProcessStartFailed,
-                                          ex.Message))
+                                          ex.Message)
             End Try
         End Function
 
@@ -327,7 +353,52 @@ Namespace GSM.Node
             managed.State = InstanceState.Stopping
             managed.StateChangedAt = DateTime.UtcNow
 
-            If managed.Process IsNot Nothing AndAlso Not managed.Process.HasExited Then
+            If managed.ExecutionMode = ExecutionMode.Shim AndAlso managed.Shim IsNot Nothing Then
+                Dim shim = managed.Shim
+                Try
+                    Dim timeout = If(request.GracefulTimeoutMs > 0, request.GracefulTimeoutMs, 20000)
+
+                    ' Graceful-first (Phase 8-1 slice 5). The Node delivers the
+                    ' real shutdown signal straight to the game by PID — exactly
+                    ' as in direct mode — because AttachConsole/CTRL_C_EVENT (and
+                    ' SIGTERM) target a PID, not a parent/child relationship, so
+                    ' it works whether the game is the Node's child (direct) or
+                    ' the shim's (shim mode). The shim isn't involved in the
+                    ' signal; its WatchExitAsync reports the clean exit, draining
+                    ' late-stage log output first. managed.Pid is the game (B) or
+                    ' cmd (C) PID. Escalate to the shim's kill / Shutdown only if
+                    ' the graceful signal doesn't land the exit in time.
+                    Dim gracefulSent = False
+                    If OperatingSystem.IsWindows() Then
+                        _logger.LogInformation(
+                            "Graceful stop of shim instance {Id} (PID {Pid}) via CTRL_C_EVENT",
+                            request.InstanceId, managed.Pid)
+                        gracefulSent = SendCtrlCToProcess(managed.Pid)
+                    ElseIf OperatingSystem.IsLinux() Then
+                        _logger.LogInformation(
+                            "Graceful stop of shim instance {Id} (PID {Pid}) via SIGINT",
+                            request.InstanceId, managed.Pid)
+                        gracefulSent = SendSigIntToProcess(managed.Pid)
+                    End If
+
+                    Dim finished = Await Task.WhenAny(shim.ExitedTask, Task.Delay(timeout))
+                    If finished IsNot shim.ExitedTask Then
+                        _logger.LogWarning(
+                            "Shim-mode {Id} didn't exit gracefully in {Ms}ms (signalSent={Sent}); sending kill",
+                            request.InstanceId, timeout, gracefulSent)
+                        Await shim.SendStopAsync("kill", timeout, CancellationToken.None)
+                        Dim killFinished = Await Task.WhenAny(shim.ExitedTask, Task.Delay(5000))
+                        If killFinished IsNot shim.ExitedTask Then
+                            _logger.LogWarning("Shim-mode {Id} still alive after kill; sending Shutdown",
+                                               request.InstanceId)
+                            Await shim.SendShutdownAsync(CancellationToken.None)
+                            Await Task.WhenAny(shim.ExitedTask, Task.Delay(5000))
+                        End If
+                    End If
+                Catch ex As Exception
+                    _logger.LogError(ex, "Error stopping shim instance {InstanceId}", request.InstanceId)
+                End Try
+            ElseIf managed.Process IsNot Nothing AndAlso Not managed.Process.HasExited Then
                 Try
                     Dim timeout = If(request.GracefulTimeoutMs > 0,
                                      request.GracefulTimeoutMs, 20000)
@@ -344,31 +415,32 @@ Namespace GSM.Node
                         _logger.LogInformation(
                             "Initiating graceful stop of {Id} (PID {Pid}, CaptureStdout={CapStd})",
                             request.InstanceId, managed.Pid, managed.CaptureStdout)
-                        gracefulSignalSent = SendCtrlCToProcess(managed.Process)
+                        gracefulSignalSent = SendCtrlCToProcess(managed.Process.Id)
                     ElseIf OperatingSystem.IsLinux() Then
-                        ' Linux equivalent of CTRL_C_EVENT for UE4: SIGTERM.
-                        ' UE4 dedicated servers on Linux install a
-                        ' signal handler in LaunchUnix.cpp that maps
-                        ' SIGTERM/SIGINT to RequestEngineExit, which
-                        ' is the same graceful-shutdown entry point
-                        ' the Windows CTRL_C_EVENT handler routes to.
-                        ' Most Linux servers behave similarly:
-                        ' Factorio handles SIGTERM as save-and-quit,
-                        ' Source-engine servers do too.
+                        ' Linux analog of the Windows CTRL_C_EVENT for
+                        ' UE4: SIGINT, not SIGTERM. UE4 installs a signal
+                        ' handler (LaunchUnix.cpp) that sets the exit
+                        ' request, but MistServer (Last Oasis) only acts
+                        ' on the interrupt path: it exits SILENTLY on
+                        ' SIGTERM and shuts down cleanly on SIGINT,
+                        ' mirroring how its Windows graceful path is the
+                        ' console-ctrl handler. SIGINT is also save-and-
+                        ' quit for Factorio, so it's the right graceful
+                        ' dose across our Linux games. (UE4 acts on the
+                        ' request on its next main-loop tick, so a server
+                        ' still in startup defers the quit until load
+                        ' finishes; the timeout-then-SIGKILL below covers
+                        ' the case where it never does.)
                         '
                         ' Process.Kill() in .NET 8 sends SIGKILL on
-                        ' Linux, which is not what we want here —
-                        ' that's the force-kill fallback below. We
-                        ' shell out to /bin/kill instead so we get
-                        ' SIGTERM with no native interop required
-                        ' (libc.kill via P/Invoke is the obvious
-                        ' alternative, but pulling that in just for
-                        ' a graceful stop signal isn't worth it when
-                        ' /bin/kill is universally present).
+                        ' Linux, which is the force-kill fallback below,
+                        ' not this. We shell out to /bin/kill instead so
+                        ' no native interop is needed for one signal
+                        ' (/bin/kill is universally present).
                         _logger.LogInformation(
-                            "Initiating graceful stop of {Id} (PID {Pid}) via SIGTERM",
+                            "Initiating graceful stop of {Id} (PID {Pid}) via SIGINT",
                             request.InstanceId, managed.Pid)
-                        gracefulSignalSent = SendSigTermToProcess(managed.Process)
+                        gracefulSignalSent = SendSigIntToProcess(managed.Process.Id)
                     End If
 
                     ' Fallback: close stdin — some servers (Factorio
@@ -534,6 +606,41 @@ Namespace GSM.Node
         End Sub
 
         ''' <summary>
+        ''' On a clean Node shutdown, send Detach to every shim-mode instance so
+        ''' each shim cleanly keeps its game running and waits for the next Node
+        ''' (suppressing a spurious "lost Node" on the shim side). A raw crash
+        ''' drop also keeps the game — this is just the tidy path. Best-effort and
+        ''' time-boxed so an unresponsive shim can't stall shutdown.
+        ''' </summary>
+        Public Sub DetachShimsForShutdown()
+            Dim shims As New List(Of ShimSession)
+            For Each kvp In _instances
+                Dim m = kvp.Value
+                If m IsNot Nothing AndAlso m.ExecutionMode = ExecutionMode.Shim AndAlso m.Shim IsNot Nothing Then
+                    shims.Add(m.Shim)
+                End If
+            Next
+            If shims.Count = 0 Then Return
+
+            _logger.LogInformation(
+                "Node shutting down: detaching {Count} shim instance(s), leaving games running", shims.Count)
+
+            Dim tasks As New List(Of Task)
+            For Each s In shims
+                Try
+                    tasks.Add(s.SendDetachAsync(CancellationToken.None))
+                Catch ex As Exception
+                    _logger.LogDebug(ex, "Detach send failed for a shim during shutdown")
+                End Try
+            Next
+            Try
+                Task.WhenAll(tasks).Wait(TimeSpan.FromSeconds(3))
+            Catch
+                ' best-effort; we're shutting down regardless
+            End Try
+        End Sub
+
+        ''' <summary>
         ''' Single-snapshot adoption attempt. Returns True on
         ''' successful adoption (instance now in _instances and
         ''' fully wired up) or False on any non-throwing rejection
@@ -570,6 +677,13 @@ Namespace GSM.Node
                     id)
                 _database.RemoveInstanceSnapshot(id)
                 Return False
+            End If
+
+            ' Phase 8-1: shim-mode instances reconnect to a live shim by its
+            ' saved endpoint rather than re-deriving a Process handle by PID +
+            ' start time. The shim kept the game alive across the Node restart.
+            If snapshot.ExecutionMode = CInt(ExecutionMode.Shim) Then
+                Return TryAdoptShim(snapshot)
             End If
 
             ' Look up the saved PID. ArgumentException = no
@@ -790,6 +904,359 @@ Namespace GSM.Node
             Return True
         End Function
 
+        ''' <summary>
+        ''' Shim-mode adoption (Phase 8-1 slice 3): reconnect to the instance's
+        ''' still-running GSM.Shim by its saved endpoint instead of re-deriving a
+        ''' Process handle. The shim kept the game alive across the Node restart
+        ''' and reports the live game pid + replays buffered output on reconnect.
+        ''' Returns False (removing the snapshot) if the endpoint is missing or
+        ''' the shim/game is gone.
+        ''' </summary>
+        Private Function TryAdoptShim(snapshot As InstanceSnapshotRow) As Boolean
+            Dim id = snapshot.InstanceId
+
+            If String.IsNullOrEmpty(snapshot.ShimEndpoint) Then
+                _logger.LogInformation(
+                    "Snapshot {Id}: shim mode but no endpoint recorded — discarding", id)
+                _database.RemoveInstanceSnapshot(id)
+                Return False
+            End If
+
+            ' Reconstruct the ManagedInstance shell (no Process handle in shim
+            ' mode). Mirrors the Direct path minus the PID / start-time identity
+            ' check, which the shim handshake replaces.
+            Dim managed As New ManagedInstance()
+            managed.InstanceId = id
+            managed.State = InstanceState.Running
+            managed.StateChangedAt = DateTime.UtcNow
+            managed.StopIntentPending = False
+            managed.CrashCount = 0
+
+            ' Restore crash policy (same shape FinalizeStart serialized).
+            If Not String.IsNullOrEmpty(snapshot.CrashPolicyJson) Then
+                Try
+                    Dim policy = JsonSerializer.Deserialize(Of CrashPolicyState)(snapshot.CrashPolicyJson)
+                    If policy IsNot Nothing Then
+                        Dim parsed As CrashRestartPolicy
+                        If [Enum].TryParse(Of CrashRestartPolicy)(policy.Policy, parsed) Then
+                            managed.CrashPolicy = parsed
+                        End If
+                        If policy.MaxCrash > 0 Then managed.MaxCrashCount = policy.MaxCrash
+                        If policy.WindowMin > 0 Then managed.CrashWindowMinutes = policy.WindowMin
+                    End If
+                Catch ex As Exception
+                    _logger.LogWarning(ex, "Snapshot {Id}: CrashPolicyJson parse failed, using defaults", id)
+                End Try
+            End If
+
+            ' Spawn metadata + a rebuilt ProcessStartInfo so a post-adopt shim
+            ' exit can be restarted through StartViaShimAsync (which reads
+            ' managed.StartInfo to rebuild the SpawnSpec).
+            managed.Strategy = CType(snapshot.Strategy, SpawnStrategy)
+            managed.StdoutIsLog = snapshot.StdoutIsLog
+            managed.RequiresConsoleIsolation = snapshot.RequiresConsoleIsolation
+            managed.LogTailerStartDelayMs = snapshot.LogTailerStartDelayMs
+
+            Dim psi As New ProcessStartInfo()
+            psi.FileName = snapshot.ExePath
+            psi.Arguments = If(snapshot.Arguments, "")
+            psi.WorkingDirectory = If(snapshot.WorkingDirectory,
+                                       Path.GetDirectoryName(snapshot.ExePath))
+            psi.UseShellExecute = False
+            psi.CreateNoWindow = True
+            managed.StartInfo = psi
+
+            ' Log file paths + CaptureStdout (same hasFileLogs rule as the Direct
+            ' path; shim Strategy A normally carries no file logs).
+            Dim logFilePaths As IList(Of String) = Nothing
+            If Not String.IsNullOrEmpty(snapshot.LogFilePathsJson) Then
+                Try
+                    logFilePaths = JsonSerializer.Deserialize(Of List(Of String))(snapshot.LogFilePathsJson)
+                Catch ex As Exception
+                    _logger.LogWarning(ex, "Snapshot {Id}: LogFilePathsJson parse failed, no tailers", id)
+                End Try
+            End If
+            managed.LogFilePaths = logFilePaths
+            Dim adoptHasFileLogs = managed.LogFilePaths IsNot Nothing AndAlso managed.LogFilePaths.Count > 0
+            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture) AndAlso Not adoptHasFileLogs
+
+            Dim parseRules As IList(Of LogParseRule) = Nothing
+            If Not String.IsNullOrEmpty(snapshot.ParseRulesJson) Then
+                Try
+                    parseRules = JsonSerializer.Deserialize(Of List(Of LogParseRule))(snapshot.ParseRulesJson)
+                Catch ex As Exception
+                    _logger.LogWarning(ex, "Snapshot {Id}: ParseRulesJson parse failed, no event tracking until manager re-pushes", id)
+                End Try
+            End If
+            managed.ParseRules = parseRules
+
+            ' Register EventStore + publish into _instances BEFORE reconnecting:
+            ' AdoptViaShimAsync starts the read loop immediately, and the shim
+            ' replays its buffered output the instant we connect — those lines
+            ' must find registered rules (and the instance) already in place or
+            ' they'd be dropped. hydrateState:=True inherits the prior session's
+            ' persisted instance_state (tile / match-state) like the Direct path.
+            If parseRules IsNot Nothing AndAlso parseRules.Count > 0 Then
+                _eventStore.RegisterInstance(id, parseRules, hydrateState:=True)
+            End If
+            _instances(id) = managed
+
+            ' Reconnect to the live shim. Block on the async adopt: AdoptSnapshots
+            ' runs synchronously at startup with no sync context, and AdoptAsync
+            ' is fully ConfigureAwait(False), so GetResult() can't deadlock. The
+            ' 8s connect timeout bounds a dead-endpoint reconnect.
+            Dim adopted As Boolean
+            Try
+                adopted = AdoptViaShimAsync(managed, snapshot.ShimEndpoint).GetAwaiter().GetResult()
+            Catch ex As Exception
+                _logger.LogWarning(ex, "Snapshot {Id}: shim adopt threw — discarding", id)
+                adopted = False
+            End Try
+
+            If Not adopted Then
+                _logger.LogInformation(
+                    "Snapshot {Id}: shim at {Endpoint} did not answer (game/shim gone) — discarding",
+                    id, snapshot.ShimEndpoint)
+                Dim removed As ManagedInstance = Nothing
+                _instances.TryRemove(id, removed)
+                _eventStore.UnregisterInstance(id)
+                _database.RemoveInstanceSnapshot(id)
+                Return False
+            End If
+
+            ' Shim Strategy A streams stdout (no file tailers). Resume tailers
+            ' only if a snapshot somehow carried file logs, mirroring Direct.
+            If logFilePaths IsNot Nothing AndAlso logFilePaths.Count > 0 Then
+                StartFileTailers(managed, logFilePaths, skipResume:=True)
+            End If
+
+            ScheduleCrashCountReset(managed, Nothing)
+
+            _logger.LogInformation(
+                "Adopted shim instance {Id} (game PID {Pid}, shim PID {ShimPid}, endpoint {Endpoint}, {RuleCount} rule(s))",
+                id, managed.Pid, managed.ShimPid, snapshot.ShimEndpoint, If(parseRules?.Count, 0))
+            Return True
+        End Function
+
+        ''' <summary>
+        ''' Phase 8-3 shim rediscovery. After the snapshot-driven adoption pass,
+        ''' enumerate the OS shim namespace (named pipes on Windows, the socket
+        ''' dir on Linux) and lean-adopt any LIVE shim whose instance id wasn't
+        ''' already adopted from a snapshot. This is what stops a lost or corrupt
+        ''' node.db from orphaning running games: the node rediscovers its live
+        ''' shims straight from the OS, independent of the snapshot store. Each
+        ''' endpoint is a deterministic function of the instance id, and the shim
+        ''' reports its own id in the handshake (HelloAck.InstanceId), so a swept
+        ''' shim fully identifies itself. Best-effort and synchronous (same
+        ''' startup context as AdoptSnapshots); call it right after.
+        ''' </summary>
+        Public Sub SweepAdoptLiveShims()
+            Dim endpoints As List(Of String) = EnumerateShimEndpoints()
+            If endpoints Is Nothing OrElse endpoints.Count = 0 Then
+                _logger.LogDebug("Shim sweep: no shim endpoints present in the namespace.")
+                Return
+            End If
+
+            _logger.LogInformation(
+                "Shim sweep: probing {Count} endpoint(s) for live shims not covered by snapshots...",
+                endpoints.Count)
+
+            Dim adopted As Integer = 0
+            Dim skipped As Integer = 0
+            For Each endpoint In endpoints
+                Try
+                    Dim probe As ShimProbeResult =
+                        ShimSession.ProbeEndpointAsync(endpoint, 3000, _logger).GetAwaiter().GetResult()
+
+                    If probe Is Nothing Then
+                        ' No/stale/unresponsive listener. Conservatively leave any
+                        ' Linux .sock in place — the listener clears stale files at
+                        ' bind time, and we can't tell a dead socket from a slow-
+                        ' but-live shim without risking orphaning the latter.
+                        skipped += 1
+                        Continue For
+                    End If
+
+                    If String.IsNullOrEmpty(probe.InstanceId) Then
+                        _logger.LogDebug(
+                            "Shim sweep: {Endpoint} answered without an instance id (older shim) — skipping",
+                            endpoint)
+                        skipped += 1
+                        Continue For
+                    End If
+
+                    ' Already live in this node (snapshot pass adopted it, or a
+                    ' duplicate endpoint). The snapshot path keeps the full
+                    ' recovery payload, so never displace it.
+                    If _instances.ContainsKey(probe.InstanceId) Then
+                        skipped += 1
+                        Continue For
+                    End If
+
+                    If Not String.Equals(probe.GameState, "running", StringComparison.Ordinal) Then
+                        _logger.LogDebug(
+                            "Shim sweep: {Endpoint} (instance {Id}) reports game state '{State}' — not adopting",
+                            endpoint, probe.InstanceId, probe.GameState)
+                        skipped += 1
+                        Continue For
+                    End If
+
+                    If TryLeanAdoptShim(probe.InstanceId, endpoint) Then
+                        adopted += 1
+                    Else
+                        skipped += 1
+                    End If
+
+                Catch ex As Exception
+                    _logger.LogWarning(ex, "Shim sweep: probe/adopt threw for {Endpoint}", endpoint)
+                    skipped += 1
+                End Try
+            Next
+
+            _logger.LogInformation(
+                "Shim sweep complete: {Adopted} rediscovered + lean-adopted, {Skipped} skipped.",
+                adopted, skipped)
+        End Sub
+
+        ''' <summary>
+        ''' Enumerate candidate shim endpoints in the OS namespace:
+        '''   Windows — named pipes "\\.\pipe\powergsm-shim-*"
+        '''   Linux   — "*.sock" files in the node's shim socket dir.
+        ''' Returns endpoint strings ("pipe:..." / "unix:...") ready for
+        ''' ShimSession.ProbeEndpointAsync. Best-effort: any enumeration error
+        ''' yields an empty list (the sweep then does nothing — the snapshot pass
+        ''' already ran).
+        ''' </summary>
+        Private Function EnumerateShimEndpoints() As List(Of String)
+            Dim result As New List(Of String)()
+            Const prefix As String = "powergsm-shim-"
+            Const selfTestPrefix As String = "powergsm-shim-selftest-"
+            Try
+                If OperatingSystem.IsWindows() Then
+                    ' The pipe namespace is a listable directory. GetFiles can
+                    ' throw on odd pipe names, so guard the whole call.
+                    Dim names As String() = Nothing
+                    Try
+                        names = Directory.GetFiles("\\.\pipe\")
+                    Catch ex As Exception
+                        _logger.LogDebug(ex, "Shim sweep: could not enumerate the pipe namespace")
+                        Return result
+                    End Try
+                    For Each p In names
+                        Dim name As String = p
+                        Dim idx As Integer = name.LastIndexOf("\"c)
+                        If idx >= 0 Then name = name.Substring(idx + 1)
+                        If name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) AndAlso
+                           Not name.StartsWith(selfTestPrefix, StringComparison.OrdinalIgnoreCase) Then
+                            result.Add("pipe:" & name)
+                        End If
+                    Next
+                Else
+                    ' Linux: the shim socket dir is dedicated, and each file is
+                    ' "<sanitizedInstanceId>.sock" (the shim reports its true id
+                    ' on the probe handshake, so the lossy filename isn't relied
+                    ' on). Self-test sockets live in a different dir.
+                    If Directory.Exists(_shimSocketDir) Then
+                        For Each f In Directory.GetFiles(_shimSocketDir, "*.sock")
+                            result.Add("unix:" & f)
+                        Next
+                    End If
+                End If
+            Catch ex As Exception
+                _logger.LogDebug(ex, "Shim sweep: endpoint enumeration failed")
+            End Try
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Phase 8-3 lean adopt: reconnect to a rediscovered live shim with no
+        ''' snapshot payload. Registers the instance with an EMPTY rule set (so
+        ''' the Manager's reconnect re-push has a valid target — EventStore's
+        ''' UpdateParseRules ignores unregistered instances) and hydrates the
+        ''' persisted instance_state, then reconnects via the shim. The game is
+        ''' tracked (status / stop / stdout relay / exit) but, lacking StartInfo,
+        ''' is set NeverRestart — a crash can't rebuild a SpawnSpec until the
+        ''' instance is fully restarted (documented Phase 8-3 gap). For hidden-
+        ''' console (file-tailed) games, event tracking also stays dark until a
+        ''' full restart re-establishes the log paths. Returns True on a
+        ''' successful reconnect.
+        ''' </summary>
+        Private Function TryLeanAdoptShim(instanceId As String, endpoint As String) As Boolean
+            Dim managed As New ManagedInstance()
+            managed.InstanceId = instanceId
+            managed.State = InstanceState.Running
+            managed.StateChangedAt = DateTime.UtcNow
+            managed.StopIntentPending = False
+            managed.CrashCount = 0
+
+            ' No StartInfo / parse rules / log paths recovered from node.db, so we
+            ' cannot rebuild a SpawnSpec. NeverRestart keeps a later exit from
+            ' attempting (and failing) a crash-restart; RestartInstanceAsync also
+            ' guards StartInfo Is Nothing, so this is belt-and-suspenders.
+            managed.CrashPolicy = CrashRestartPolicy.NeverRestart
+            managed.StartInfo = Nothing
+            managed.ParseRules = Nothing
+            managed.LogFilePaths = Nothing
+
+            ' Capture stdout if the shim streams it (Strategy A). For hidden-
+            ' console games (B/C) the shim streams nothing, so this is harmless;
+            ' those games are file-tailed and stay dark until a full restart
+            ' restores their log paths.
+            managed.Strategy = SpawnStrategy.StdoutCapture
+            managed.CaptureStdout = True
+
+            ' Register EventStore with an EMPTY rule set so the instance EXISTS as
+            ' a push target: EventStore.UpdateParseRules ignores unregistered
+            ' instances, so without this the Manager's reconnect rule re-push
+            ' would be silently dropped. hydrateState restores the persisted
+            ' match/tile state. The Manager re-pushes the real rules within a few
+            ' seconds via its stream-health reconnect.
+            _eventStore.RegisterInstance(instanceId, New List(Of LogParseRule)(), hydrateState:=True)
+            _instances(instanceId) = managed
+
+            Dim adopted As Boolean
+            Try
+                adopted = AdoptViaShimAsync(managed, endpoint).GetAwaiter().GetResult()
+            Catch ex As Exception
+                _logger.LogWarning(ex, "Shim sweep: lean adopt threw for {Id} at {Endpoint}", instanceId, endpoint)
+                adopted = False
+            End Try
+
+            If Not adopted Then
+                Dim removed As ManagedInstance = Nothing
+                _instances.TryRemove(instanceId, removed)
+                _eventStore.UnregisterInstance(instanceId)
+                _logger.LogInformation(
+                    "Shim sweep: {Endpoint} (instance {Id}) didn't answer the adopt — discarded",
+                    endpoint, instanceId)
+                Return False
+            End If
+
+            ' Phase 8-3 — the shim echoes back the log-file paths it was handed
+            ' at spawn (SpawnSpec.LogFilePaths -> HelloAck.LogFilePaths). For a
+            ' file-tailed (hidden-console) game that's how this node.db-less path
+            ' recovers WHERE to tail without the Manager or the install path.
+            ' Start the tailers from end (skipResume) like the snapshot adopt and
+            ' switch off stdout capture, since the file is now the source.
+            Dim recoveredLogs As IReadOnlyList(Of String) = Nothing
+            If managed.Shim IsNot Nothing Then recoveredLogs = managed.Shim.AdoptedLogFilePaths
+            If recoveredLogs IsNot Nothing AndAlso recoveredLogs.Count > 0 Then
+                Dim paths As New List(Of String)(recoveredLogs)
+                managed.LogFilePaths = paths
+                managed.CaptureStdout = False
+                StartFileTailers(managed, paths, skipResume:=True)
+                _logger.LogInformation(
+                    "Shim sweep: recovered {Count} log path(s) from the shim for {Id}; file tailing resumed",
+                    paths.Count, instanceId)
+            End If
+
+            _logger.LogInformation(
+                "Shim sweep: lean-adopted instance {Id} (game PID {Pid}, shim PID {ShimPid}, endpoint {Endpoint}); " &
+                "awaiting Manager rule re-push for event tracking",
+                instanceId, managed.Pid, managed.ShimPid, endpoint)
+            Return True
+        End Function
+
         ' ============================================================
         '  Spawn dispatch
         '
@@ -849,6 +1316,150 @@ Namespace GSM.Node
             ''' <summary>Strategy C: same as B but spawning cmd.exe /S /c "&lt;exe&gt; &lt;args&gt;" so the game inherits cmd's hidden console.</summary>
             HiddenConsoleWrapped = 2
         End Enum
+
+        ''' <summary>
+        ''' How the Node runs an instance's game process. Direct = the Node
+        ''' spawns and holds the Process handle (today's path). Shim = the
+        ''' game runs under a per-instance GSM.Shim supervisor and the Node
+        ''' holds a ShimSession instead (Phase 8-1). Persisted per instance.
+        ''' </summary>
+        Public Enum ExecutionMode
+            Direct = 0
+            Shim = 1
+        End Enum
+
+        ''' <summary>
+        ''' Phase 8-1 shim spawn (any strategy): launch the game under a
+        ''' per-instance GSM.Shim supervisor and wire its exit frames — plus,
+        ''' for Strategy A, its stdout/stderr frames — into the same ring
+        ''' buffer / EventStore / restart machinery the direct path uses. (B/C
+        ''' are hidden-console: no stdout is streamed; the Node tails the log
+        ''' file as in direct mode.) Sets the managed instance's shim fields,
+        ''' Pid (= game pid),
+        ''' MetricsProcess (by-pid handle for WorkingSet64), and
+        ''' ExecutionMode = Shim. Returns False on any launch/handshake/spawn
+        ''' failure (the session is torn down). The caller runs
+        ''' FinalizeStart(managed, Nothing) after a True return.
+        ''' </summary>
+        Private Async Function StartViaShimAsync(managed As ManagedInstance) As Task(Of Boolean)
+            Dim psi = managed.StartInfo
+
+            ' Environment carries the FULL resolved env (node env + request
+            ' overrides — exactly what psi would have handed the child). The
+            ' shim REPLACES the game's environment block with whatever we pass,
+            ' so an empty/Nothing dict would mean "inherit" and silently drop
+            ' the request's overrides.
+            Dim env As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+            Try
+                For Each kvp In psi.Environment
+                    env(kvp.Key) = kvp.Value
+                Next
+            Catch
+            End Try
+
+            Dim spec As New SpawnSpec With {
+                .ExePath = psi.FileName,
+                .Arguments = psi.Arguments,
+                .WorkingDirectory = If(String.IsNullOrEmpty(psi.WorkingDirectory), Nothing, psi.WorkingDirectory),
+                .Environment = env,
+                .Strategy = managed.Strategy.ToString(),
+                .LogFilePaths = If(managed.LogFilePaths Is Nothing, Nothing, New List(Of String)(managed.LogFilePaths))
+            }
+
+            Dim session As ShimSession = CreateShimSession(managed)
+            Dim ok As Boolean = Await session.StartAsync(spec, 15000, CancellationToken.None).ConfigureAwait(False)
+            If Not ok Then
+                session.Dispose()
+                Return False
+            End If
+
+            ApplyShimSession(managed, session)
+            Return True
+        End Function
+
+        ''' <summary>
+        ''' Phase 8-1 (slice 3) adopt path: reconnect to an ALREADY-RUNNING shim
+        ''' at <paramref name="endpoint"/> (its game survived a Node restart) and
+        ''' wire it up exactly like a fresh shim start — same stdout/exit
+        ''' callbacks, same managed-instance shim fields. No game is spawned; the
+        ''' shim reports the live game pid and replays its buffered output.
+        ''' Returns False if the shim/endpoint is gone (caller discards the row).
+        ''' </summary>
+        Private Async Function AdoptViaShimAsync(managed As ManagedInstance, endpoint As String) As Task(Of Boolean)
+            Dim session As ShimSession = CreateShimSession(managed)
+            Dim ok As Boolean = Await session.AdoptAsync(endpoint, 8000, CancellationToken.None).ConfigureAwait(False)
+            If Not ok Then
+                session.Dispose()
+                Return False
+            End If
+
+            ApplyShimSession(managed, session)
+            Return True
+        End Function
+
+        ''' <summary>
+        ''' Builds a ShimSession wired with the stdout/stderr line callback
+        ''' (forward to buffer + EventStore when CaptureStdout) and the exit
+        ''' callback (stash code, route through HandleProcessExited). Shared by
+        ''' the fresh-start and adopt paths so both behave identically. The
+        ''' session is created but not yet started/adopted.
+        ''' </summary>
+        Private Function CreateShimSession(managed As ManagedInstance) As ShimSession
+            ' onLine mirrors AttachProcessHandlers.OutputDataReceived: forward
+            ' stdout lines to the buffer + EventStore only when CaptureStdout is
+            ' set; stderr is drain-only (parity with the direct path).
+            Dim onLine As Action(Of DateTime, String, Boolean) =
+                Sub(ts, text, isError)
+                    If isError Then Return
+                    If Not managed.CaptureStdout Then Return
+                    _logStore.Append(managed.InstanceId,
+                        New BufferedLogLine With {
+                            .Timestamp = ts,
+                            .Text = text,
+                            .IsError = False
+                        })
+                    _eventStore.ProcessLine(managed.InstanceId, ts, text)
+                End Sub
+
+            ' onExited mirrors the Process.Exited handler: record the code and
+            ' route through HandleProcessExited, wrapped so a throw can't poison
+            ' the shim read loop's continuation.
+            Dim onExited As Action(Of Integer) =
+                Sub(code)
+                    managed.LastShimExitCode = code
+                    _logger.LogInformation("Shim-mode exit for {Id} (code {Code})",
+                                           managed.InstanceId, code)
+                    Try
+                        HandleProcessExited(managed)
+                    Catch ex As Exception
+                        _logger.LogError(ex, "HandleProcessExited threw for {Id}", managed.InstanceId)
+                    End Try
+                End Sub
+
+            Return New ShimSession(managed.InstanceId, _shimSocketDir, onLine, onExited, _logger)
+        End Function
+
+        ''' <summary>
+        ''' Stamps a connected ShimSession's results onto the managed instance:
+        ''' ExecutionMode = Shim, the session, the game pid (= reported Pid),
+        ''' shim pid/endpoint/protocol, and a by-PID metrics handle on the game.
+        ''' </summary>
+        Private Sub ApplyShimSession(managed As ManagedInstance, session As ShimSession)
+            managed.ExecutionMode = ExecutionMode.Shim
+            managed.Shim = session
+            managed.Pid = session.GamePid
+            managed.ShimPid = session.ShimPid
+            managed.ShimEndpoint = session.Endpoint
+            managed.ShimProtocolVersion = session.ProtocolVersion
+
+            ' By-PID handle on the GAME, used only for WorkingSet64 metrics
+            ' (managed.Process stays Nothing in shim mode). Best-effort.
+            Try
+                managed.MetricsProcess = Process.GetProcessById(session.GamePid)
+            Catch
+                managed.MetricsProcess = Nothing
+            End Try
+        End Sub
 
         Private Function SpawnGameProcess(managed As ManagedInstance,
                                           psi As ProcessStartInfo) As Process
@@ -1313,9 +1924,9 @@ Namespace GSM.Node
         ''' True if either succeeded; the caller still has to wait
         ''' for the process to actually exit.
         ''' </summary>
-        Private Function SendCtrlCToProcess(proc As Process) As Boolean
-            If TrySendConsoleCtrlC(proc) Then Return True
-            Return TrySendTaskkill(proc)
+        Private Function SendCtrlCToProcess(pid As Integer) As Boolean
+            If TrySendConsoleCtrlC(pid) Then Return True
+            Return TrySendTaskkill(pid)
         End Function
 
         ''' <summary>
@@ -1323,47 +1934,61 @@ Namespace GSM.Node
         ''' the target's hidden console and fire CTRL_C_EVENT.
         ''' Returns True only if the helper exits with code 0.
         ''' </summary>
-        Private Function TrySendConsoleCtrlC(proc As Process) As Boolean
+        Private Function TrySendConsoleCtrlC(pid As Integer) As Boolean
             Try
                 Dim helperPath = Path.Combine(AppContext.BaseDirectory, "GSM.CtrlCSender.exe")
                 If Not File.Exists(helperPath) Then
                     _logger.LogWarning(
-                        "GSM.CtrlCSender.exe not found at {Path} — falling back to taskkill",
+                        "GSM.CtrlCSender.exe not found at {Path} - falling back to taskkill",
                         helperPath)
                     Return False
                 End If
 
-                Dim psi As New ProcessStartInfo(helperPath, proc.Id.ToString())
+                Dim psi As New ProcessStartInfo(helperPath, pid.ToString())
                 psi.UseShellExecute = False
                 psi.CreateNoWindow = True
                 psi.RedirectStandardOutput = True
                 psi.RedirectStandardError = True
 
-                Using p = Process.Start(psi)
-                    If Not p.WaitForExit(5000) Then
-                        Try : p.Kill() : Catch : End Try
-                        _logger.LogWarning("GSM.CtrlCSender timed out for PID {Pid}", proc.Id)
-                        Return False
-                    End If
+                ' GSM.CtrlCSender fires GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)
+                ' at the target's console; on some Windows configs that bounces
+                ' back to this node's console. Suppress our own console-ctrl
+                ' handler's terminate path for the duration (plus a short grace
+                ' for a late-delivered bounce) so stopping a game never takes the
+                ' node down. A user Ctrl+C outside this window still closes it.
+                ConsoleCtrlSuppression.Push()
+                Try
+                    Using p = Process.Start(psi)
+                        If Not p.WaitForExit(5000) Then
+                            Try : p.Kill() : Catch : End Try
+                            _logger.LogWarning("GSM.CtrlCSender timed out for PID {Pid}", pid)
+                            Return False
+                        End If
 
-                    If p.ExitCode <> 0 Then
-                        Dim stderr As String = ""
-                        Try
-                            stderr = p.StandardError.ReadToEnd().Trim()
-                        Catch
-                        End Try
-                        _logger.LogWarning(
-                            "GSM.CtrlCSender exit {Code} for PID {Pid}: {Err}",
-                            p.ExitCode, proc.Id, stderr)
-                        Return False
-                    End If
+                        If p.ExitCode <> 0 Then
+                            Dim stderr As String = ""
+                            Try
+                                stderr = p.StandardError.ReadToEnd().Trim()
+                            Catch
+                            End Try
+                            _logger.LogWarning(
+                                "GSM.CtrlCSender exit {Code} for PID {Pid}: {Err}",
+                                p.ExitCode, pid, stderr)
+                            Return False
+                        End If
 
-                    _logger.LogInformation(
-                        "Sent CTRL_C_EVENT to PID {Pid} via GSM.CtrlCSender", proc.Id)
-                    Return True
-                End Using
+                        _logger.LogInformation(
+                            "Sent CTRL_C_EVENT to PID {Pid} via GSM.CtrlCSender", pid)
+                        Return True
+                    End Using
+                Finally
+                    ' The bounced CTRL_C can land a beat after the helper exits;
+                    ' hold suppression a touch longer, then release.
+                    Threading.Thread.Sleep(150)
+                    ConsoleCtrlSuppression.Pop()
+                End Try
             Catch ex As Exception
-                _logger.LogWarning(ex, "GSM.CtrlCSender invocation failed for PID {Pid}", proc.Id)
+                _logger.LogWarning(ex, "GSM.CtrlCSender invocation failed for PID {Pid}", pid)
                 Return False
             End Try
         End Function
@@ -1374,9 +1999,9 @@ Namespace GSM.Node
         ''' servers ignore it. Kept as a fallback for processes
         ''' that don't have a console for AttachConsole to attach to.
         ''' </summary>
-        Private Function TrySendTaskkill(proc As Process) As Boolean
+        Private Function TrySendTaskkill(pid As Integer) As Boolean
             Try
-                Dim psi As New ProcessStartInfo("taskkill", $"/PID {proc.Id}")
+                Dim psi As New ProcessStartInfo("taskkill", $"/PID {pid}")
                 psi.UseShellExecute = False
                 psi.CreateNoWindow = True
                 psi.RedirectStandardOutput = True
@@ -1391,31 +2016,35 @@ Namespace GSM.Node
         End Function
 
         ''' <summary>
-        ''' Linux graceful-shutdown signal: SIGTERM via /bin/kill.
-        ''' Returns True iff the kill command itself succeeded — the
-        ''' caller still has to wait for the process to actually
-        ''' react and exit.
+        ''' Linux graceful-shutdown signal: SIGINT via /bin/kill — the
+        ''' POSIX analog of the Windows console Ctrl+C. Returns True iff
+        ''' the kill command itself succeeded; the caller still has to
+        ''' wait for the process to actually react and exit.
         '''
-        ''' Why /bin/kill instead of Process.Kill: .NET 8's
-        ''' Process.Kill on Linux sends SIGKILL, which is the
-        ''' nuclear option, not the polite one. There's no
-        ''' Process.Signal API to send SIGTERM specifically. P/Invoke
-        ''' to libc.kill works but pulls in platform-specific
-        ''' marshalling for one signal we'd ever send. The /bin/kill
-        ''' command exists on every Linux system back to the dawn of
-        ''' time and ProcessStartInfo can drive it cleanly.
+        ''' SIGINT, not SIGTERM: MistServer (Last Oasis) exits silently
+        ''' on SIGTERM but shuts down cleanly on SIGINT, matching how its
+        ''' Windows graceful path is the console-ctrl handler. SIGINT is
+        ''' also save-and-quit for Factorio. Note UE4 only acts on the
+        ''' request on its next main-loop tick, so a server still in
+        ''' startup (pak mount / mod scan) defers the quit until that
+        ''' work finishes — the caller's timeout-then-SIGKILL ladder
+        ''' covers the case where it never gets there.
         '''
-        ''' Targets the process directly, not the process group.
-        ''' UE4 dedicated servers run as a single process — internal
-        ''' threading, no forked children we'd need to reach by group
-        ''' signal. If a future Linux-only plugin spawns a wrapper
-        ''' shell that forks the actual binary, we may need to switch
-        ''' to `kill -- -&lt;pgid&gt;` (negative target = process group),
-        ''' but for current games SIGTERM-the-pid is the correct dose.
+        ''' Why /bin/kill instead of Process.Kill: .NET 8's Process.Kill
+        ''' on Linux sends SIGKILL, the nuclear option, and there's no
+        ''' managed API to send a specific signal. P/Invoke to libc.kill
+        ''' works but pulls in marshalling for one signal; /bin/kill is
+        ''' on every Linux system and ProcessStartInfo drives it cleanly.
+        '''
+        ''' Targets the process directly, not the process group. UE4
+        ''' dedicated servers run as a single process. If a future
+        ''' Linux-only plugin forks a wrapper, we may need
+        ''' `kill -- -&lt;pgid&gt;` (negative target = process group), but
+        ''' for current games SIGINT-the-pid is the correct dose.
         ''' </summary>
-        Private Function SendSigTermToProcess(proc As Process) As Boolean
+        Private Function SendSigIntToProcess(pid As Integer) As Boolean
             Try
-                Dim psi As New ProcessStartInfo("kill", proc.Id.ToString())
+                Dim psi As New ProcessStartInfo("kill", "-INT " & pid.ToString())
                 psi.UseShellExecute = False
                 psi.CreateNoWindow = True
                 psi.RedirectStandardOutput = True
@@ -1423,7 +2052,7 @@ Namespace GSM.Node
                 Using p = Process.Start(psi)
                     If Not p.WaitForExit(5000) Then
                         Try : p.Kill() : Catch : End Try
-                        _logger.LogWarning("kill command timed out for PID {Pid}", proc.Id)
+                        _logger.LogWarning("kill command timed out for PID {Pid}", pid)
                         Return False
                     End If
                     If p.ExitCode <> 0 Then
@@ -1434,14 +2063,14 @@ Namespace GSM.Node
                         End Try
                         _logger.LogWarning(
                             "kill exited {Code} for PID {Pid}: {Err}",
-                            p.ExitCode, proc.Id, stderr)
+                            p.ExitCode, pid, stderr)
                         Return False
                     End If
-                    _logger.LogInformation("Sent SIGTERM to PID {Pid}", proc.Id)
+                    _logger.LogInformation("Sent SIGINT to PID {Pid}", pid)
                     Return True
                 End Using
             Catch ex As Exception
-                _logger.LogWarning(ex, "SIGTERM via /bin/kill failed for PID {Pid}", proc.Id)
+                _logger.LogWarning(ex, "SIGINT via /bin/kill failed for PID {Pid}", pid)
                 Return False
             End Try
         End Function
@@ -1496,7 +2125,7 @@ Namespace GSM.Node
         '  has nothing to deliver the SIGINT through.
         '
         '  Manager-initiated graceful stop continues to work
-        '  unchanged: SendSigTermToProcess shoots /bin/kill at
+        '  unchanged: SendSigIntToProcess shoots /bin/kill at
         '  the PID directly, which doesn't care about controlling
         '  ttys or process groups. Crash detection works the same
         '  way (Exited event on the same PID).
@@ -1862,7 +2491,7 @@ Namespace GSM.Node
                                 ' first-iteration read (potentially MB of backfill)
                                 ' is what we most want visibility on.
                                 _logger.LogInformation(
-                                    "Tailer iter {Iter} reading {Id}: {Start}→{End} ({Bytes} bytes)",
+                                    "Tailer iter {Iter} reading {Id}: {Start}->{End} ({Bytes} bytes)",
                                     iterationCount, instanceId, startPos, endLength, endLength - startPos)
 
                                 Dim linesEmitted As Long = 0
@@ -2054,10 +2683,38 @@ Namespace GSM.Node
             ' {ExitCode} token stayed literal because the emitter
             ' only adds it when the value is non-null.
             Dim exitCode = 0
-            Try
-                exitCode = managed.Process.ExitCode
-            Catch
-            End Try
+            If managed.ExecutionMode = ExecutionMode.Shim Then
+                ' No game Process in shim mode — the code arrived over the wire
+                ' on the Exited frame (stashed by StartViaShimAsync's onExited).
+                exitCode = If(managed.LastShimExitCode, 0)
+
+                ' The game is gone but the shim process is still alive and idle.
+                ' Detach + async-dispose it (kills the orphaned shim, frees the
+                ' pipe, releases the metrics handle); a restart launches a fresh
+                ' shim. Done off-thread because we're running inside the shim
+                ' read loop's own exit continuation.
+                Dim oldShim = managed.Shim
+                Dim oldMetrics = managed.MetricsProcess
+                managed.Shim = Nothing
+                managed.MetricsProcess = Nothing
+                If oldShim IsNot Nothing OrElse oldMetrics IsNot Nothing Then
+                    Task.Run(Sub()
+                                 Try
+                                     If oldShim IsNot Nothing Then oldShim.Dispose()
+                                 Catch
+                                 End Try
+                                 Try
+                                     If oldMetrics IsNot Nothing Then oldMetrics.Dispose()
+                                 Catch
+                                 End Try
+                             End Sub)
+                End If
+            Else
+                Try
+                    exitCode = managed.Process.ExitCode
+                Catch
+                End Try
+            End If
             managed.LastExitCode = exitCode
 
             If managed.StopIntentPending Then
@@ -2178,22 +2835,35 @@ Namespace GSM.Node
             End If
 
             Try
-                ' Re-spawn through the same dispatch as the initial
-                ' start so the file-logged hidden-console path is
-                ' preserved across crash-restart cycles. (Pre-refactor,
-                ' restart did its own bare Process.Start which would
-                ' have put a UE4 server back on the no-console path
-                ' and broken graceful shutdown after any crash.)
-                Dim proc As Process = SpawnGameProcess(managed, managed.StartInfo)
+                If managed.ExecutionMode = ExecutionMode.Shim Then
+                    ' Shim mode: the old shim was torn down on exit
+                    ' (HandleProcessExited). Launch a fresh supervisor.
+                    Dim shimOk As Boolean = Await StartViaShimAsync(managed).ConfigureAwait(False)
+                    If Not shimOk Then
+                        managed.State = InstanceState.CrashLoopHalted
+                        managed.StateChangedAt = DateTime.UtcNow
+                        _logger.LogError("Failed to restart shim instance {InstanceId}", managed.InstanceId)
+                        Return
+                    End If
+                    FinalizeStart(managed, Nothing)
+                Else
+                    ' Re-spawn through the same dispatch as the initial
+                    ' start so the file-logged hidden-console path is
+                    ' preserved across crash-restart cycles. (Pre-refactor,
+                    ' restart did its own bare Process.Start which would
+                    ' have put a UE4 server back on the no-console path
+                    ' and broken graceful shutdown after any crash.)
+                    Dim proc As Process = SpawnGameProcess(managed, managed.StartInfo)
 
-                If proc Is Nothing Then
-                    managed.State = InstanceState.CrashLoopHalted
-                    managed.StateChangedAt = DateTime.UtcNow
-                    _logger.LogError("Failed to restart instance {InstanceId}", managed.InstanceId)
-                    Return
+                    If proc Is Nothing Then
+                        managed.State = InstanceState.CrashLoopHalted
+                        managed.StateChangedAt = DateTime.UtcNow
+                        _logger.LogError("Failed to restart instance {InstanceId}", managed.InstanceId)
+                        Return
+                    End If
+
+                    FinalizeStart(managed, proc)
                 End If
-
-                FinalizeStart(managed, proc)
             Catch ex As Exception
                 managed.State = InstanceState.CrashLoopHalted
                 managed.StateChangedAt = DateTime.UtcNow
@@ -2298,24 +2968,31 @@ Namespace GSM.Node
         ''' both StartInstanceAsync and RestartInstanceAsync.
         ''' </summary>
         Private Sub FinalizeStart(managed As ManagedInstance, proc As Process)
-            managed.Process = proc
-            managed.Pid = proc.Id
+            If proc IsNot Nothing Then
+                managed.Process = proc
+                managed.Pid = proc.Id
 
-            ' Prefer proc.StartTime (the kernel-recorded process
-            ' start time) over DateTime.UtcNow so the snapshot we
-            ' write carries the same value that re-adoption reads
-            ' back via Process.GetProcessById(...).StartTime on the
-            ' next node startup. That makes PID-reuse detection an
-            ' effectively-exact equality check rather than a
-            ' best-effort tolerance window. Falls back to UtcNow if
-            ' StartTime throws — some access-restricted processes
-            ' refuse to disclose it; none of our game-server
-            ' children would, but defensive coverage is cheap.
-            Try
-                managed.StartedAt = proc.StartTime.ToUniversalTime()
-            Catch
+                ' Prefer proc.StartTime (the kernel-recorded process
+                ' start time) over DateTime.UtcNow so the snapshot we
+                ' write carries the same value that re-adoption reads
+                ' back via Process.GetProcessById(...).StartTime on the
+                ' next node startup. That makes PID-reuse detection an
+                ' effectively-exact equality check rather than a
+                ' best-effort tolerance window. Falls back to UtcNow if
+                ' StartTime throws — some access-restricted processes
+                ' refuse to disclose it; none of our game-server
+                ' children would, but defensive coverage is cheap.
+                Try
+                    managed.StartedAt = proc.StartTime.ToUniversalTime()
+                Catch
+                    managed.StartedAt = DateTime.UtcNow
+                End Try
+            Else
+                ' Shim mode: no game Process handle here. Pid was already set
+                ' to the game pid by StartViaShimAsync, and the shim doesn't
+                ' surface a kernel start time over the wire, so stamp now.
                 managed.StartedAt = DateTime.UtcNow
-            End Try
+            End If
 
             managed.State = InstanceState.Running
             managed.StateChangedAt = DateTime.UtcNow
@@ -2397,6 +3074,11 @@ Namespace GSM.Node
                 workingDir = managed.StartInfo.WorkingDirectory
             End If
 
+            ' Persist the snapshot for re-adoption. Direct mode stores the game
+            ' pid + start time (adoption re-derives a Process handle and verifies
+            ' by start-time). Shim mode stores the shim endpoint + ExecutionMode
+            ' so adoption reconnects to the live shim instead — the pid/start
+            ' time are recorded but not used for shim identity.
             _database.SaveInstanceSnapshot(
                 managed.InstanceId, managed.State.ToString(),
                 managed.Pid, managed.StartedAt,
@@ -2414,7 +3096,11 @@ Namespace GSM.Node
                 CInt(managed.Strategy),
                 managed.StdoutIsLog,
                 managed.RequiresConsoleIsolation,
-                managed.LogTailerStartDelayMs)
+                managed.LogTailerStartDelayMs,
+                managed.ShimEndpoint,
+                managed.ShimPid,
+                managed.ShimProtocolVersion,
+                CInt(managed.ExecutionMode))
 
             ' If the instance stays up long enough, clear CrashCount
             ' so the next crash starts from a clean backoff baseline.
@@ -2435,7 +3121,7 @@ Namespace GSM.Node
             If seconds <= 0 Then Return
 
             Dim instanceId = managed.InstanceId
-            Dim targetPid = proc.Id
+            Dim targetPid = If(proc IsNot Nothing, proc.Id, managed.Pid)
 
             Task.Run(Async Function()
                          Try
@@ -2444,21 +3130,25 @@ Namespace GSM.Node
                              Dim cur As ManagedInstance = Nothing
                              If Not _instances.TryGetValue(instanceId, cur) Then Return
 
-                             ' Bail if the tracked process isn't the
-                             ' one we started watching: a crash-restart
-                             ' swapped it out, and that new run's
-                             ' counter should be judged on its own
-                             ' uptime, not this timer.
-                             If cur.Process Is Nothing Then Return
-                             If cur.Process.Id <> targetPid Then Return
-                             If cur.Process.HasExited Then Return
+                             ' Bail if the tracked run isn't the one we
+                             ' started watching: a crash-restart swapped
+                             ' it out, and that new run's counter should
+                             ' be judged on its own uptime, not this timer.
                              If cur.State <> InstanceState.Running Then Return
+                             If cur.ExecutionMode = ExecutionMode.Shim Then
+                                 If cur.Pid <> targetPid Then Return
+                                 If cur.Shim Is Nothing Then Return
+                             Else
+                                 If cur.Process Is Nothing Then Return
+                                 If cur.Process.Id <> targetPid Then Return
+                                 If cur.Process.HasExited Then Return
+                             End If
 
                              Dim prior = cur.CrashCount
                              If prior > 0 Then
                                  cur.CrashCount = 0
                                  _logger.LogInformation(
-                                     "Instance {Id} stable for {Sec}s — resetting crash count (was {Prior})",
+                                     "Instance {Id} stable for {Sec}s - resetting crash count (was {Prior})",
                                      instanceId, seconds, prior)
                              End If
                          Catch ex As Exception
@@ -2517,6 +3207,7 @@ Namespace GSM.Node
             resp.InstanceId = managed.InstanceId
             resp.CurrentState = managed.State
             resp.Pid = managed.Pid
+            resp.SupervisorPid = If(managed.ShimPid > 0, CType(managed.ShimPid, Integer?), Nothing)
             resp.CrashCount = managed.CrashCount
             resp.LastExitCode = managed.LastExitCode
             resp.StateChangedAt = managed.StateChangedAt
@@ -2526,11 +3217,15 @@ Namespace GSM.Node
                 resp.UptimeSeconds = CLng((DateTime.UtcNow - managed.StartedAt).TotalSeconds)
             End If
 
-            ' Best-effort process metrics
-            If managed.Process IsNot Nothing AndAlso Not managed.Process.HasExited Then
+            ' Best-effort process metrics. In shim mode the Node holds no
+            ' game Process, only a by-PID MetricsProcess handle.
+            Dim metricsProc = If(managed.Process, managed.MetricsProcess)
+            If metricsProc IsNot Nothing Then
                 Try
-                    managed.Process.Refresh()
-                    resp.MemoryMb = managed.Process.WorkingSet64 \ (1024L * 1024L)
+                    If Not metricsProc.HasExited Then
+                        metricsProc.Refresh()
+                        resp.MemoryMb = metricsProc.WorkingSet64 \ (1024L * 1024L)
+                    End If
                 Catch
                 End Try
             End If
@@ -2580,6 +3275,39 @@ Namespace GSM.Node
         Public Property StopIntentPending As Boolean
         Public Property CrashCount As Integer
         Public Property LastExitCode As Integer?
+
+        ' ---- Shim execution (Phase 8-1) ----
+
+        ''' <summary>
+        ''' Direct (Node holds the game Process) or Shim (game runs under a
+        ''' GSM.Shim supervisor and the Node holds <see cref="Shim"/>).
+        ''' </summary>
+        Public Property ExecutionMode As ProcessManager.ExecutionMode = ProcessManager.ExecutionMode.Direct
+
+        ''' <summary>The shim client when ExecutionMode = Shim; Nothing otherwise.</summary>
+        Public Property Shim As ShimSession
+
+        ''' <summary>Supervisor (shim) PID — surfaced as InstanceStatusResponse.SupervisorPid.</summary>
+        Public Property ShimPid As Integer
+
+        ''' <summary>The shim's pipe/socket endpoint (for adoption in slice 3).</summary>
+        Public Property ShimEndpoint As String
+
+        ''' <summary>Negotiated shim protocol version.</summary>
+        Public Property ShimProtocolVersion As Integer
+
+        ''' <summary>
+        ''' By-PID handle on the GAME process, kept only for metrics
+        ''' (WorkingSet64) in Shim mode where <see cref="Process"/> is Nothing.
+        ''' See decision 11: metrics follow the game, not the shim.
+        ''' </summary>
+        Public Property MetricsProcess As Process
+
+        ''' <summary>
+        ''' Exit code reported by the shim's Exited frame. Read by
+        ''' HandleProcessExited in Shim mode (there is no Process.ExitCode).
+        ''' </summary>
+        Public Property LastShimExitCode As Integer?
 
         ''' <summary>
         ''' File tailer cancellation tokens, one per tailed log file.

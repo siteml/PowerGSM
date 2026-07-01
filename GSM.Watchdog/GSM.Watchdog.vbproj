@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      WinExe (not Exe) so the watchdog has NO console window. It runs
+      unattended — launched at logon by a Task Scheduler task, and as a
+      sibling of the GUI Manager — and writes everything to
+      watchdog.log, so a console would only ever be visible clutter.
+      A console-subsystem exe launched by an interactive logon task
+      would actually flash/show a console window; WinExe never does.
+      Same headless rationale as GSM.Node. Entry point is still
+      Module Program / Sub Main; any Console.Write* calls simply go
+      nowhere under WinExe (the watchdog logs to file instead).
+    -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+
+    <!--
+      Windows-only: launches / monitors GSM.Manager.exe, uses named
+      mutexes for single-instance + running-Manager detection, and is
+      installed via Task Scheduler. win-x64 is the only RID that
+      matters; listed so a RID-targeted publish has its restore slot
+      in obj/project.assets.json (same NETSDK1047 reasoning as
+      GSM.CtrlCSender / GSM.Node / GSM.Manager).
+    -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+
+    <RootNamespace></RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OptionStrict>Off</OptionStrict>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionInfer>On</OptionInfer>
+    <AssemblyName>GSM.Watchdog</AssemblyName>
+
+    <!--
+      Published single-file self-contained (like GSM.Node) so the
+      watchdog is a standalone .exe next to GSM.Manager.exe with no
+      framework dependency. SelfContained / PublishSingleFile are
+      pinned on the publish CLI (see RELEASE_PROCESS.md) rather than
+      here, matching the other projects' release pipeline.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Default config travels next to the binary. <None Update> +
+      PreserveNewest (NOT <Content Include>) per the project-wide
+      JSON-copy convention — an operator-edited watchdogsettings.json
+      in the output dir isn't clobbered on rebuild.
+    -->
+    <None Update="watchdogsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

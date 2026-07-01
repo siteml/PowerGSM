@@ -51,6 +51,10 @@ Namespace GSM.Manager.UI
         Private _layoutDownButton As Button
         Private _layoutResetButton As Button
         Private _groupingCombo As ComboBox
+        Private _kindCombo As ComboBox
+        Private _showEmptyCheck As CheckBox
+        Private _showJoinTimeCheck As CheckBox
+        Private _showTotalCheck As CheckBox
         Private _overridesButton As Button
         Private _overridesStatusLabel As Label
         Private _saveButton As Button
@@ -95,60 +99,101 @@ Namespace GSM.Manager.UI
             Me.MaximizeBox = False
             Me.MinimizeBox = False
             Me.StartPosition = FormStartPosition.CenterParent
-            Me.Size = New Size(560, 660)
+            ' Wider + shorter than the original single-column 832-tall
+            ' layout, which overflowed a 768px screen and hid the
+            ' Save/Cancel buttons. The tall "Layout" list now lives in
+            ' a right-hand column that spans the full height of the
+            ' field stack, so the form height is driven by the (short)
+            ' field rows instead of stacking the list above them.
+            Me.Size = New Size(940, 580)
 
-            ' Three new rows since v1: a tall "Layout" row
-            ' (listbox + button stack), a "Group by" row, and an
-            ' "Override roles" row (Phase 5d-5 item 4). Total
-            ' rows = 10. The Layout row is the only one with a
-            ' non-fixed height — it absorbs whatever space is left
-            ' after the other fixed-height rows and the button row.
-            Dim layout As New TableLayoutPanel With {
+            ' Outer: two content columns (fields | layout list) over a
+            ' full-width button row.
+            Dim outer As New TableLayoutPanel With {
                 .Dock = DockStyle.Fill,
                 .ColumnCount = 2,
-                .RowCount = 10,
+                .RowCount = 2,
                 .Padding = New Padding(10),
                 .AutoSize = False
             }
-            layout.ColumnStyles.Add(New ColumnStyle(SizeType.Absolute, 130))
-            layout.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
-            ' Rows 0..5: existing fixed rows (name/guild/channel/scope/target/refresh).
-            For i = 0 To 5
-                layout.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
+            outer.ColumnStyles.Add(New ColumnStyle(SizeType.Absolute, 430))
+            outer.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
+            outer.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
+            outer.RowStyles.Add(New RowStyle(SizeType.Absolute, 44))
+
+            ' Left column: the field stack. Row 6 is an empty spacer
+            ' (0px) where the Layout list used to sit before it moved
+            ' to the right column — kept so the rows below retain their
+            ' original indices.
+            Dim fields As New TableLayoutPanel With {
+                .Dock = DockStyle.Fill,
+                .ColumnCount = 2,
+                .RowCount = 13,
+                .Padding = New Padding(0),
+                .AutoSize = False
+            }
+            fields.ColumnStyles.Add(New ColumnStyle(SizeType.Absolute, 120))
+            fields.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
+            ' Rows 0..3: name/guild/channel/scope-kind (fixed 36).
+            For i = 0 To 3
+                fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
             Next
-            ' Row 6: Layout — takes all remaining vertical space.
-            layout.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
-            ' Row 7: Group-by combo (fixed).
-            layout.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
-            ' Row 8: Override roles button + status label (fixed).
-            layout.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
-            ' Row 9: button row (fixed).
-            layout.RowStyles.Add(New RowStyle(SizeType.Absolute, 44))
+            ' Row 4: scope target + the Phase 5d-7b slash-command
+            ' visibility hint stacked beneath it — taller for the wrap.
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 64))
+            ' Row 5: refresh interval.
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
+            ' Row 6: empty spacer (Layout moved to the right column).
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 0))
+            ' Row 7: group-by combo.
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
+            ' Row 8: override roles button + status label.
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
+            ' Row 9: panel kind (Phase 5k).
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
+            ' Row 10: show-empty toggle (Phase 5k).
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
+            ' Row 11: show-join-time toggle (Phase 5k-2c).
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
+            ' Row 12: show-total-in-title toggle (Phase 5k-2c).
+            fields.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
+
+            ' Right column: the layout list (label over listbox +
+            ' button stack), filling the full content height.
+            Dim layoutPane As New TableLayoutPanel With {
+                .Dock = DockStyle.Fill,
+                .ColumnCount = 1,
+                .RowCount = 2,
+                .Padding = New Padding(0)
+            }
+            layoutPane.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
+            layoutPane.RowStyles.Add(New RowStyle(SizeType.Absolute, 22))
+            layoutPane.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
 
             ' Name
-            layout.Controls.Add(MakeLabel("Display name:"), 0, 0)
+            fields.Controls.Add(MakeLabel("Display name:"), 0, 0)
             _nameTextBox = New TextBox With {.Dock = DockStyle.Fill}
-            layout.Controls.Add(_nameTextBox, 1, 0)
+            fields.Controls.Add(_nameTextBox, 1, 0)
 
             ' Guild
-            layout.Controls.Add(MakeLabel("Guild:"), 0, 1)
+            fields.Controls.Add(MakeLabel("Guild:"), 0, 1)
             _guildCombo = New ComboBox With {
                 .Dock = DockStyle.Fill,
                 .DropDownStyle = ComboBoxStyle.DropDownList
             }
             AddHandler _guildCombo.SelectedIndexChanged, AddressOf OnGuildChanged
-            layout.Controls.Add(_guildCombo, 1, 1)
+            fields.Controls.Add(_guildCombo, 1, 1)
 
             ' Channel
-            layout.Controls.Add(MakeLabel("Channel:"), 0, 2)
+            fields.Controls.Add(MakeLabel("Channel:"), 0, 2)
             _channelCombo = New ComboBox With {
                 .Dock = DockStyle.Fill,
                 .DropDownStyle = ComboBoxStyle.DropDownList
             }
-            layout.Controls.Add(_channelCombo, 1, 2)
+            fields.Controls.Add(_channelCombo, 1, 2)
 
             ' Scope kind
-            layout.Controls.Add(MakeLabel("Scope:"), 0, 3)
+            fields.Controls.Add(MakeLabel("Scope:"), 0, 3)
             _scopeKindCombo = New ComboBox With {
                 .Dock = DockStyle.Fill,
                 .DropDownStyle = ComboBoxStyle.DropDownList
@@ -160,26 +205,50 @@ Namespace GSM.Manager.UI
                 New ScopeItem("InstanceSet", "By instance set tag")
             })
             AddHandler _scopeKindCombo.SelectedIndexChanged, AddressOf OnScopeKindChanged
-            layout.Controls.Add(_scopeKindCombo, 1, 3)
+            fields.Controls.Add(_scopeKindCombo, 1, 3)
 
             ' Scope target — label updates with kind
             _scopeTargetLabel = MakeLabel("Target:")
-            layout.Controls.Add(_scopeTargetLabel, 0, 4)
+            _scopeTargetLabel.TextAlign = ContentAlignment.TopLeft
+            fields.Controls.Add(_scopeTargetLabel, 0, 4)
             _scopeTargetCombo = New ComboBox With {
                 .Dock = DockStyle.Fill,
                 .DropDownStyle = ComboBoxStyle.DropDownList
             }
-            layout.Controls.Add(_scopeTargetCombo, 1, 4)
+            ' Phase 5d-7b — the panel's scope (kind + target) is
+            ' also exactly what this guild's slash commands can
+            ' see, but nothing here said so. Stack a grey hint
+            ' under the target combo so the coupling is visible
+            ' where the operator actually sets the scope.
+            Dim scopeTargetHost As New TableLayoutPanel With {
+                .Dock = DockStyle.Fill,
+                .ColumnCount = 1,
+                .RowCount = 2,
+                .Padding = New Padding(0)
+            }
+            scopeTargetHost.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
+            scopeTargetHost.RowStyles.Add(New RowStyle(SizeType.Absolute, 26))
+            scopeTargetHost.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
+            scopeTargetHost.Controls.Add(_scopeTargetCombo, 0, 0)
+            Dim scopeSlashHint As New Label With {
+                .Dock = DockStyle.Fill,
+                .ForeColor = SystemColors.GrayText,
+                .AutoSize = False,
+                .TextAlign = ContentAlignment.TopLeft,
+                .Text = "Instances in this panel's scope are also what this guild's slash commands (/players, and /lastseen once added) can see."
+            }
+            scopeTargetHost.Controls.Add(scopeSlashHint, 0, 1)
+            fields.Controls.Add(scopeTargetHost, 1, 4)
 
             ' Refresh interval
-            layout.Controls.Add(MakeLabel("Drift refresh (sec):"), 0, 5)
+            fields.Controls.Add(MakeLabel("Drift refresh (sec):"), 0, 5)
             _refreshIntervalNumeric = New NumericUpDown With {
                 .Dock = DockStyle.Fill,
                 .Minimum = 10,
                 .Maximum = 3600,
                 .Value = 60
             }
-            layout.Controls.Add(_refreshIntervalNumeric, 1, 5)
+            fields.Controls.Add(_refreshIntervalNumeric, 1, 5)
 
             ' Layout (Phase 5d-5 item 3) — listbox of element
             ' specs with a vertical button stack. The listbox
@@ -190,7 +259,7 @@ Namespace GSM.Manager.UI
             ' its preview to match what the renderer actually
             ' outputs (the leading prefix is suppressed for the
             ' first non-empty element on the line).
-            layout.Controls.Add(MakeLabel("Layout:"), 0, 6)
+            layoutPane.Controls.Add(MakeLabel("Layout:"), 0, 0)
             Dim layoutHost As New TableLayoutPanel With {
                 .Dock = DockStyle.Fill,
                 .ColumnCount = 2,
@@ -257,11 +326,11 @@ Namespace GSM.Manager.UI
             buttonStack.Controls.Add(_layoutDownButton)
             buttonStack.Controls.Add(_layoutResetButton)
             layoutHost.Controls.Add(buttonStack, 1, 0)
-            layout.Controls.Add(layoutHost, 1, 6)
+            layoutPane.Controls.Add(layoutHost, 0, 1)
 
             ' Group-by combo. Stored as a discriminator string;
             ' values match the renderer's grouping switch.
-            layout.Controls.Add(MakeLabel("Group by:"), 0, 7)
+            fields.Controls.Add(MakeLabel("Group by:"), 0, 7)
             _groupingCombo = New ComboBox With {
                 .Dock = DockStyle.Fill,
                 .DropDownStyle = ComboBoxStyle.DropDownList
@@ -272,7 +341,7 @@ Namespace GSM.Manager.UI
                 New GroupingItem("ByGame", "By game"),
                 New GroupingItem("ByNodeThenGame", "By node, then by game")
             })
-            layout.Controls.Add(_groupingCombo, 1, 7)
+            fields.Controls.Add(_groupingCombo, 1, 7)
 
             ' Override roles row (Phase 5d-5 item 4). The button
             ' opens DiscordPanelRoleOverridesForm; the status
@@ -282,7 +351,7 @@ Namespace GSM.Manager.UI
             ' doesn't exist in the DB yet, and saving overrides
             ' against an unsaved panel ID would leave orphan rows
             ' if the user then cancels the panel editor.
-            layout.Controls.Add(MakeLabel("Override roles:"), 0, 8)
+            fields.Controls.Add(MakeLabel("Override roles:"), 0, 8)
             Dim overridesRow As New TableLayoutPanel With {
                 .Dock = DockStyle.Fill,
                 .ColumnCount = 2,
@@ -306,7 +375,41 @@ Namespace GSM.Manager.UI
                 .Text = "—"
             }
             overridesRow.Controls.Add(_overridesStatusLabel, 1, 0)
-            layout.Controls.Add(overridesRow, 1, 8)
+            fields.Controls.Add(overridesRow, 1, 8)
+
+            ' Panel kind (Phase 5k) — InstanceManager vs PlayerList.
+            fields.Controls.Add(MakeLabel("Panel kind:"), 0, 9)
+            _kindCombo = New ComboBox With {
+                .Dock = DockStyle.Fill,
+                .DropDownStyle = ComboBoxStyle.DropDownList
+            }
+            _kindCombo.Items.Add(New IdItem("InstanceManager", "Instance manager"))
+            _kindCombo.Items.Add(New IdItem("PlayerList", "Player list"))
+            AddHandler _kindCombo.SelectedIndexChanged, AddressOf OnKindChanged
+            fields.Controls.Add(_kindCombo, 1, 9)
+
+            ' Show-empty toggle (Phase 5k) — player-list panels only.
+            _showEmptyCheck = New CheckBox With {
+                .Text = "Show instances with nobody online (player list only)",
+                .Dock = DockStyle.Fill,
+                .TextAlign = ContentAlignment.MiddleLeft
+            }
+            fields.Controls.Add(_showEmptyCheck, 1, 10)
+
+            ' Player-list display toggles (Phase 5k-2c).
+            _showJoinTimeCheck = New CheckBox With {
+                .Text = "Show each player's join time (player list only)",
+                .Dock = DockStyle.Fill,
+                .TextAlign = ContentAlignment.MiddleLeft
+            }
+            fields.Controls.Add(_showJoinTimeCheck, 1, 11)
+
+            _showTotalCheck = New CheckBox With {
+                .Text = "Show total online count in the title (player list only)",
+                .Dock = DockStyle.Fill,
+                .TextAlign = ContentAlignment.MiddleLeft
+            }
+            fields.Controls.Add(_showTotalCheck, 1, 12)
 
             ' Buttons
             Dim buttonRow As New FlowLayoutPanel With {
@@ -323,9 +426,14 @@ Namespace GSM.Manager.UI
                                              End Sub
             buttonRow.Controls.Add(_saveButton)
             buttonRow.Controls.Add(_cancelButton)
-            layout.Controls.Add(buttonRow, 1, 9)
+            ' Assemble: fields left, layout list right, buttons across
+            ' the bottom.
+            outer.Controls.Add(fields, 0, 0)
+            outer.Controls.Add(layoutPane, 1, 0)
+            outer.Controls.Add(buttonRow, 0, 1)
+            outer.SetColumnSpan(buttonRow, 2)
 
-            Me.Controls.Add(layout)
+            Me.Controls.Add(outer)
             Me.AcceptButton = _saveButton
             Me.CancelButton = _cancelButton
         End Sub
@@ -337,6 +445,29 @@ Namespace GSM.Manager.UI
                 .TextAlign = ContentAlignment.MiddleLeft
             }
         End Function
+
+        ''' <summary>
+        ''' Phase 5k — a player-list panel uses a fixed per-instance
+        ''' layout, so the layout-composition controls don't apply;
+        ''' the show-empty toggle applies only to it. Grouping (5k-2b)
+        ''' applies to both kinds, so the grouping combo stays enabled.
+        ''' Enable/disable accordingly when the kind changes.
+        ''' </summary>
+        Private Sub OnKindChanged(sender As Object, e As EventArgs)
+            Dim kindItem = TryCast(_kindCombo.SelectedItem, IdItem)
+            Dim isPlayer = kindItem IsNot Nothing AndAlso
+                           String.Equals(kindItem.Id, "PlayerList", StringComparison.OrdinalIgnoreCase)
+            _layoutListBox.Enabled = Not isPlayer
+            _layoutAddButton.Enabled = Not isPlayer
+            _layoutRemoveButton.Enabled = Not isPlayer
+            _layoutUpButton.Enabled = Not isPlayer
+            _layoutDownButton.Enabled = Not isPlayer
+            _layoutResetButton.Enabled = Not isPlayer
+            _groupingCombo.Enabled = True
+            _showEmptyCheck.Enabled = isPlayer
+            _showJoinTimeCheck.Enabled = isPlayer
+            _showTotalCheck.Enabled = isPlayer
+        End Sub
 
         ' ============================================================
         '  Loading existing entity into controls
@@ -417,6 +548,21 @@ Namespace GSM.Manager.UI
             If seconds < _refreshIntervalNumeric.Minimum Then seconds = CInt(_refreshIntervalNumeric.Minimum)
             If seconds > _refreshIntervalNumeric.Maximum Then seconds = CInt(_refreshIntervalNumeric.Maximum)
             _refreshIntervalNumeric.Value = seconds
+
+            ' Panel kind + show-empty toggle (Phase 5k).
+            Dim panelKindToSelect = If(_panel.PanelKind, "InstanceManager")
+            For i = 0 To _kindCombo.Items.Count - 1
+                Dim kItem = CType(_kindCombo.Items(i), IdItem)
+                If String.Equals(kItem.Id, panelKindToSelect, StringComparison.OrdinalIgnoreCase) Then
+                    _kindCombo.SelectedIndex = i
+                    Exit For
+                End If
+            Next
+            If _kindCombo.SelectedIndex = -1 Then _kindCombo.SelectedIndex = 0
+            _showEmptyCheck.Checked = _panel.ShowEmptyGroups
+            _showJoinTimeCheck.Checked = _panel.ShowJoinTime
+            _showTotalCheck.Checked = _panel.ShowTotalInTitle
+            OnKindChanged(_kindCombo, EventArgs.Empty)
 
             ' Layout (Phase 5d-5 item 3). Parse the saved JSON if
             ' present; fall back to the default-equivalent specs
@@ -1019,6 +1165,13 @@ Namespace GSM.Manager.UI
             _panel.ScopeKind = scope.Kind
             _panel.ScopeTargetId = targetId
             _panel.RefreshIntervalSeconds = CInt(_refreshIntervalNumeric.Value)
+
+            ' Panel kind + show-empty toggle (Phase 5k).
+            Dim kindItem = TryCast(_kindCombo.SelectedItem, IdItem)
+            _panel.PanelKind = If(kindItem IsNot Nothing, kindItem.Id, "InstanceManager")
+            _panel.ShowEmptyGroups = _showEmptyCheck.Checked
+            _panel.ShowJoinTime = _showJoinTimeCheck.Checked
+            _panel.ShowTotalInTitle = _showTotalCheck.Checked
 
             ' Layout (Phase 5d-5 item 3). Save NULL when the
             ' layout is the default — keeps default-layout rows

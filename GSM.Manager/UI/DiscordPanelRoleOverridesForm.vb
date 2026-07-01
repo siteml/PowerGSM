@@ -88,9 +88,9 @@ Namespace GSM.Manager.UI
 
         Private Sub InitializeControls()
             Me.Text = "Panel role overrides"
-            Me.Size = New Size(720, 500)
+            Me.Size = New Size(720, 536)
             Me.StartPosition = FormStartPosition.CenterParent
-            Me.MinimumSize = New Size(640, 400)
+            Me.MinimumSize = New Size(640, 436)
 
             Dim root As New TableLayoutPanel With {
                 .Dock = DockStyle.Fill,
@@ -101,7 +101,7 @@ Namespace GSM.Manager.UI
             root.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
             root.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
             root.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
-            root.RowStyles.Add(New RowStyle(SizeType.Absolute, 56))
+            root.RowStyles.Add(New RowStyle(SizeType.Absolute, 88))
             root.RowStyles.Add(New RowStyle(SizeType.Absolute, 48))
 
             ' Header row — names the panel scope so the operator
@@ -162,7 +162,31 @@ Namespace GSM.Manager.UI
                 .ForeColor = SystemColors.GrayText,
                 .TextAlign = ContentAlignment.TopLeft
             }
-            root.Controls.Add(_hintLabel, 0, 2)
+            ' Phase 5d-7b — spell out that panel overrides do NOT
+            ' change slash-command access. Verified in code: slash
+            ' commands resolve against the guild-default role map
+            ' only (ResolveUserPermission with no panelId); these
+            ' overrides gate panel buttons. This is the OPPOSITE of
+            ' the guild-default form's note, on purpose.
+            Dim hintHost As New TableLayoutPanel With {
+                .Dock = DockStyle.Fill,
+                .ColumnCount = 1,
+                .RowCount = 2,
+                .Padding = New Padding(0)
+            }
+            hintHost.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
+            hintHost.RowStyles.Add(New RowStyle(SizeType.Absolute, 48))
+            hintHost.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
+            hintHost.Controls.Add(_hintLabel, 0, 0)
+            Dim slashNote As New Label With {
+                .Dock = DockStyle.Fill,
+                .ForeColor = SystemColors.GrayText,
+                .AutoSize = False,
+                .TextAlign = ContentAlignment.TopLeft,
+                .Text = "Slash commands (e.g. /players) are NOT affected by panel overrides — they always use the guild-default role mapping. These overrides change only this panel's buttons."
+            }
+            hintHost.Controls.Add(slashNote, 0, 1)
+            root.Controls.Add(hintHost, 0, 2)
 
             ' Close button
             Dim closeRow As New FlowLayoutPanel With {

@@ -92,6 +92,18 @@ Namespace GSM.Manager.Core
         Public Property GameId As String
         Public Property Key As String
         Public Property Port As Integer
+
+        ''' <summary>
+        ''' True when this observation is a port RESERVED by a field
+        ''' rather than a value the user actually entered — e.g. the
+        ''' Conan pinger port (game port + 1) derived from a field's
+        ''' ReservedPortOffsets. Reserved observations participate in
+        ''' the "in use" set (suggestion + conflict detection) but
+        ''' carry a descriptive synthetic Key ("Port +1 (reserved)")
+        ''' so they never match a real field key in same-key baseline
+        ''' computation.
+        ''' </summary>
+        Public Property IsReserved As Boolean
     End Class
 
     ''' <summary>
@@ -193,6 +205,19 @@ Namespace GSM.Manager.Core
 
                 suggestions(field.Key) = candidate.ToString()
                 taken.Add(candidate)
+
+                ' Reserve this field's derived neighbours within the
+                ' same call too, so a later port field in this very
+                ' suggestion can't be handed a value that lands on a
+                ' port we just implicitly reserved (e.g. a freshly
+                ' allocated Conan game port + 1 pinger).
+                If field.ReservedPortOffsets IsNot Nothing Then
+                    For Each off In field.ReservedPortOffsets
+                        If off = 0 Then Continue For
+                        Dim rp = candidate + off
+                        If rp >= 1 AndAlso rp <= 65535 Then taken.Add(rp)
+                    Next
+                End If
             Next
 
             Return suggestions
@@ -244,7 +269,7 @@ Namespace GSM.Manager.Core
             ' validation if required.
             Dim ciProposed As New Dictionary(Of String, String)(
                 proposedConfig, StringComparer.OrdinalIgnoreCase)
-            Dim proposedPorts As New List(Of (Key As String, Port As Integer))
+            Dim proposedPorts As New List(Of (Key As String, Port As Integer, IsReserved As Boolean))
             For Each f In schema
                 If f Is Nothing OrElse Not f.IsPort Then Continue For
                 Dim raw As String = Nothing
@@ -252,7 +277,21 @@ Namespace GSM.Manager.Core
                 If String.IsNullOrWhiteSpace(raw) Then Continue For
                 Dim n As Integer
                 If Not Integer.TryParse(raw.Trim(), n) Then Continue For
-                proposedPorts.Add((f.Key, n))
+                proposedPorts.Add((f.Key, n, False))
+
+                ' Expand the field's reserved neighbours so the
+                ' proposed instance's derived ports (e.g. its own
+                ' pinger at game port + 1) are checked too — both
+                ' against its other fields (intra-config) and against
+                ' the rest of the node (cross-instance).
+                If f.ReservedPortOffsets IsNot Nothing Then
+                    For Each off In f.ReservedPortOffsets
+                        If off = 0 Then Continue For
+                        Dim rp = n + off
+                        If rp < 1 OrElse rp > 65535 Then Continue For
+                        proposedPorts.Add((FormatReservedKey(f.Key, off), rp, True))
+                    Next
+                End If
             Next
             If proposedPorts.Count = 0 Then Return conflicts
 
@@ -397,7 +436,7 @@ Namespace GSM.Manager.Core
             ' Cache per-game port-field key list — we'd otherwise call
             ' GetInstanceConfigSchema once per instance, which is
             ' wasteful when a node has many instances of the same game.
-            Dim portKeysByGame As New Dictionary(Of String, List(Of String))(StringComparer.OrdinalIgnoreCase)
+            Dim portKeysByGame As New Dictionary(Of String, List(Of PortFieldSpec))(StringComparer.OrdinalIgnoreCase)
 
             For Each inst In rows
                 If Not String.IsNullOrEmpty(excludeInstanceId) AndAlso
@@ -407,8 +446,8 @@ Namespace GSM.Manager.Core
                 Dim gameId = If(inst.GameId, "")
                 If String.IsNullOrEmpty(gameId) Then Continue For
 
-                Dim portKeys = ResolvePortKeysForGame(gameId, registry, portKeysByGame)
-                If portKeys.Count = 0 Then Continue For
+                Dim portSpecs = ResolvePortKeysForGame(gameId, registry, portKeysByGame)
+                If portSpecs.Count = 0 Then Continue For
 
                 If String.IsNullOrEmpty(inst.ConfigJson) Then Continue For
                 Dim cfg As Dictionary(Of String, String) = Nothing
@@ -419,9 +458,9 @@ Namespace GSM.Manager.Core
                 If cfg Is Nothing Then Continue For
                 Dim ciCfg As New Dictionary(Of String, String)(cfg, StringComparer.OrdinalIgnoreCase)
 
-                For Each key In portKeys
+                For Each spec In portSpecs
                     Dim raw As String = Nothing
-                    If Not ciCfg.TryGetValue(key, raw) Then Continue For
+                    If Not ciCfg.TryGetValue(spec.Key, raw) Then Continue For
                     If String.IsNullOrWhiteSpace(raw) Then Continue For
                     Dim n As Integer
                     If Not Integer.TryParse(raw.Trim(), n) Then Continue For
@@ -429,9 +468,30 @@ Namespace GSM.Manager.Core
                         .InstanceId = inst.InstanceId,
                         .InstanceName = inst.DisplayName,
                         .GameId = gameId,
-                        .Key = key,
-                        .Port = n
+                        .Key = spec.Key,
+                        .Port = n,
+                        .IsReserved = False
                     })
+
+                    ' Emit an extra observation per reserved offset so
+                    ' derived ports (Conan's game-port-+1 pinger, etc.)
+                    ' occupy the node-wide "in use" set even though no
+                    ' field stores them.
+                    If spec.Offsets IsNot Nothing Then
+                        For Each off In spec.Offsets
+                            If off = 0 Then Continue For
+                            Dim reservedPort = n + off
+                            If reservedPort < 1 OrElse reservedPort > 65535 Then Continue For
+                            results.Add(New PortObservation With {
+                                .InstanceId = inst.InstanceId,
+                                .InstanceName = inst.DisplayName,
+                                .GameId = gameId,
+                                .Key = FormatReservedKey(spec.Key, off),
+                                .Port = reservedPort,
+                                .IsReserved = True
+                            })
+                        Next
+                    End If
                 Next
             Next
 
@@ -439,19 +499,20 @@ Namespace GSM.Manager.Core
         End Function
 
         ''' <summary>
-        ''' Look up the list of port-typed field keys for a game,
-        ''' caching the result. Returns the conventional fallback
-        ''' list when the plugin isn't resolvable so we still detect
-        ''' obvious collisions for orphan instances.
+        ''' Look up the port-typed fields for a game (key + any
+        ''' reserved offsets), caching the result. Returns the
+        ''' conventional fallback list when the plugin isn't
+        ''' resolvable so we still detect obvious collisions for
+        ''' orphan instances (fallback fields reserve nothing extra).
         ''' </summary>
         Private Shared Function ResolvePortKeysForGame(
                 gameId As String,
                 registry As PluginRegistry,
-                cache As Dictionary(Of String, List(Of String))) As List(Of String)
-            Dim cached As List(Of String) = Nothing
+                cache As Dictionary(Of String, List(Of PortFieldSpec))) As List(Of PortFieldSpec)
+            Dim cached As List(Of PortFieldSpec) = Nothing
             If cache.TryGetValue(gameId, cached) Then Return cached
 
-            Dim keys As New List(Of String)
+            Dim specs As New List(Of PortFieldSpec)
             If registry IsNot Nothing Then
                 Try
                     Dim plugin = registry.GetPlugin(gameId)
@@ -461,7 +522,14 @@ Namespace GSM.Manager.Core
                             For Each f In schema
                                 If f IsNot Nothing AndAlso f.IsPort AndAlso
                                    Not String.IsNullOrEmpty(f.Key) Then
-                                    keys.Add(f.Key)
+                                    Dim offsets As New List(Of Integer)
+                                    If f.ReservedPortOffsets IsNot Nothing Then
+                                        offsets.AddRange(f.ReservedPortOffsets)
+                                    End If
+                                    specs.Add(New PortFieldSpec With {
+                                        .Key = f.Key,
+                                        .Offsets = offsets
+                                    })
                                 End If
                             Next
                         End If
@@ -472,14 +540,38 @@ Namespace GSM.Manager.Core
 
             ' Plugin not loaded / no port-typed fields declared.
             ' Fall back to convention so we don't silently miss
-            ' collisions on an orphan instance.
-            If keys.Count = 0 Then
-                keys.AddRange({"Port", "RconPort", "QueryPort", "GamePort"})
+            ' collisions on an orphan instance. Fallback fields carry
+            ' no reserved offsets — we can't know them without the
+            ' plugin's schema.
+            If specs.Count = 0 Then
+                For Each k In {"Port", "RconPort", "QueryPort", "GamePort"}
+                    specs.Add(New PortFieldSpec With {.Key = k, .Offsets = New List(Of Integer)})
+                Next
             End If
 
-            cache(gameId) = keys
-            Return keys
+            cache(gameId) = specs
+            Return specs
         End Function
+
+        ''' <summary>
+        ''' Synthetic, self-describing Key for a reserved (derived)
+        ''' port observation/conflict, e.g. "Port +1 (reserved)".
+        ''' Deliberately game-agnostic — the plugin owns vocabulary
+        ''' like "pinger"; the allocator only knows "field + offset".
+        ''' </summary>
+        Private Shared Function FormatReservedKey(sourceKey As String, offset As Integer) As String
+            Dim sign = If(offset >= 0, "+", "")
+            Return $"{sourceKey} {sign}{offset} (reserved)"
+        End Function
+
+        ''' <summary>
+        ''' One port-typed field on a game's instance schema: its key
+        ''' plus any neighbour ports it reserves (ReservedPortOffsets).
+        ''' </summary>
+        Private Class PortFieldSpec
+            Public Property Key As String
+            Public Property Offsets As List(Of Integer)
+        End Class
 
     End Class
 

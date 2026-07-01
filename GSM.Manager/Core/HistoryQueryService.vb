@@ -8,6 +8,7 @@ Imports Microsoft.Extensions.DependencyInjection
 Imports Microsoft.Extensions.Logging
 Imports GSM.Manager.Data
 Imports GSM.Plugin
+Imports GSM.Node.Api
 
 ' ============================================================
 '  HistoryQueryService — read-only query surface for the
@@ -152,6 +153,61 @@ Namespace GSM.Manager.Core
         ''' </summary>
         Public Property CharacterId As String
 
+        ''' <summary>
+        ''' In-game character display name for this row, taken
+        ''' RAW from the underlying entity — unlike PlayerName,
+        ''' this is NOT coalesced through IdentityFormatter, so
+        ''' the column reads empty when the entity row's
+        ''' DisplayName was NULL at write time (typical for early
+        ''' rows in a session before the Node's players-table
+        ''' cache resolved the character name from the Persisting
+        ''' tick). Drives the History window's "Character" column,
+        ''' which sits alongside the persona-only "Player" column
+        ''' so the operator can trace either identity
+        ''' independently — a row missing the character name
+        ''' still shows the persona, and vice versa.
+        '''
+        ''' Sources:
+        '''   - Chat rows: ChatMessages.DisplayName directly. Chat
+        '''     lines on Last Oasis and Conan carry the in-game
+        '''     character name natively, so the value is canonical
+        '''     at write time.
+        '''   - Join/Leave rows: PlayerActivity.DisplayName, with
+        '''     the same Phase 5g-2b render-time chat fallback as
+        '''     PlayerName — if DisplayName was empty (or equal to
+        '''     the raw PlayerName) and the row carries a
+        '''     PlatformUserId, ApplyChatFallbackDisplayNames
+        '''     overrides it with the most recent chat DisplayName
+        '''     for that (session, pid) pair.
+        ''' </summary>
+        Public Property CharacterName As String
+
+        ''' <summary>
+        ''' Platform persona (Steam handle, Funcom FLS handle,
+        ''' multiplayer username on Factorio, etc.) for this row
+        ''' — the raw platform-level identifier, distinct from the
+        ''' character name the player chose in-game. Drives the
+        ''' History window's "Player" column.
+        '''
+        ''' Sources:
+        '''   - Join/Leave rows: PlayerActivity.PlayerName, which
+        '''     is the raw login-line string the parser captured
+        '''     at the moment of the event. On Last Oasis this is
+        '''     the Steam persona; on Conan the FLS handle; on
+        '''     Factorio the multiplayer username (same as the
+        '''     character name there).
+        '''   - Chat rows: ChatMessages doesn't carry a persona
+        '''     column directly, so this is resolved via a batch
+        '''     lookup against PlayerActivity by (SessionIdentity,
+        '''     PlatformUserId) — ApplyActivityFallbackPersona
+        '''     pulls the most recent PlayerActivity.PlayerName
+        '''     for each chat row's pid. Chat rows whose pid never
+        '''     appears in PlayerActivity (returning players on a
+        '''     Node that hasn't seen them join in scope) stay
+        '''     empty.
+        ''' </summary>
+        Public Property PlatformPersona As String
+
         Public Property Text As String
 
         ''' <summary>
@@ -180,6 +236,27 @@ Namespace GSM.Manager.Core
         Public Property TileDisplayName As String
         Public Property LastChatText As String
         Public Property LastChatTimeUtc As DateTime?
+
+        ''' <summary>
+        ''' In-game character display name for the player at
+        ''' the snapshot instant — same semantics as
+        ''' TimelineRow.CharacterName but resolved from the
+        ''' join event's DisplayName captured during the
+        ''' activity replay. Empty when the join row didn't
+        ''' have DisplayName bound (typical for early-session
+        ''' joins before the Node resolved the character name).
+        ''' </summary>
+        Public Property CharacterName As String
+
+        ''' <summary>
+        ''' Platform persona for the player at the snapshot
+        ''' instant — the join event's PlayerName, which on
+        ''' Last Oasis is the Steam persona, on Conan the FLS
+        ''' handle, on Factorio the username (which equals the
+        ''' character name there). Always populated for snapshot
+        ''' rows because the replay key includes PlayerName.
+        ''' </summary>
+        Public Property PlatformPersona As String
 
         ''' <summary>
         ''' Phase 5h-6 — InstanceId of the join event the player
@@ -305,7 +382,7 @@ Namespace GSM.Manager.Core
                     }).ToDictionary(Function(x) x.Identity, Function(x) x.Name)
 
                 ' Phase 5h-6 — build a session-identity → realm
-                ' DisplayName map so the session dropdown can
+                ' name map so the session dropdown can
                 ' show the friendly realm name (e.g. "Site's World")
                 ' instead of the raw realm_id substring for
                 ' installations linked to a SharedConfigGroup.
@@ -330,16 +407,35 @@ Namespace GSM.Manager.Core
                 If hostMappings.Count > 0 Then
                     Dim groupIds = hostMappings.
                         Select(Function(m) m.GroupId).Distinct().ToList()
-                    Dim groupNames = db.SharedConfigGroups.
+                    ' Resolve each linked group to a realm label, preferring
+                    ' its canonical RealmName field over the DisplayName
+                    ' (which may carry a per-provider "(label)" suffix) so
+                    ' the dropdown matches the History Source column; falls
+                    ' back to DisplayName when no RealmName is set (7-6 2a).
+                    Dim groupDisplayNames = db.SharedConfigGroups.
                         Where(Function(g) groupIds.Contains(g.GroupId)).
                         Select(Function(g) New With {.GroupId = g.GroupId, .DisplayName = g.DisplayName}).
                         ToDictionary(Function(x) x.GroupId, Function(x) x.DisplayName)
+                    Dim sharedConfigService = scope.ServiceProvider.GetService(Of SharedConfigService)()
+                    Dim realmLabelByGroup As New Dictionary(Of String, String)(StringComparer.Ordinal)
+                    For Each gid In groupIds
+                        Dim label As String = Nothing
+                        If sharedConfigService IsNot Nothing Then
+                            Dim rn As String = Nothing
+                            If sharedConfigService.LoadNonSensitiveFields(db, gid).TryGetValue("RealmName", rn) AndAlso
+                               Not String.IsNullOrEmpty(rn) Then
+                                label = rn
+                            End If
+                        End If
+                        If String.IsNullOrEmpty(label) Then groupDisplayNames.TryGetValue(gid, label)
+                        If Not String.IsNullOrEmpty(label) Then realmLabelByGroup(gid) = label
+                    Next
                     For Each m In hostMappings
-                        Dim displayName As String = Nothing
-                        If groupNames.TryGetValue(m.GroupId, displayName) AndAlso
-                           Not String.IsNullOrEmpty(displayName) AndAlso
+                        Dim label As String = Nothing
+                        If realmLabelByGroup.TryGetValue(m.GroupId, label) AndAlso
+                           Not String.IsNullOrEmpty(label) AndAlso
                            Not realmNameByIdentity.ContainsKey(m.Identity) Then
-                            realmNameByIdentity(m.Identity) = displayName
+                            realmNameByIdentity(m.Identity) = label
                         End If
                     Next
                 End If
@@ -463,8 +559,23 @@ Namespace GSM.Manager.Core
                     ' without two round trips.
                     Dim chatRows = q.OrderByDescending(Function(c) c.TimestampUtc).
                         Take(TimelineRowLimit + 1).ToList()
+
+                    ' Chat rows track (Row, SessionIdentity, PlatformUserId)
+                    ' tuples for a follow-up batch lookup that resolves
+                    ' the persona (PlatformPersona) from the matching
+                    ' PlayerActivity rows for the same (session, pid).
+                    ' Chat lines on Last Oasis and Conan don't carry the
+                    ' platform persona on the wire — only the character
+                    ' name — so the Player column would be blank for
+                    ' every chat row without this lookup. Pulls are
+                    ' batched by distinct pid (typically a handful per
+                    ' query) so the cost is bounded regardless of how
+                    ' many chat rows came back.
+                    Dim chatRowsNeedingPersona As _
+                        New List(Of (Row As TimelineRow, SessionIdentity As String, PlatformUserId As String))
+
                     For Each r In chatRows
-                        merged.Add(New TimelineRow With {
+                        Dim row = New TimelineRow With {
                             .Kind = TimelineRow.RowKind.Chat,
                             .TimestampUtc = r.TimestampUtc,
                             .SessionIdentity = r.SessionIdentity,
@@ -473,14 +584,30 @@ Namespace GSM.Manager.Core
                             .PlayerName = r.DisplayName,
                             .PlatformUserId = r.PlatformUserId,
                             .CharacterId = r.CharacterId,
+                            .CharacterName = r.DisplayName,
+                            .PlatformPersona = Nothing,
                             .Text = r.Text
-                        })
+                        }
+                        merged.Add(row)
+
+                        If Not String.IsNullOrEmpty(r.PlatformUserId) Then
+                            chatRowsNeedingPersona.Add((row, r.SessionIdentity, r.PlatformUserId))
+                        End If
                     Next
+
+                    If chatRowsNeedingPersona.Count > 0 Then
+                        ApplyActivityFallbackPersona(db, chatRowsNeedingPersona)
+                    End If
                 End If
 
                 ' ---- Activity slice ----
                 If filter.IncludeJoins OrElse filter.IncludeLeaves Then
                     token.ThrowIfCancellationRequested()
+                    ' Phase 5g-2d Round 3c — render-time identity
+                    ' enrichment source. Singleton; GetService is
+                    ' cheap and returns Nothing only if somehow
+                    ' unregistered (defensive null-check at use).
+                    Dim identityResolver = _serviceProvider.GetService(Of IdentityResolver)()
                     Dim q = db.PlayerActivity.AsQueryable().
                         Where(Function(a) a.TimestampUtc >= filter.StartUtc AndAlso
                                            a.TimestampUtc <= endUtc)
@@ -532,11 +659,55 @@ Namespace GSM.Manager.Core
                             .PlayerName = IdentityFormatter.Format(r.DisplayName, Nothing, r.PlayerName),
                             .PlatformUserId = r.PlatformUserId,
                             .CharacterId = r.CharacterId,
+                            .CharacterName = r.DisplayName,
+                            .PlatformPersona = r.PlayerName,
                             .Text = Nothing
                         }
                         merged.Add(row)
 
-                        If Not String.IsNullOrEmpty(r.PlatformUserId) AndAlso
+                        ' ---- Resolver render-time enrichment (5g-2d Round 3c) ----
+                        ' For rows whose stored snapshot couldn't bind
+                        ' a character name (DisplayName empty, or equal
+                        ' to the raw PlayerName), consult the in-memory
+                        ' resolver before falling back to the chat
+                        ' lookup. The resolver is hydrated from History
+                        ' and continuously fed, so it often knows the
+                        ' character name for OLD rows that were
+                        ' persisted NULL before this player's identity
+                        ' was ever resolved — including rows for players
+                        ' who aren't currently online (which the chat
+                        ' fallback can also do, but the resolver is
+                        ' in-memory and covers the persona-keyed case
+                        ' the chat lookup can't when PlatformUserId is
+                        ' absent). Probe carries every known facet so
+                        ' the resolver matches on its strongest key.
+                        Dim resolvedByResolver = False
+                        If identityResolver IsNot Nothing AndAlso
+                           (String.IsNullOrEmpty(r.DisplayName) OrElse
+                            String.Equals(r.DisplayName, r.PlayerName, StringComparison.Ordinal)) Then
+                            Try
+                                Dim probe = New PlayerSession With {
+                                    .PlatformPersona = r.PlayerName,
+                                    .PlatformUserId = r.PlatformUserId,
+                                    .CharacterId = r.CharacterId,
+                                    .DisplayName = r.DisplayName
+                                }
+                                Dim hit = identityResolver.EnrichBySessionIdentity(r.SessionIdentity, probe)
+                                If hit IsNot Nothing AndAlso
+                                   Not String.IsNullOrEmpty(hit.DisplayName) AndAlso
+                                   Not String.Equals(hit.DisplayName, r.PlayerName, StringComparison.Ordinal) Then
+                                    row.PlayerName = IdentityFormatter.Format(hit.DisplayName, Nothing, r.PlayerName)
+                                    If String.IsNullOrEmpty(row.CharacterId) Then row.CharacterId = hit.CharacterId
+                                    If String.IsNullOrEmpty(row.PlatformUserId) Then row.PlatformUserId = hit.PlatformUserId
+                                    resolvedByResolver = True
+                                End If
+                            Catch
+                                ' Best-effort; fall through to chat fallback.
+                            End Try
+                        End If
+
+                        If Not resolvedByResolver AndAlso
+                           Not String.IsNullOrEmpty(r.PlatformUserId) AndAlso
                            (String.IsNullOrEmpty(r.DisplayName) OrElse
                             String.Equals(r.DisplayName, r.PlayerName, StringComparison.Ordinal)) Then
                             rowsNeedingChatFallback.Add((row, r.SessionIdentity, r.PlatformUserId))
@@ -633,6 +804,7 @@ Namespace GSM.Manager.Core
             Public InstanceName As String
             Public GameId As String
             Public SharedConfigGroupName As String
+            Public SharedConfigFields As Dictionary(Of String, String)
         End Class
 
         ''' <summary>
@@ -680,6 +852,7 @@ Namespace GSM.Manager.Core
                     Distinct().ToList()
 
                 Dim groupNameMap As New Dictionary(Of String, String)(StringComparer.Ordinal)
+                Dim groupFieldsMap As New Dictionary(Of String, Dictionary(Of String, String))(StringComparer.Ordinal)
                 If groupIds.Count > 0 Then
                     Dim groups = db.SharedConfigGroups.
                         Where(Function(g) groupIds.Contains(g.GroupId)).
@@ -688,19 +861,34 @@ Namespace GSM.Manager.Core
                     For Each g In groups
                         groupNameMap(g.GroupId) = g.DisplayName
                     Next
+
+                    ' Phase 7-6 — also pull each linked group's
+                    ' non-sensitive fields (RealmName et al.) so the
+                    ' source label can prefer the canonical RealmName
+                    ' over the per-group DisplayName. Non-sensitive
+                    ' only: the encrypted keys are never decrypted here.
+                    Dim sharedConfigService = scope.ServiceProvider.GetService(Of SharedConfigService)()
+                    If sharedConfigService IsNot Nothing Then
+                        For Each gid In groupIds
+                            groupFieldsMap(gid) = sharedConfigService.LoadNonSensitiveFields(db, gid)
+                        Next
+                    End If
                 End If
 
                 For Each row In instanceData
                     Dim groupName As String = Nothing
+                    Dim groupFields As Dictionary(Of String, String) = Nothing
                     If Not String.IsNullOrEmpty(row.SharedConfigGroupId) Then
                         groupNameMap.TryGetValue(row.SharedConfigGroupId, groupName)
+                        groupFieldsMap.TryGetValue(row.SharedConfigGroupId, groupFields)
                     End If
                     map(row.InstanceId) = New ResolvedInstance With {
                         .NodeName = row.NodeName,
                         .InstallationName = row.InstallationName,
                         .InstanceName = row.InstanceName,
                         .GameId = row.GameId,
-                        .SharedConfigGroupName = groupName
+                        .SharedConfigGroupName = groupName,
+                        .SharedConfigFields = groupFields
                     }
                 Next
             End Using
@@ -740,6 +928,7 @@ Namespace GSM.Manager.Core
                 ctx.InstallationName = resolved.InstallationName
                 ctx.InstanceName = resolved.InstanceName
                 ctx.SharedConfigGroupName = resolved.SharedConfigGroupName
+                ctx.SharedConfigFields = resolved.SharedConfigFields
             End If
 
             ' Dispatch to plugin if the GameId resolves to a
@@ -840,7 +1029,74 @@ Namespace GSM.Manager.Core
                 Dim resolved As String = Nothing
                 If displayNameMap.TryGetValue(key, resolved) AndAlso
                    Not String.IsNullOrEmpty(resolved) Then
+                    ' Update both the coalesced legacy PlayerName
+                    ' (consumed by GsmSlashCommands.BuildPlayersResponse
+                    ' and any other caller that wants "best display
+                    ' name") AND the new CharacterName column, so the
+                    ' History window's Character column also picks up
+                    ' the chat-fallback resolution.
                     tup.Row.PlayerName = resolved
+                    tup.Row.CharacterName = resolved
+                End If
+            Next
+        End Sub
+
+        ''' <summary>
+        ''' Inverse of ApplyChatFallbackDisplayNames: for each chat
+        ''' TimelineRow that carries a PlatformUserId but whose
+        ''' PlatformPersona is empty (the chat entity has no persona
+        ''' column on the wire), look up the most recent
+        ''' PlayerActivity.PlayerName for that (SessionIdentity, pid)
+        ''' pair and bind it. Lets the History window's Player
+        ''' column populate consistently across both chat and
+        ''' activity rows even though only activity rows carry the
+        ''' persona natively.
+        '''
+        ''' Query strategy mirrors ApplyChatFallbackDisplayNames —
+        ''' one indexed lookup per DISTINCT (session, pid) pair,
+        ''' bounded by the small number of distinct chatting
+        ''' players in scope. Players who chatted but never had a
+        ''' Join row written (returning players on a Node whose
+        ''' players-table cache lost the join event — e.g. across
+        ''' a Manager restart that missed the join line) stay
+        ''' empty; we don't fabricate a persona we can't prove.
+        ''' </summary>
+        Private Shared Sub ApplyActivityFallbackPersona(
+                db As GsmDbContext,
+                rowsNeedingFallback As List(Of (Row As TimelineRow, SessionIdentity As String, PlatformUserId As String)))
+            If rowsNeedingFallback Is Nothing OrElse rowsNeedingFallback.Count = 0 Then Return
+
+            Dim uniquePairs = rowsNeedingFallback.
+                Select(Function(t) (SessionIdentity:=t.SessionIdentity, PlatformUserId:=t.PlatformUserId)).
+                Distinct().ToList()
+
+            Dim personaMap As New Dictionary(Of String, String)(StringComparer.Ordinal)
+            For Each pair In uniquePairs
+                Dim sid = pair.SessionIdentity
+                Dim pid = pair.PlatformUserId
+                ' Prefer the most-recent activity row for this pid
+                ' — if the player rejoined under a different login
+                ' string at some point (rare but possible after a
+                ' Steam name change), we want the most current
+                ' persona, not the historical one.
+                Dim persona = db.PlayerActivity.
+                    Where(Function(a) a.SessionIdentity = sid AndAlso
+                                        a.PlatformUserId = pid AndAlso
+                                        a.PlayerName IsNot Nothing).
+                    OrderByDescending(Function(a) a.TimestampUtc).
+                    Select(Function(a) a.PlayerName).
+                    FirstOrDefault()
+                If Not String.IsNullOrEmpty(persona) Then
+                    personaMap(sid & "|" & pid) = persona
+                End If
+            Next
+
+            For Each tup In rowsNeedingFallback
+                Dim key = tup.SessionIdentity & "|" & tup.PlatformUserId
+                Dim resolved As String = Nothing
+                If personaMap.TryGetValue(key, resolved) AndAlso
+                   Not String.IsNullOrEmpty(resolved) Then
+                    tup.Row.PlatformPersona = resolved
                 End If
             Next
         End Sub
@@ -897,13 +1153,17 @@ Namespace GSM.Manager.Core
                 ' don't collapse the same name across tiles. The
                 ' tuple now also carries InstanceId so the snapshot
                 ' row's SourceLabel can resolve through the same
-                ' plugin dispatch the timeline uses.
+                ' plugin dispatch the timeline uses. DisplayName is
+                ' captured too so SnapshotRow.CharacterName can
+                ' surface the in-game character name alongside the
+                ' platform persona — same dual-column treatment as
+                ' the timeline view.
                 Dim present As _
-                    New Dictionary(Of String, (SessionIdentity As String, PlayerName As String, JoinedUtc As DateTime, InstanceId As String))
+                    New Dictionary(Of String, (SessionIdentity As String, PlayerName As String, DisplayName As String, JoinedUtc As DateTime, InstanceId As String))
                 For Each ev In events
                     Dim key = ev.SessionIdentity & "|" & ev.PlayerName
                     If ev.EventKind = "join" Then
-                        present(key) = (ev.SessionIdentity, ev.PlayerName, ev.TimestampUtc, ev.InstanceId)
+                        present(key) = (ev.SessionIdentity, ev.PlayerName, ev.DisplayName, ev.TimestampUtc, ev.InstanceId)
                     ElseIf ev.EventKind = "leave" Then
                         present.Remove(key)
                     End If
@@ -933,6 +1193,8 @@ Namespace GSM.Manager.Core
                         .SessionIdentity = info.SessionIdentity,
                         .TileDisplayName = ResolveDisplayName(tileNames, info.SessionIdentity),
                         .InstanceId = info.InstanceId,
+                        .CharacterName = info.DisplayName,
+                        .PlatformPersona = info.PlayerName,
                         .LastChatText = If(lastChat IsNot Nothing, lastChat.Text, Nothing),
                         .LastChatTimeUtc = If(lastChat IsNot Nothing,
                                               CType(lastChat.TimestampUtc, DateTime?),

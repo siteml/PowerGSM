@@ -62,12 +62,21 @@ Namespace GSM.Node
         '   read troubleshooting output.
         '
         '   The portable alternative is a process-local console
-        '   control handler that ignores CTRL_C_EVENT. The node's
-        '   console stays attached and visible; the CTRL_C our
-        '   GSM.CtrlCSender helper fires (intended for a child) still
-        '   reaches the node but the handler returns TRUE meaning
-        '   "handled, don't terminate"; the child's own handler runs
-        '   the graceful-shutdown path as intended.
+        '   control handler that ignores CTRL_C_EVENT *only while the
+        '   node is itself firing one at a child* (tracked by
+        '   ConsoleCtrlSuppression, set around the GSM.CtrlCSender
+        '   call). The node's console stays attached and visible; the
+        '   CTRL_C our helper fires (intended for a child) may reach
+        '   the node but the handler returns TRUE meaning "handled,
+        '   don't terminate", so the child's own handler runs the
+        '   graceful-shutdown path while the node survives. Crucially,
+        '   a user-typed Ctrl+C arrives with suppression INACTIVE, so
+        '   the handler returns FALSE and the event falls through to
+        '   ASP.NET Core's ConsoleLifetime — which calls
+        '   StopApplication() for a graceful node shutdown (and that
+        '   fires ApplicationStopping -> the shim-detach hook). This
+        '   is why Ctrl+C closing the node works again now that games
+        '   run under shims with their own consoles.
         '
         '   ORDERING TRAP: Win32 console-control handlers are LIFO
         '   (last registered, first called). ASP.NET Core's
@@ -83,8 +92,10 @@ Namespace GSM.Node
         '   has started, via IHostApplicationLifetime.ApplicationStarted.
         '   By then ASP.NET has already inserted its handler; our late
         '   registration goes on top of that, so LIFO calls ours first
-        '   for CTRL_C. Returning TRUE stops the chain before
-        '   ASP.NET's handler can run. The early registration is kept
+        '   for CTRL_C. When suppression is active we return TRUE to
+        '   stop the chain before ASP.NET's handler can run; when it's
+        '   inactive we return FALSE so ASP.NET's handler DOES run and
+        '   gracefully stops the node. The early registration is kept
         '   too as a defence-in-depth for any CTRL_C that arrives
         '   during the brief startup window before ApplicationStarted
         '   fires.
@@ -108,10 +119,17 @@ Namespace GSM.Node
         ' or collect it while the OS still holds the function pointer.
         Private ReadOnly _consoleCtrlHandler As ConsoleCtrlDelegate =
             Function(ctrlType As UInteger) As Boolean
-                If ctrlType = CTRL_C_EVENT Then
+                If ctrlType = CTRL_C_EVENT AndAlso ConsoleCtrlSuppression.Active Then
+                    ' Our own GSM.CtrlCSender broadcast bouncing back: swallow it
+                    ' so stopping a game doesn't terminate the node.
                     Return True   ' "handled, do not terminate"
                 End If
-                Return False      ' Let the default handler run
+                ' User-typed Ctrl+C (suppression inactive) falls through so
+                ' ASP.NET Core's ConsoleLifetime runs StopApplication() and the
+                ' node shuts down gracefully (firing ApplicationStopping -> the
+                ' shim-detach hook). Break/Close/Logoff/Shutdown also fall
+                ' through to default handling.
+                Return False
             End Function
 
         Private Delegate Function ConsoleCtrlDelegate(ctrlType As UInteger) As Boolean
@@ -121,7 +139,59 @@ Namespace GSM.Node
                                                 add As Boolean) As Boolean
         End Function
 
+        ' For --shim-self-test: a WinExe has no console of its own, so attach
+        ' to the launching cmd's console (if any) before writing results.
+        <Runtime.InteropServices.DllImport("kernel32.dll", SetLastError:=True)>
+        Private Function AttachConsole(dwProcessId As UInteger) As Boolean
+        End Function
+
+        Private Const ATTACH_PARENT_PROCESS As UInteger = &HFFFFFFFFUI
+
         Sub Main(args As String())
+
+            ' Diagnostic mode: drive a real ShimSession against the deployed
+            ' shim and exit, without spinning up the web host. See ShimSelfTest.
+            If args IsNot Nothing AndAlso Array.IndexOf(args, "--shim-self-test") >= 0 Then
+                If OperatingSystem.IsWindows() Then
+                    Try
+                        AttachConsole(ATTACH_PARENT_PROCESS)
+                    Catch
+                    End Try
+                End If
+                Dim rc As Integer = ShimSelfTest.RunAsync().GetAwaiter().GetResult()
+                Environment.Exit(rc)
+            End If
+
+            ' Diagnostic mode: prove adopt-on-restart (start under a shim,
+            ' detach leaving it alive, adopt from a fresh ShimSession, assert
+            ' same game pid + replayed output). See ShimReconnectTest.
+            If args IsNot Nothing AndAlso Array.IndexOf(args, "--shim-reconnect-test") >= 0 Then
+                If OperatingSystem.IsWindows() Then
+                    Try
+                        AttachConsole(ATTACH_PARENT_PROCESS)
+                    Catch
+                    End Try
+                End If
+                Dim rc As Integer = ShimReconnectTest.RunAsync().GetAwaiter().GetResult()
+                Environment.Exit(rc)
+            End If
+
+            ' Diagnostic mode: stage the live binary as GSM.Node.new through the
+            ' real chunked staging path, then (unless --stage-only) trigger the
+            ' running node's apply-update over loopback. Exercises slice-6
+            ' self-update end to end without the Manager or any manual HTTP.
+            ' See SelfUpdateDryRun.
+            If args IsNot Nothing AndAlso Array.IndexOf(args, "--self-update-dry-run") >= 0 Then
+                If OperatingSystem.IsWindows() Then
+                    Try
+                        AttachConsole(ATTACH_PARENT_PROCESS)
+                    Catch
+                    End Try
+                End If
+                Dim stageOnly As Boolean = Array.IndexOf(args, "--stage-only") >= 0
+                Dim rc As Integer = SelfUpdateDryRun.RunAsync(stageOnly).GetAwaiter().GetResult()
+                Environment.Exit(rc)
+            End If
 
             If OperatingSystem.IsWindows() Then
                 SetErrorMode(SEM_FAILCRITICALERRORS Or SEM_NOGPFAULTERRORBOX Or SEM_NOOPENFILEERRORBOX)
@@ -184,6 +254,7 @@ Namespace GSM.Node
             builder.Services.AddSingleton(Of RconClientManager)()
             builder.Services.AddSingleton(Of InstallRunner)()
             builder.Services.AddSingleton(Of MapGenerationRunner)()
+            builder.Services.AddSingleton(Of SelfUpdateService)()
 
             ' ---- Security services ----
             builder.Services.AddSingleton(Of AuthFailureTracker)()
@@ -253,6 +324,26 @@ Namespace GSM.Node
                 ' Logging failure must never block startup.
             End Try
 
+            ' If node.db was found corrupt and reset during EnsureCreated, say so
+            ' loudly now that the logger exists. The lost rows (snapshots, crash
+            ' counts, chat mirror, tailer cursors) are node-local cache: the
+            ' Manager re-pushes config/rules and the shim sweep below rediscovers
+            ' any running games, so a reset is recoverable, not catastrophic.
+            If Not String.IsNullOrEmpty(db.LastCorruptionBackup) Then
+                Try
+                    app.Services.
+                        GetRequiredService(Of ILoggerFactory)().
+                        CreateLogger("GSM.Node").
+                        LogWarning(
+                            "node.db was corrupt on startup and has been reset to an empty database. " &
+                            "The damaged file was preserved at {Backup}. Node-local cache (instance " &
+                            "snapshots, crash history, chat mirror, tailer cursors) was lost; running games " &
+                            "will be rediscovered from their shims and the Manager will re-push configuration.",
+                            db.LastCorruptionBackup)
+                Catch
+                End Try
+            End If
+
             ' ---- Adopt previously-spawned game processes ----
             ' Re-attach to game-server processes that outlived the
             ' last node session. Reads InstanceSnapshots, verifies
@@ -272,6 +363,15 @@ Namespace GSM.Node
             Try
                 Dim pm = app.Services.GetRequiredService(Of ProcessManager)()
                 pm.AdoptSnapshots()
+
+                ' Phase 8-3 — rediscover live shims the snapshot pass didn't
+                ' cover (e.g. a lost or corrupt node.db) by enumerating the OS
+                ' shim namespace and lean-adopting any running shim not already
+                ' adopted. Runs AFTER the snapshot pass so snapshot-backed
+                ' instances keep their full recovery payload; the sweep only
+                ' fills the gaps. Same synchronous startup context, and the
+                ' sweep is internally try-guarded per endpoint.
+                pm.SweepAdoptLiveShims()
             Catch ex As Exception
                 Try
                     Dim adoptLogger = app.Services.
@@ -285,8 +385,113 @@ Namespace GSM.Node
                 End Try
             End Try
 
+            ' ---- Clean-shutdown shim detach (Phase 8-1) ----
+            ' On a graceful Node stop/restart (Ctrl+C, SIGTERM, service stop),
+            ' tell each shim to Detach so its game keeps running and the shim
+            ' waits for the next Node. Registered after adoption so the pm is
+            ' built. ApplicationStopping does NOT fire on a hard kill — but a
+            ' hard kill just drops the pipe, which the shim also treats as
+            ' "keep the game and wait", so survival doesn't depend on this hook;
+            ' it only suppresses a spurious lost-Node on the shim side.
+            Try
+                Dim lifetimeForShim = app.Services.GetRequiredService(Of IHostApplicationLifetime)()
+                Dim pmForShutdown = app.Services.GetRequiredService(Of ProcessManager)()
+                lifetimeForShim.ApplicationStopping.Register(
+                    Sub() pmForShutdown.DetachShimsForShutdown())
+            Catch
+                ' Non-fatal: without this, a clean shutdown still drops the
+                ' pipe and the shim keeps the game; we just skip the tidy Detach.
+            End Try
+
+            ' ---- Phase 8-2 slice 8b-2 — confirm a systemd self-update is healthy ----
+            ' Under systemd the unit's ExecStartPre drops a "<node>.update-pending"
+            ' marker when it applies a staged update, and reverts to .old on the
+            ' next start if the marker is still there (the update never proved
+            ' healthy). Clear the marker once the host has been up for a short
+            ' grace period, so a binary that comes up then crashes inside the
+            ' window still rolls back. The file only exists right after a systemd
+            ' update apply; the delete is a harmless no-op otherwise (Windows /
+            ' bare nodes use the NodeSetup survivor's own health gate instead).
+            Try
+                Dim lifetimeForUpdate = app.Services.GetRequiredService(Of IHostApplicationLifetime)()
+                lifetimeForUpdate.ApplicationStarted.Register(AddressOf ScheduleUpdateMarkerClear)
+            Catch
+                ' Non-fatal: a lingering marker only affects the NEXT start after
+                ' an update apply, and the operator can delete it by hand.
+            End Try
+
+            ' ---- Phase 8-2 — Node self-update exit code (capture before Run) ----
+            ' app.Run() disposes the host and its DI container when it returns,
+            ' so the SelfUpdateService must be resolved BEFORE Run — resolving it
+            ' afterwards throws ObjectDisposedException (which previously got
+            ' swallowed, so the node always exited 0 and systemd never restarted
+            ' it after an update-exit). We hold the reference here; the instance
+            ' stays alive and reading its flags post-shutdown is fine.
+            Dim selfUpdateForExit As SelfUpdateService = Nothing
+            Try
+                selfUpdateForExit = app.Services.GetService(Of SelfUpdateService)()
+            Catch
+                ' If resolution fails, the update-exit simply falls back to a
+                ' clean exit; never block startup over it.
+            End Try
+
             app.Run()
 
+            ' app.Run() returns once the host has fully stopped. If the stop was
+            ' an update-exit relying on systemd's Restart=on-failure to bring us
+            ' back (Linux under systemd), exit non-zero so systemd relaunches;
+            ' the idempotent ExecStartPre swap moves GSM.Node.new into place
+            ' first. A clean exit (0) here is either a normal shutdown or an
+            ' update-exit where NodeSetup owns the relaunch.
+            If selfUpdateForExit IsNot Nothing AndAlso
+               selfUpdateForExit.UpdateExitRequested AndAlso
+               selfUpdateForExit.ExitNonZeroForSystemd Then
+                Environment.Exit(SelfUpdateService.UpdateExitCode)
+            End If
+
+        End Sub
+
+        ' ---- Phase 8-2 slice 8b-2 — systemd self-update health marker ----
+
+        Private Const UpdatePendingMarkerSuffix As String = ".update-pending"
+        Private Const UpdateHealthyGraceMs As Integer = 15000
+
+        ''' <summary>
+        ''' Fired on ApplicationStarted. Schedules a delayed clear of the
+        ''' systemd self-update marker so a node that comes up and then crashes
+        ''' inside the grace window still leaves the marker for the unit's
+        ''' ExecStartPre to roll back on the next start.
+        ''' </summary>
+        Private Sub ScheduleUpdateMarkerClear()
+            ' Fire-and-forget; the delay + delete runs off the startup thread.
+            Task.Run(AddressOf ClearUpdatePendingMarkerAfterGraceAsync)
+        End Sub
+
+        ''' <summary>Waits the grace period, then clears the update marker.</summary>
+        Private Async Function ClearUpdatePendingMarkerAfterGraceAsync() As Task
+            Try
+                Await Task.Delay(UpdateHealthyGraceMs)
+                ClearUpdatePendingMarker()
+            Catch
+                ' Best effort: a lingering marker only affects the NEXT start
+                ' after an update, and the operator can remove it manually.
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Deletes the "&lt;node&gt;.update-pending" marker beside the live binary
+        ''' if present — the signal the systemd survivor uses to know the applied
+        ''' update came up healthy. No-op when absent (every non-update start,
+        ''' and all Windows / bare nodes).
+        ''' </summary>
+        Private Sub ClearUpdatePendingMarker()
+            Try
+                Dim exeName = If(OperatingSystem.IsWindows(), "GSM.Node.exe", "GSM.Node")
+                Dim marker = Path.Combine(AppContext.BaseDirectory, exeName & UpdatePendingMarkerSuffix)
+                If File.Exists(marker) Then File.Delete(marker)
+            Catch
+                ' Best effort.
+            End Try
         End Sub
 
         ''' <summary>
@@ -377,6 +582,20 @@ Namespace GSM.Node
         Public Property MetricsIntervalSeconds As Integer = 5
 
         ''' <summary>
+        ''' Kill-switch for the Phase 8-1 per-instance shim supervisor.
+        ''' When False (default), Strategy A (stdout-captured) instances
+        ''' run their game under a GSM.Shim supervisor so a Node restart
+        ''' doesn't sever the game's stdio. When True, Strategy A falls
+        ''' back to the legacy in-Node spawn. Strategy B/C are unaffected
+        ''' (they move under the shim in a later slice).
+        '''
+        ''' NOTE: until graceful stop lands (Phase 8 slice 5), a shim-mode
+        ''' Stop hard-kills the game (no save-and-quit). Set this True on
+        ''' nodes hosting save-sensitive games until then.
+        ''' </summary>
+        Public Property DisableShim As Boolean = False
+
+        ''' <summary>
         ''' Default parent directory for new game-server installations.
         ''' Defaults to a sibling "servers" folder next to the node
         ''' executable so a fresh install just works without the user
@@ -457,10 +676,86 @@ Namespace GSM.Node
             _connectionString = $"Data Source={dbPath}"
         End Sub
 
+        ' SQLite extended-result codes for a damaged / foreign database file.
+        Private Const SQLITE_CORRUPT As Integer = 11   ' "database disk image is malformed"
+        Private Const SQLITE_NOTADB As Integer = 26    ' "file is not a database"
+
+        Private _lastCorruptionBackup As String
+
         ''' <summary>
-        ''' Creates tables if they do not exist.
+        ''' If EnsureCreated found node.db corrupt and reset it, the path the bad
+        ''' file was preserved at; Nothing otherwise. NodeProgram logs this once
+        ''' the logger is up.
+        ''' </summary>
+        Public ReadOnly Property LastCorruptionBackup As String
+            Get
+                Return _lastCorruptionBackup
+            End Get
+        End Property
+
+        ''' <summary>
+        ''' Creates tables if they do not exist. Self-heals a corrupt node.db:
+        ''' SQLITE_CORRUPT / SQLITE_NOTADB on open or first DDL would otherwise
+        ''' crash the node on startup (and crash-loop it under systemd). On those
+        ''' two codes ONLY, the bad file is renamed aside (node.db.corrupt-&lt;ts&gt;)
+        ''' and recreated empty — losing only node-local cache (snapshots, crash
+        ''' counts, chat mirror, tailer cursors), which the Manager re-pushes and
+        ''' the shim sweep rediscovers. Any other SqliteException (locked, busy,
+        ''' readonly, ...) is NOT corruption and propagates unchanged.
         ''' </summary>
         Public Sub EnsureCreated()
+            Try
+                EnsureCreatedCore()
+            Catch ex As SqliteException When ex.SqliteErrorCode = SQLITE_CORRUPT OrElse
+                                              ex.SqliteErrorCode = SQLITE_NOTADB
+                BackupAndDeleteCorruptDb()
+                EnsureCreatedCore()   ' retry once on a fresh, empty file
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Renames a corrupt node.db aside (preserved for forensics) and clears
+        ''' its sidecars so EnsureCreatedCore can recreate an empty DB. Records
+        ''' the backup path in LastCorruptionBackup for NodeProgram to log once
+        ''' the logger exists.
+        ''' </summary>
+        Private Sub BackupAndDeleteCorruptDb()
+            ' Drop pooled handles so the file isn't locked when we move it.
+            Try
+                SqliteConnection.ClearAllPools()
+            Catch
+            End Try
+            Dim dbPath = Path.Combine(_dataDir, "node.db")
+            Dim stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss")
+            Dim backup = Path.Combine(_dataDir, $"node.db.corrupt-{stamp}")
+            Try
+                If File.Exists(dbPath) Then
+                    File.Move(dbPath, backup)
+                    _lastCorruptionBackup = backup
+                End If
+            Catch
+                ' If the move fails, fall back to delete so the node can at least
+                ' start on a fresh DB.
+                Try
+                    If File.Exists(dbPath) Then File.Delete(dbPath)
+                Catch
+                End Try
+            End Try
+            ' Best-effort: clear transient sidecars so the new DB starts clean.
+            For Each suffix In {"-wal", "-shm", "-journal"}
+                Try
+                    Dim sidecar = dbPath & suffix
+                    If File.Exists(sidecar) Then File.Delete(sidecar)
+                Catch
+                End Try
+            Next
+        End Sub
+
+        ''' <summary>
+        ''' Creates tables if they do not exist (the original body, now wrapped
+        ''' by EnsureCreated's corruption guard).
+        ''' </summary>
+        Private Sub EnsureCreatedCore()
             Using conn As New SqliteConnection(_connectionString)
                 conn.Open()
 
@@ -535,7 +830,9 @@ Namespace GSM.Node
                 ' restart: ExePath, Arguments, WorkingDirectory,
                 ' LogFilePathsJson, ParseRulesJson, Strategy,
                 ' StdoutIsLog, RequiresConsoleIsolation,
-                ' LogTailerStartDelayMs. Discovered via
+                ' LogTailerStartDelayMs; and the Phase 8-1 shim columns
+                ' ShimEndpoint, ShimPid, ShimProtocolVersion, ExecutionMode
+                ' (ExecutionMode 0 = Direct, the legacy path). Discovered via
                 ' PRAGMA table_info so an upgraded node with
                 ' pre-existing snapshots from the prior schema
                 ' picks up the additions exactly once, and a fresh
@@ -572,7 +869,11 @@ Namespace GSM.Node
                     ("Strategy", "INTEGER NOT NULL DEFAULT 0"),
                     ("StdoutIsLog", "INTEGER NOT NULL DEFAULT 0"),
                     ("RequiresConsoleIsolation", "INTEGER NOT NULL DEFAULT 0"),
-                    ("LogTailerStartDelayMs", "INTEGER NOT NULL DEFAULT 5000")
+                    ("LogTailerStartDelayMs", "INTEGER NOT NULL DEFAULT 5000"),
+                    ("ShimEndpoint", "TEXT"),
+                    ("ShimPid", "INTEGER NOT NULL DEFAULT 0"),
+                    ("ShimProtocolVersion", "INTEGER NOT NULL DEFAULT 0"),
+                    ("ExecutionMode", "INTEGER NOT NULL DEFAULT 0")
                 }
 
                 For Each col In columnsToAdd
@@ -661,16 +962,22 @@ Namespace GSM.Node
                                         strategy As Integer,
                                         stdoutIsLog As Boolean,
                                         requiresConsoleIsolation As Boolean,
-                                        logTailerStartDelayMs As Integer)
+                                        logTailerStartDelayMs As Integer,
+                                        Optional shimEndpoint As String = Nothing,
+                                        Optional shimPid As Integer = 0,
+                                        Optional shimProtocolVersion As Integer = 0,
+                                        Optional executionMode As Integer = 0)
             Using conn = OpenConnection()
                 Using cmd = conn.CreateCommand()
                     cmd.CommandText = "INSERT OR REPLACE INTO InstanceSnapshots
                         (InstanceId, State, Pid, StartedAtUtc, CrashPolicyJson, StopIntentPending,
                          ExePath, Arguments, WorkingDirectory, LogFilePathsJson, ParseRulesJson,
-                         Strategy, StdoutIsLog, RequiresConsoleIsolation, LogTailerStartDelayMs)
+                         Strategy, StdoutIsLog, RequiresConsoleIsolation, LogTailerStartDelayMs,
+                         ShimEndpoint, ShimPid, ShimProtocolVersion, ExecutionMode)
                         VALUES (@id, @state, @pid, @started, @policy, @intent,
                                 @exe, @args, @cwd, @logs, @rules,
-                                @strategy, @stdoutLog, @iso, @delay)"
+                                @strategy, @stdoutLog, @iso, @delay,
+                                @shimEndpoint, @shimPid, @shimProto, @execMode)"
                     cmd.Parameters.AddWithValue("@id", instanceId)
                     cmd.Parameters.AddWithValue("@state", state)
                     cmd.Parameters.AddWithValue("@pid", pid)
@@ -686,6 +993,10 @@ Namespace GSM.Node
                     cmd.Parameters.AddWithValue("@stdoutLog", If(stdoutIsLog, 1, 0))
                     cmd.Parameters.AddWithValue("@iso", If(requiresConsoleIsolation, 1, 0))
                     cmd.Parameters.AddWithValue("@delay", logTailerStartDelayMs)
+                    cmd.Parameters.AddWithValue("@shimEndpoint", If(shimEndpoint, CObj(DBNull.Value)))
+                    cmd.Parameters.AddWithValue("@shimPid", shimPid)
+                    cmd.Parameters.AddWithValue("@shimProto", shimProtocolVersion)
+                    cmd.Parameters.AddWithValue("@execMode", executionMode)
                     cmd.ExecuteNonQuery()
                 End Using
             End Using
@@ -710,7 +1021,8 @@ Namespace GSM.Node
                 Using cmd = conn.CreateCommand()
                     cmd.CommandText = "SELECT InstanceId, State, Pid, StartedAtUtc, CrashPolicyJson, StopIntentPending,
                                               ExePath, Arguments, WorkingDirectory, LogFilePathsJson, ParseRulesJson,
-                                              Strategy, StdoutIsLog, RequiresConsoleIsolation, LogTailerStartDelayMs
+                                              Strategy, StdoutIsLog, RequiresConsoleIsolation, LogTailerStartDelayMs,
+                                              ShimEndpoint, ShimPid, ShimProtocolVersion, ExecutionMode
                                        FROM InstanceSnapshots"
                     Using reader = cmd.ExecuteReader()
                         While reader.Read()
@@ -753,6 +1065,10 @@ Namespace GSM.Node
                             row.StdoutIsLog = Not reader.IsDBNull(12) AndAlso reader.GetInt32(12) <> 0
                             row.RequiresConsoleIsolation = Not reader.IsDBNull(13) AndAlso reader.GetInt32(13) <> 0
                             row.LogTailerStartDelayMs = If(reader.IsDBNull(14), 5000, reader.GetInt32(14))
+                            row.ShimEndpoint = If(reader.IsDBNull(15), Nothing, reader.GetString(15))
+                            row.ShimPid = If(reader.IsDBNull(16), 0, reader.GetInt32(16))
+                            row.ShimProtocolVersion = If(reader.IsDBNull(17), 0, reader.GetInt32(17))
+                            row.ExecutionMode = If(reader.IsDBNull(18), 0, reader.GetInt32(18))
                             rows.Add(row)
                         End While
                     End Using
@@ -904,6 +1220,10 @@ Namespace GSM.Node
         Public Property StdoutIsLog As Boolean
         Public Property RequiresConsoleIsolation As Boolean
         Public Property LogTailerStartDelayMs As Integer
+        Public Property ShimEndpoint As String
+        Public Property ShimPid As Integer
+        Public Property ShimProtocolVersion As Integer
+        Public Property ExecutionMode As Integer
     End Class
 
 End Namespace

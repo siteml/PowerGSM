@@ -1,5 +1,5 @@
-' <plugin id="conanexiles" name="Conan Exiles Dedicated Server" version="1.0.0" author="siteml" requiresContracts="1">
-' <RequiresContracts: 1>
+' <plugin id="conanexiles" name="Conan Exiles Dedicated Server" version="1.0.0" author="siteml" requiresContracts="2">
+' <RequiresContracts: 2>
 Imports System
 Imports System.Collections.Generic
 Imports System.IO
@@ -59,12 +59,13 @@ Imports GSM.Plugin
 '                           gates an internal beta with a password
 '
 '  Key config fields (instance-level):
-'    ServerName          — in-game server browser. Mirrored to
-'                           Engine.ini's [OnlineSubsystem]
-'                           ServerName by the file editor for
-'                           operators who prefer setting it
-'                           there. Configuration tab launch arg
-'                           wins at runtime.
+'    ServerName          — in-game server browser. Rendered into
+'                           Engine.ini [OnlineSubsystem] at launch
+'                           (off the URL, which mangled names with
+'                           spaces/unicode).
+'    ServerPassword      — connect password. Rendered into Engine.ini
+'                           [OnlineSubsystem] at launch; blank keeps
+'                           the file value, Clear checkbox empties it.
 '    Port                — game UDP, default 7777
 '    QueryPort           — Steam query UDP, default 27015
 '    RconPort            — RCON TCP, default 25575 (via InstanceConfig)
@@ -73,22 +74,23 @@ Imports GSM.Plugin
 '    MaxPlayers          — server slot count, default 40
 '    Multihome           — optional IP bind override
 '
-'  Where ServerPassword goes (NOT a Configuration-tab field):
-'    Conan reads the connect password from Engine.ini's
-'    [OnlineSubsystem] ServerPassword. Per Funcom's official
-'    dedicated-server documentation. Surfacing ServerPassword as
-'    a launch-URL ?param looked like it should work but produced
-'    PacketHandlerLog AESDecryptionFailed errors on every
-'    connect — the URL value never propagates to the
-'    OnlineSubsystem code path, so the AES key derived from the
-'    server's effective password drifts away from the one the
-'    client computes from the user-typed password, and the
-'    decryption mismatch surfaces at the network layer instead
-'    of the application layer (vanilla UE4 would have emitted a
-'    "wrong password" message; Conan's customised handshake
-'    fails earlier). The plugin therefore exposes ServerPassword
-'    only via the Engine.ini structured editor (Network tab),
-'    where it lives in the file Conan actually reads.
+'  Where ServerName + ServerPassword go (rendered, not on args):
+'    Conan reads both from Engine.ini's [OnlineSubsystem] section.
+'    A launch-URL ?ServerPassword= silently fails — the value never
+'    reaches the OnlineSubsystem code path, so the AES key drifts
+'    and connects die with PacketHandlerLog AESDecryptionFailed at
+'    the network layer instead of a clean "wrong password". And a
+'    ?ServerName= mangles names with spaces/unicode through UE's
+'    URL parser. So both are Configuration-tab fields that
+'    IStartupFileProvider.RenderStartupFile writes into Engine.ini
+'    [OnlineSubsystem] just before launch; neither is on the
+'    command line. ServerName always writes (blank → default name);
+'    ServerPassword is preserve-if-blank with an explicit Clear
+'    checkbox, so upgrading from the old Engine.ini-editor version
+'    doesn't wipe a set password (re-enter it on the Configuration
+'    tab, or tick Clear to open the server). Single-ownership: the
+'    old structured "Network (Engine.ini)" editor tab is removed;
+'    raw Engine.ini stays editable via the .ini file browser.
 '
 '  Where AdminPassword goes (NOT a Configuration-tab field):
 '    Conan reads AdminPassword from ServerSettings.ini's
@@ -114,6 +116,7 @@ Public Class ConanExilesPlugin
     Implements IManagedDirectoriesProvider
     Implements IInstanceFileEditorProvider
     Implements ILaunchOptionsProvider
+    Implements IStartupFileProvider
 
     Public ReadOnly Property GameId As String = "conanexiles" Implements IGamePlugin.GameId
     Public ReadOnly Property DisplayName As String = "Conan Exiles" Implements IGamePlugin.DisplayName
@@ -296,20 +299,14 @@ Public Class ConanExilesPlugin
         url.Append("?MaxPlayers=")
         url.Append(maxPlayers)
 
-        Dim serverName = GetField(config.CustomFields, "ServerName")
-        If Not String.IsNullOrEmpty(serverName) Then
-            url.Append("?ServerName=")
-            url.Append(EscapeUrlValue(serverName))
-        End If
-
-        ' ServerPassword is intentionally NOT emitted on the launch
-        ' URL — Conan reads it from Engine.ini's [OnlineSubsystem]
-        ' ServerPassword instead, and a URL value silently fails to
-        ' propagate to the OnlineSubsystem code path. Result is
-        ' AESDecryptionFailed at connect time. The Engine.ini
-        ' structured editor (Network tab) is the only supported way
-        ' to set it. See the file-header comment for the full
-        ' rationale.
+        ' ServerName and ServerPassword are intentionally NOT emitted
+        ' on the launch URL. Conan reads both from Engine.ini's
+        ' [OnlineSubsystem] section; IStartupFileProvider.RenderStartupFile
+        ' writes them there just before launch. A URL ?ServerName=
+        ' mangles names with spaces/unicode through UE's URL parser,
+        ' and a URL ?ServerPassword= silently fails to reach the
+        ' OnlineSubsystem code path (AESDecryptionFailed at connect).
+        ' See the file-header comment for the full rationale.
 
         ' AdminPassword used to be appended here as ?AdminPassword=X
         ' on the launch URL. It now lives in ServerSettings.ini's
@@ -369,14 +366,44 @@ Public Class ConanExilesPlugin
     End Function
 
     Public Function ValidateConfig(config As InstanceConfig) As IReadOnlyList(Of String) Implements IGamePlugin.ValidateConfig
-        ' No instance-level validation currently. The AdminPassword
-        ' check that lived here through Phase 5g-2 moved with the
-        ' field to ServerSettings.ini — the file-editor schema's
-        ' IsRequired flag covers that surface now. Function kept as
-        ' a no-op stub because IGamePlugin requires the
-        ' implementation; future instance-level validations land
-        ' here if any arise.
-        Return New List(Of String)
+        ' The one instance-level validation Conan needs is the
+        ' "pinger" port reservation. Funcom hard-codes the pinger
+        ' port — the UDP port the in-game server browser pings to
+        ' decide whether a server is alive — to GAME PORT + 1. There
+        ' is no command-line flag or INI entry to move it. If any
+        ' other UDP port the operator configures lands on game port
+        ' + 1, the bind collides with the pinger and the server
+        ' silently never appears in the browser: no error, no log
+        ' line, just an invisible-but-running server. So we treat
+        ' game port + 1 as reserved and reject a Query Port that
+        ' lands on it (or on the game port itself).
+        '
+        ' NOTE (cross-instance gap): this catches THIS instance's
+        ' Query Port against its OWN pinger. The global PortAllocator
+        ' still doesn't know game+1 is occupied, so it can't stop a
+        ' DIFFERENT instance's game/query port from landing on this
+        ' one's pinger. Closing that needs an allocator/contract
+        ' change (a derived-/reserved-port declaration) rather than
+        ' a plugin-only edit — low frequency given Conan is one
+        ' instance per installation, parked as a follow-up.
+        '
+        ' AdminPassword validation that lived here through Phase
+        ' 5g-2 moved with the field to ServerSettings.ini — the
+        ' file-editor schema's IsRequired flag covers that now.
+        Dim issues As New List(Of String)
+        If config Is Nothing Then Return issues
+
+        Dim port = GetFieldInt(config.CustomFields, "Port", 7777)
+        Dim queryPort = GetFieldInt(config.CustomFields, "QueryPort", 27015)
+        Dim pingerPort = port + 1
+
+        If queryPort = pingerPort Then
+            issues.Add($"Query Port ({queryPort}) lands on the hard-coded pinger port (game port + 1 = {pingerPort}). The pinger port is fixed by the engine and used by the server browser to detect the server — a Query Port that collides with it leaves the server invisible in the list even though it's running. Move the Query Port off {pingerPort} (the 27015 default, or game port + 2, are both safe).")
+        ElseIf queryPort = port Then
+            issues.Add($"Query Port and Game Port are both {port}. They must be different UDP ports — and note the engine also reserves game port + 1 ({pingerPort}) for the pinger, so keep the Query Port clear of that too.")
+        End If
+
+        Return issues
     End Function
 
     ' ============================================================
@@ -411,9 +438,23 @@ Public Class ConanExilesPlugin
             New ConfigFieldDescriptor With {
                 .Key = "ServerName",
                 .Label = "Server Name",
-                .Description = "Appears in the in-game server browser. Avoid special characters that need URL escaping — engine parses this off the launch URL. (Also exposed on the Network (Engine.ini) tab for operators who prefer setting it there; the launch URL wins at runtime.)",
+                .Description = "Appears in the in-game server browser. PowerGSM writes this into Engine.ini [OnlineSubsystem] at launch, so spaces and special characters are fine (it's no longer parsed off the launch URL).",
                 .FieldType = ConfigFieldType.Text,
                 .DefaultValue = "PowerGSM Conan Server"
+            },
+            New ConfigFieldDescriptor With {
+                .Key = "ServerPassword",
+                .Label = "Server Password (connect)",
+                .Description = "Password players must enter to join. Leave blank for an open server. PowerGSM writes this into Engine.ini [OnlineSubsystem] at launch (the file Conan actually reads — a launch-URL value causes AESDecryptionFailed). Leaving it blank KEEPS whatever password is already in Engine.ini; to remove a password, blank this and tick ""Clear server password"" below.",
+                .FieldType = ConfigFieldType.Password,
+                .IsSensitive = True
+            },
+            New ConfigFieldDescriptor With {
+                .Key = "ClearServerPassword",
+                .Label = "Clear server password",
+                .Description = "Only acts when the password box above is blank. Tick this to write an EMPTY password into Engine.ini at launch (making the server open). Leave unticked to keep the existing password — this is what stops an upgrade from wiping a previously-set password.",
+                .FieldType = ConfigFieldType.BooleanField,
+                .DefaultValue = "false"
             },
             New ConfigFieldDescriptor With {
                 .Key = "MaxPlayers",
@@ -427,17 +468,24 @@ Public Class ConanExilesPlugin
             New ConfigFieldDescriptor With {
                 .Key = "Port",
                 .Label = "Game Port (UDP)",
-                .Description = "Game traffic port. Funcom warns: Engine.ini's Port setting does NOT work — this command-line value is what actually takes effect.",
+                .Description = "Game traffic port. Funcom warns: Engine.ini's Port setting does NOT work — this command-line value is what actually takes effect. (See the pinger note below about game port + 1.)",
                 .FieldType = ConfigFieldType.IntegerField,
                 .DefaultValue = "7777",
                 .MinValue = 1024,
                 .MaxValue = 65535,
-                .IsPort = True
+                .IsPort = True,
+                .ReservedPortOffsets = New List(Of Integer) From {1}
+            },
+            New ConfigFieldDescriptor With {
+                .Key = "_pinger_notice",
+                .Label = "Game port + 1 is reserved for the pinger",
+                .Description = "The next UDP port after the game port (game port + 1 — e.g. 7778 when the game port is 7777) is hard-coded as the ""pinger"" and MUST be left open. The in-game server browser pings it to detect the server; there is no config or command-line way to move it. Don't assign it to the Query Port or to another instance, or the server won't appear in the list even though it's running.",
+                .FieldType = ConfigFieldType.Notice
             },
             New ConfigFieldDescriptor With {
                 .Key = "QueryPort",
                 .Label = "Query Port (UDP)",
-                .Description = "Steam query port. Used by the server browser to find the server.",
+                .Description = "Steam query port. Used by the server browser to find the server. Keep it off game port + 1 (the pinger — see the note above). The 27015 default is safe.",
                 .FieldType = ConfigFieldType.IntegerField,
                 .DefaultValue = "27015",
                 .MinValue = 1024,
@@ -804,6 +852,11 @@ Public Class ConanExilesPlugin
                 .Body = "Funcom doesn't ship a native Linux build of the Conan Exiles dedicated server. Install on a Linux node will fail at launch. The community workaround (Wine + xvfb) is outside this plugin's scope — if you need Linux hosting, run a Windows VM."
             },
             New InstallationNotice With {
+                .Severity = NoticeSeverity.Warning,
+                .Title = "Reserve the pinger port (game port + 1)",
+                .Body = "Conan hard-codes a 'pinger' port at game port + 1 (UDP) — the server browser pings it to decide whether the server is alive, and there's no config or command-line way to move it. Leave game port + 1 free: don't set the Query Port (or any other UDP port) to it, or the server won't appear in the browser even though it's running. The default ports (game 7777, query 27015) are already clear of it."
+            },
+            New InstallationNotice With {
                 .Severity = NoticeSeverity.Information,
                 .Title = "Pick your Build before installing",
                 .Body = "Enhanced (UE5) is the current default — Funcom's May 2026 upgrade. Legacy (UE4) stays on Steam under the 'conan-exiles-legacy' beta branch, useful if you have a mod-heavy server that isn't yet UE5-compatible. Both branches share saves and config layout; switching later is an Update operation, not a fresh install."
@@ -905,10 +958,9 @@ Public Class ConanExilesPlugin
     End Function
 
     ' ============================================================
-    '  IInstanceFileEditorProvider — ServerSettings.ini + Engine.ini
-    '  editors
+    '  IInstanceFileEditorProvider — ServerSettings.ini editor
     '
-    '  Two editors surface as structured forms on the InstancePanel:
+    '  One editor surfaces as a structured form on the InstancePanel:
     '
     '    Server Settings tab → ServerSettings.ini, [ServerSettings]
     '      section. Gameplay-rule knobs (PvP, multipliers, decay).
@@ -917,39 +969,25 @@ Public Class ConanExilesPlugin
     '      unchanged via WriteValuesToFile's preserve-existing-
     '      text behaviour.
     '
-    '    Network (Engine.ini) tab → Engine.ini, [OnlineSubsystem]
-    '      section. The two server-identity fields Funcom's docs
-    '      explicitly route here: ServerName and ServerPassword.
-    '      Other [OnlineSubsystem] entries (notably BuildIdOverride
-    '      / bUseBuildIdOverride, which per Inflexion's
-    '      troubleshooting guide can prevent clients connecting
-    '      after Enhanced-build upgrades) round-trip verbatim
-    '      — they're not in the schema because adding them as
-    '      default-False fields would write the lines into INIs
-    '      that didn't previously have them, which is the
-    '      opposite of what users in that situation need.
-    '      Operators who need to clear them out edit Engine.ini
-    '      directly via the Server Config (INIs) directory.
+    '  Engine.ini's [OnlineSubsystem] identity fields (ServerName,
+    '  ServerPassword) used to have their own "Network (Engine.ini)"
+    '  editor tab. They're now Configuration-tab fields rendered into
+    '  Engine.ini at launch (see the IStartupFileProvider block), so
+    '  that tab is gone. Other [OnlineSubsystem] entries — notably
+    '  BuildIdOverride / bUseBuildIdOverride, which per Inflexion's
+    '  troubleshooting guide can block clients connecting after
+    '  Enhanced-build upgrades — round-trip verbatim through the
+    '  render's preserve-existing-text writer; operators who need to
+    '  edit them do so on raw Engine.ini via the Server Config (INIs)
+    '  directory.
     '
-    '  Why ServerPassword is in Engine.ini (not on the
-    '  Configuration tab):
-    '    Conan reads the connect password from Engine.ini's
-    '    [OnlineSubsystem] ServerPassword; surfacing it as a
-    '    launch-URL ?ServerPassword= produces PacketHandlerLog
-    '    AESDecryptionFailed errors on every connect. See the
-    '    file-header comment for the full rationale.
-    '
-    '  Why ServerName appears on BOTH the Configuration tab AND
-    '  here:
-    '    The launch URL's ?ServerName= demonstrably works — the
-    '    test capture from the first Conan playthrough showed
-    '    the server registering under the URL-supplied name. So
-    '    the Configuration tab is the runtime source of truth
-    '    for ServerName. But Funcom's docs route it through
-    '    Engine.ini, and some operators prefer that workflow,
-    '    so we expose ServerName on both surfaces with the
-    '    precedence noted in each description. When set in both
-    '    places, the launch URL wins.
+    '  ServerName / ServerPassword routing:
+    '    Both are Configuration-tab fields rendered into Engine.ini
+    '    [OnlineSubsystem] at launch (IStartupFileProvider), not on
+    '    the command line — a URL ?ServerPassword= dies with
+    '    AESDecryptionFailed and a URL ?ServerName= mangles on
+    '    spaces/unicode. See the file-header and IStartupFileProvider
+    '    comments for the full rationale and blank-handling.
     '
     '  Why this set of ServerSettings fields:
     '    21 of the 100+ ServerSettings.ini knobs, chosen for how
@@ -960,11 +998,10 @@ Public Class ConanExilesPlugin
     '    worse than the raw file.
     '
     '  Fields NOT in the ServerSettings schema:
-    '    - ServerName. Comes from the launch-URL command line
-    '      via the Configuration tab, which is the source of
-    '      truth. ServerName ALSO appears on the Network
-    '      (Engine.ini) tab so operators have the choice; the
-    '      Configuration tab value wins at runtime.
+    '    - ServerName / ServerPassword. Configuration-tab fields
+    '      rendered into Engine.ini [OnlineSubsystem] at launch
+    '      (not ServerSettings.ini). See the IStartupFileProvider
+    '      block.
     '    - The 80-odd other ServerSettings.ini fields a power
     '      user might want. They round-trip verbatim through
     '      WriteValuesToFile's preserve-existing-text behaviour,
@@ -1002,7 +1039,6 @@ Public Class ConanExilesPlugin
     Private Const ServerSettingsRelativePath As String = "ConanSandbox/Saved/Config/WindowsServer/ServerSettings.ini"
     Private Const ServerSettingsSectionName As String = "ServerSettings"
 
-    Private Const EngineIniEditorKey As String = "engine-ini"
     Private Const EngineIniRelativePath As String = "ConanSandbox/Saved/Config/WindowsServer/Engine.ini"
     Private Const OnlineSubsystemSectionName As String = "OnlineSubsystem"
 
@@ -1028,12 +1064,6 @@ Public Class ConanExilesPlugin
                 .TabTitle = "Server Settings",
                 .RelativePath = ServerSettingsRelativePath,
                 .Schema = BuildServerSettingsSchema()
-            },
-            New InstanceFileEditor With {
-                .Key = EngineIniEditorKey,
-                .TabTitle = "Network (Engine.ini)",
-                .RelativePath = EngineIniRelativePath,
-                .Schema = BuildEngineIniSchema()
             }
         }
     End Function
@@ -1050,8 +1080,6 @@ Public Class ConanExilesPlugin
         Select Case editorKey
             Case ServerSettingsEditorKey
                 Return ServerSettingsSectionName
-            Case EngineIniEditorKey
-                Return OnlineSubsystemSectionName
             Case Else
                 Return Nothing
         End Select
@@ -1068,35 +1096,9 @@ Public Class ConanExilesPlugin
         Select Case editorKey
             Case ServerSettingsEditorKey
                 Return BuildServerSettingsSchema()
-            Case EngineIniEditorKey
-                Return BuildEngineIniSchema()
             Case Else
                 Return New ConfigFieldDescriptor() {}
         End Select
-    End Function
-
-    Private Shared Function BuildEngineIniSchema() As IReadOnlyList(Of ConfigFieldDescriptor)
-        ' Engine.ini's [OnlineSubsystem] section. The two
-        ' authoritative server-identity fields per Funcom's
-        ' official dedicated-server docs. Anything else in
-        ' [OnlineSubsystem] (BuildIdOverride etc.) round-trips
-        ' verbatim through the preserve-existing-text writer.
-        Return New ConfigFieldDescriptor() {
-            New ConfigFieldDescriptor With {
-                .Key = "ServerName",
-                .Label = "Server name",
-                .Description = "[OnlineSubsystem] Server name as Funcom's docs route it. The launch URL's ?ServerName= takes precedence at runtime, but some operators prefer setting it here for consistency with the official docs. Setting both is fine — they're the same string.",
-                .FieldType = ConfigFieldType.Text,
-                .DefaultValue = ""
-            },
-            New ConfigFieldDescriptor With {
-                .Key = "ServerPassword",
-                .Label = "Server password (connect)",
-                .Description = "[OnlineSubsystem] Password players must enter to connect. THIS is the file Conan actually reads for the connect password — setting it on the launch URL produces AESDecryptionFailed errors at connect time. Leave blank for an open server.",
-                .FieldType = ConfigFieldType.Password,
-                .IsSensitive = True
-            }
-        }
     End Function
 
     Private Shared Function BuildServerSettingsSchema() As IReadOnlyList(Of ConfigFieldDescriptor)
@@ -1380,6 +1382,23 @@ Public Class ConanExilesPlugin
             Return If(existingText, "")
         End If
 
+        Return WriteIniSection(targetSection, schema, values, existingText)
+    End Function
+
+    ''' <summary>
+    ''' Core INI section writer shared by the file editor
+    ''' (WriteValuesToFile) and the startup render
+    ''' (RenderStartupFile). Writes every key in `schema` into
+    ''' `targetSection` of `existingText`, preserving comments,
+    ''' blank lines, unknown keys, and every other section verbatim.
+    ''' The caller controls which keys are in `schema`: the render
+    ''' OMITS a key to leave the file's existing value untouched
+    ''' (its preserve-if-blank path).
+    ''' </summary>
+    Private Shared Function WriteIniSection(targetSection As String,
+                                             schema As IReadOnlyList(Of ConfigFieldDescriptor),
+                                             values As Dictionary(Of String, String),
+                                             existingText As String) As String
         Dim safeValues As Dictionary(Of String, String) = If(values, New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase))
         Dim boolKeys = BuildBoolKeySet(schema)
 
@@ -1500,6 +1519,81 @@ Public Class ConanExilesPlugin
         End If
 
         Return result
+    End Function
+
+    ' ============================================================
+    '  IStartupFileProvider — ServerName + ServerPassword render
+    '
+    '  Conan reads both from Engine.ini [OnlineSubsystem], and
+    '  neither survives the launch command line cleanly (ServerName
+    '  mangles on spaces/unicode; ServerPassword fails the
+    '  OnlineSubsystem handshake → AESDecryptionFailed). So they're
+    '  dropped from BuildLaunchArguments and written into Engine.ini
+    '  here, just before launch, via the same section-scoped writer
+    '  the file editor uses. Best-effort on the Manager side: a
+    '  write failure warns and the launch proceeds with the file's
+    '  last values.
+    '
+    '  Blank-handling: ServerName always writes (blank → default
+    '  name, so a server is never nameless). ServerPassword is
+    '  preserve-if-blank — a blank field is simply omitted from the
+    '  render schema so the file's existing value round-trips
+    '  untouched — UNLESS ClearServerPassword is set, which writes an
+    '  empty password (open server). That keeps an upgrade from the
+    '  old Engine.ini-editor version from wiping a set password.
+    ' ============================================================
+
+    Public Function GetStartupFiles(instanceConfig As InstanceConfig) _
+            As IReadOnlyList(Of String) _
+            Implements IStartupFileProvider.GetStartupFiles
+        Return New String() {EngineIniRelativePath}
+    End Function
+
+    Public Function RenderStartupFile(relativePath As String,
+                                       instanceConfig As InstanceConfig,
+                                       existingText As String) As String _
+            Implements IStartupFileProvider.RenderStartupFile
+
+        ' Only Engine.ini.
+        If Not String.Equals(relativePath, EngineIniRelativePath, StringComparison.OrdinalIgnoreCase) Then
+            Return Nothing
+        End If
+
+        ' Conan creates Engine.ini (with all its sections) on first
+        ' launch. Don't fabricate a minimal one before it exists —
+        ' skip the render and let the server write the file; the
+        ' values apply from the second launch onward.
+        If String.IsNullOrWhiteSpace(existingText) Then Return Nothing
+
+        Dim fields = If(instanceConfig IsNot Nothing, instanceConfig.CustomFields, Nothing)
+
+        ' Build a render schema + values on the fly. A key present in
+        ' the schema is written into [OnlineSubsystem]; a key omitted
+        ' is left untouched in the file (preserve-if-blank).
+        Dim renderSchema As New List(Of ConfigFieldDescriptor)
+        Dim renderValues As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+        ' ServerName: always write; blank falls back to the default
+        ' so the server is never left nameless.
+        Dim serverName = GetField(fields, "ServerName")
+        If String.IsNullOrEmpty(serverName) Then serverName = "PowerGSM Conan Server"
+        renderSchema.Add(New ConfigFieldDescriptor With {.Key = "ServerName", .FieldType = ConfigFieldType.Text})
+        renderValues("ServerName") = serverName
+
+        ' ServerPassword: set / clear / preserve.
+        Dim serverPassword = GetField(fields, "ServerPassword")
+        Dim clearPassword As Boolean
+        If Not Boolean.TryParse(GetField(fields, "ClearServerPassword"), clearPassword) Then clearPassword = False
+        If Not String.IsNullOrEmpty(serverPassword) Then
+            renderSchema.Add(New ConfigFieldDescriptor With {.Key = "ServerPassword", .FieldType = ConfigFieldType.Password})
+            renderValues("ServerPassword") = serverPassword
+        ElseIf clearPassword Then
+            renderSchema.Add(New ConfigFieldDescriptor With {.Key = "ServerPassword", .FieldType = ConfigFieldType.Password})
+            renderValues("ServerPassword") = ""
+        End If
+        ' else: omit ServerPassword -> existing file value preserved.
+
+        Return WriteIniSection(OnlineSubsystemSectionName, renderSchema, renderValues, existingText)
     End Function
 
     ' ---- INI helpers ----

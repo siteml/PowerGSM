@@ -441,6 +441,7 @@ Namespace GSM.Manager.Core
                 ReplaceToken(sb, "{NodeId}", tokens.NodeId, profile, "NodeId")
                 ReplaceToken(sb, "{InstanceName}", tokens.InstanceName, profile, "InstanceName")
                 ReplaceToken(sb, "{InstanceId}", tokens.InstanceId, profile, "InstanceId")
+                ReplaceToken(sb, "{InstanceSetTag}", tokens.InstanceSetTag, profile, "InstanceSetTag")
                 ReplaceToken(sb, "{InstallationName}", tokens.InstallationName, profile, "InstallationName")
                 ReplaceToken(sb, "{InstallationId}", tokens.InstallationId, profile, "InstallationId")
                 ReplaceToken(sb, "{GameName}", tokens.GameName, profile, "GameName")

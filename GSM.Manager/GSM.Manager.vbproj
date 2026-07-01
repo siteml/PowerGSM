@@ -61,6 +61,7 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
     <PackageReference Include="Basic.Reference.Assemblies" Version="1.8.5" />
+    <PackageReference Include="HtmlRenderer.WinForms" Version="1.5.2" />
     <PackageReference Include="Microsoft.CodeAnalysis.VisualBasic.Workspaces" Version="4.11.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="8.0.2">
@@ -93,6 +94,20 @@
     <PackageReference Include="Microsoft.Win32.Registry" Version="5.0.0" />
 
     <!--
+      Phase 7-3 round 2 — embedded-browser web-session capture for
+      utility plugins (Decision 7a). Manager-only dependency: plugins
+      never reference WebView2; they request a capture through the
+      gated IUtilityContext and the Manager renders the dialog.
+      Requires the WebView2 Evergreen Runtime on the machine
+      (ubiquitous with modern Edge); the dialog degrades to a
+      "runtime missing" message when absent. The native
+      WebView2Loader.dll ships as a loose file next to the exe in
+      single-file publishes (IncludeNativeLibrariesForSelfExtract is
+      already false), same pattern as the SQLite native library.
+    -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2592.51" />
+
+    <!--
       Phase 5d — Discord bot integration. DSharpPlus 4.x is the
       established stable line: single package, mature gateway/REST
       surface, well-documented, .NET 8 supported. The 5.x line was
@@ -112,5 +127,106 @@
     -->
     <PackageReference Include="DSharpPlus.SlashCommands" Version="4.5.0" />
   </ItemGroup>
+
+  <!--
+    GSM.Watchdog co-location (Phase 5m-3)
+
+    The watchdog is a sibling supervisor process, NOT a referenced
+    assembly: the Manager and watchdog communicate only via process
+    launch, exit codes, and a shared mutex name (hardcoded in both,
+    by design — no shared library). Same shape as the
+    GSM.Node -> GSM.CtrlCSender deployment:
+      * ReferenceOutputAssembly=false        — don't link the Exe as a managed reference
+      * Private=false                        — keep it out of our reference/publish closure (copied explicitly below)
+      * SkipGetTargetFrameworkProperties=true — silence the TFM mismatch (Manager is net8.0-windows, watchdog is net8.0)
+      * UndefineProperties=RuntimeIdentifier  — don't propagate the Manager's RID into the watchdog's regular Build
+    This is a build-order dependency only, so a normal Build of the
+    Manager also builds the watchdog and CopyWatchdogToOutput below
+    can find its output.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\GSM.Watchdog\GSM.Watchdog.vbproj" Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+      <UndefineProperties>RuntimeIdentifier</UndefineProperties>
+    </ProjectReference>
+  </ItemGroup>
+
+  <!-- ============================================================
+       GSM.Watchdog deployment (Phase 5m-3)
+
+       The watchdog must sit next to GSM.Manager.exe so it can launch
+       and supervise the Manager. Dev (Build) and prod (Publish) need
+       different layouts, exactly like GSM.Node -> GSM.CtrlCSender:
+
+         1. BUILD (dev): framework-dependent layout
+            (.exe + .dll + .runtimeconfig.json + .deps.json [+ .pdb]
+            + watchdogsettings.json) copied next to GSM.Manager.exe.
+            The dev machine has .NET 8 installed, so this just runs.
+            This is what lets the watchdog be tested straight out of
+            bin\$(Configuration)\net8.0-windows\ with no manual copy.
+
+         2. PUBLISH (prod): the Manager publishes self-contained
+            single-file, which does NOT lay out a shared framework
+            next to the .exe, so a framework-dependent watchdog
+            dropped there would fail with "No frameworks were found".
+            At publish time we publish the watchdog self-contained
+            single-file (one standalone .exe) and copy that in.
+
+       The watchdog is win-x64 (the Manager is Windows-only). Both
+       targets are RID-gated for consistency with the Node pattern,
+       though the Manager only ever targets win-x64.
+       ============================================================ -->
+
+  <!--
+    BUILD path: copy the framework-dependent watchdog next to
+    GSM.Manager.exe. Condition="Exists('%(Identity)')" on the Copy
+    tolerates files absent in some configs (.pdb is Debug-only).
+  -->
+  <Target Name="CopyWatchdogToOutput" AfterTargets="Build" Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
+    <ItemGroup>
+      <_WatchdogOutput Include="..\GSM.Watchdog\bin\$(Configuration)\net8.0\GSM.Watchdog.exe" />
+      <_WatchdogOutput Include="..\GSM.Watchdog\bin\$(Configuration)\net8.0\GSM.Watchdog.dll" />
+      <_WatchdogOutput Include="..\GSM.Watchdog\bin\$(Configuration)\net8.0\GSM.Watchdog.runtimeconfig.json" />
+      <_WatchdogOutput Include="..\GSM.Watchdog\bin\$(Configuration)\net8.0\GSM.Watchdog.deps.json" />
+      <_WatchdogOutput Include="..\GSM.Watchdog\bin\$(Configuration)\net8.0\GSM.Watchdog.pdb" />
+      <_WatchdogOutput Include="..\GSM.Watchdog\bin\$(Configuration)\net8.0\watchdogsettings.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_WatchdogOutput)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('%(Identity)')" />
+  </Target>
+
+  <!--
+    PUBLISH path: publish the watchdog self-contained single-file
+    into a dedicated subfolder of its own bin, then copy the
+    standalone .exe (and its settings) into the Manager's publish
+    folder. BeforeTargets/AfterTargets="Publish" mirrors the Node
+    pattern so the .exe is ready when the copy fires. PublishDir is
+    pinned to keep the self-contained outputs out of the
+    framework-dependent bin the Build path uses.
+  -->
+  <Target Name="PublishWatchdog" BeforeTargets="Publish" Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
+    <!--
+      RemoveProperties="TargetFramework" is essential: a Publish sets
+      TargetFramework=net8.0-windows as a GLOBAL property for the
+      Manager's inner build, and the MSBuild task passes inherited
+      globals down to the child. Without removing it the watchdog
+      (net8.0 only) is asked to publish as net8.0-windows and fails
+      with "Assets file ... doesn't have a target for net8.0-windows".
+      The regular ProjectReference above sidesteps this via
+      SkipGetTargetFrameworkProperties; this explicit MSBuild call
+      needs its own guard. (A plain Build doesn't set TargetFramework
+      globally, which is why only Publish tripped on it.)
+    -->
+    <MSBuild Projects="..\GSM.Watchdog\GSM.Watchdog.vbproj" Targets="Publish" RemoveProperties="TargetFramework" Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=true;PublishSingleFile=true;EnableWindowsTargeting=true;PublishDir=$(MSBuildThisFileDirectory)..\GSM.Watchdog\bin\$(Configuration)\win-x64\selfcontained\" />
+  </Target>
+
+  <Target Name="CopyWatchdogToPublish" AfterTargets="Publish" Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
+    <ItemGroup>
+      <_WatchdogPublish Include="..\GSM.Watchdog\bin\$(Configuration)\win-x64\selfcontained\GSM.Watchdog.exe" />
+      <_WatchdogPublish Include="..\GSM.Watchdog\bin\$(Configuration)\win-x64\selfcontained\watchdogsettings.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_WatchdogPublish)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" Condition="Exists('%(Identity)')" />
+  </Target>
 
 </Project>

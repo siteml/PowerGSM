@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      Console Exe (not WinExe). Unlike GSM.Watchdog (WinExe, because a
+      Task Scheduler logon task would flash a console), the shim is
+      launched only by GSM.Node, which spawns it with a no-window
+      creation flag (slice 1b) so nothing flashes in production. Keeping
+      it a console Exe means running `GSM.Shim.exe` with the self-test
+      flag prints its results when run by hand from a terminal on either
+      OS — the slice-1 smoke test.
+    -->
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+
+    <!--
+      Runs on BOTH Windows and Linux nodes (unlike the Windows-only
+      CtrlCSender/Watchdog). Both RIDs are published self-contained
+      single-file at release time (pinned on the publish CLI, like
+      GSM.Node/GSM.Watchdog), so both slots must exist for the
+      no-restore release flow — see the NETSDK1047 note in
+      GSM.Node.vbproj.
+    -->
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
+
+    <!--
+      Self-contained single-file publish drops the runtime in, so neither
+      OS needs .NET installed; InvariantGlobalization removes the libicu
+      dependency, leaving only libc-class libraries present on every
+      Linux host (Phase 8 decision 7). SelfContained / PublishSingleFile
+      are pinned on the publish CLI per the release pipeline, matching
+      the other sibling exes.
+    -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <RootNamespace></RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OptionStrict>Off</OptionStrict>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionInfer>On</OptionInfer>
+    <AssemblyName>GSM.Shim</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Normal managed reference: the shim uses the protocol types directly. -->
+    <ProjectReference Include="..\GSM.Shim.Protocol\GSM.Shim.Protocol.vbproj" />
+  </ItemGroup>
+
+</Project>

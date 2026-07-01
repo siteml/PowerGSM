@@ -325,8 +325,14 @@ Namespace GSM.Manager.UI
 
         Private Sub BuildTimelineColumns()
             _resultsList.Columns.Clear()
-            _resultsList.Columns.Add("Time", 160)
-            _resultsList.Columns.Add("Kind", 70)
+            ' Time content tops out at "yyyy-MM-dd HH:mm:ss" —
+            ' 19 fixed-width characters — so 130px is plenty
+            ' even with the column-header sort caret.
+            _resultsList.Columns.Add("Time", 130)
+            ' Kind values are always one of {Join, Leave, Chat}.
+            ' "Leave" is the widest; ~55px holds it with header
+            ' padding to spare.
+            _resultsList.Columns.Add("Kind", 55)
             ' Phase 5h-6 — Source column replaces the old
             ' "Tile / Session" and "Instance" columns. The label
             ' is plugin-formatted via ISourceLabelProvider; for
@@ -335,19 +341,36 @@ Namespace GSM.Manager.UI
             ' "where did this come from" context in one cell.
             ' Plugins that don't opt in get a default
             ' "{Node}/{Install}/{Instance}" label.
-            _resultsList.Columns.Add("Source", 540)
-            _resultsList.Columns.Add("Player", 150)
-            _resultsList.Columns.Add("Message", 400)
+            _resultsList.Columns.Add("Source", 480)
+            ' Character + Player split. Character holds the
+            ' in-game character display name; Player holds the
+            ' platform persona (Steam handle, FLS handle, etc.).
+            ' Two columns rather than one coalesced "Player" so
+            ' the operator can trace either identity
+            ' independently — even when one is missing on the
+            ' row, the other still shows. Matches the
+            ' InstancePanel's Character + Platform name layout
+            ' for consistency across surfaces.
+            _resultsList.Columns.Add("Character", 140)
+            _resultsList.Columns.Add("Player", 120)
+            ' Message gets the extra space the trimmed Time and
+            ' Kind columns gave back — long chat lines tended
+            ' to clip with the old 400px allocation.
+            _resultsList.Columns.Add("Message", 445)
         End Sub
 
         Private Sub BuildSnapshotColumns()
             _resultsList.Columns.Clear()
-            _resultsList.Columns.Add("Player", 180)
+            ' Same Character + Player split as the timeline
+            ' columns — see BuildTimelineColumns for the
+            ' rationale.
+            _resultsList.Columns.Add("Character", 160)
+            _resultsList.Columns.Add("Player", 140)
             _resultsList.Columns.Add("Joined", 160)
             ' Phase 5h-6 — same plugin-formatted Source label as
             ' the timeline view (see BuildTimelineColumns).
-            _resultsList.Columns.Add("Source", 400)
-            _resultsList.Columns.Add("Last chat", 400)
+            _resultsList.Columns.Add("Source", 360)
+            _resultsList.Columns.Add("Last chat", 360)
             _resultsList.Columns.Add("Last chat time", 160)
         End Sub
 
@@ -650,7 +673,17 @@ Namespace GSM.Manager.UI
                     Dim item As New ListViewItem(FormatDisplayTime(r.TimestampUtc))
                     item.SubItems.Add(RowKindLabel(r.Kind))
                     item.SubItems.Add(If(r.SourceLabel, ""))
-                    item.SubItems.Add(If(r.PlayerName, ""))
+                    ' Character + Player split. Character is the
+                    ' in-game name (taken raw from the underlying
+                    ' entity's DisplayName, with chat-fallback for
+                    ' rows where it was empty at write time);
+                    ' Player is the platform persona (raw from
+                    ' PlayerActivity.PlayerName for activity rows,
+                    ' looked up from a matching PlayerActivity for
+                    ' chat rows). Either may be empty if the
+                    ' relevant source had no value to bind.
+                    item.SubItems.Add(If(r.CharacterName, ""))
+                    item.SubItems.Add(If(r.PlatformPersona, ""))
                     item.SubItems.Add(If(r.Text, ""))
                     item.Tag = r
                     item.ToolTipText = BuildRowTooltip(r.SessionIdentity, r.InstanceId)
@@ -679,7 +712,13 @@ Namespace GSM.Manager.UI
             Try
                 _resultsList.Items.Clear()
                 For Each r In rows
-                    Dim item As New ListViewItem(r.PlayerName)
+                    ' Snapshot rows lead with Character now — the
+                    ' in-game name is the more identifying signal
+                    ' for "who was online". The platform persona
+                    ' sits next to it for cases where the join
+                    ' event didn't have DisplayName resolved.
+                    Dim item As New ListViewItem(If(r.CharacterName, ""))
+                    item.SubItems.Add(If(r.PlatformPersona, ""))
                     item.SubItems.Add(FormatDisplayTime(r.JoinedAtUtc))
                     item.SubItems.Add(If(r.SourceLabel, ""))
                     item.SubItems.Add(If(r.LastChatText, ""))

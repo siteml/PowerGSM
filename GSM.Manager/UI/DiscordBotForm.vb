@@ -56,6 +56,7 @@ Namespace GSM.Manager.UI
         Private _testButton As Button
         Private _saveBotButton As Button
         Private _roleMappingsButton As Button
+        Private _commandsButton As Button
         Private _statusLabel As Label
 
         ' ---- Panels section ----
@@ -222,9 +223,17 @@ Namespace GSM.Manager.UI
             ' rather than panels because the mapping is a property
             ' of the bot identity / guilds it's in, not of any
             ' particular panel.
-            _roleMappingsButton = New Button With {.Text = "Role Mappings...", .Width = 130, .Margin = New Padding(0)}
+            _roleMappingsButton = New Button With {.Text = "Role Mappings...", .Width = 130, .Margin = New Padding(0, 0, 8, 0)}
             AddHandler _roleMappingsButton.Click, AddressOf OnRoleMappings
             buttonRow.Controls.Add(_roleMappingsButton)
+            ' Commands & Access… (Phase 5d-7c) — read-only view of
+            ' the slash-command catalogue plus a per-server preview
+            ' of what those commands can see and who can run them.
+            ' Co-located with Role Mappings: both describe how the
+            ' bot's command surface behaves per server.
+            _commandsButton = New Button With {.Text = "Commands && Access...", .Width = 160, .Margin = New Padding(0)}
+            AddHandler _commandsButton.Click, AddressOf OnCommandsAccess
+            buttonRow.Controls.Add(_commandsButton)
             layout.SetColumnSpan(buttonRow, 2)
             layout.Controls.Add(buttonRow, 1, 3)
 
@@ -708,6 +717,19 @@ Namespace GSM.Manager.UI
         End Sub
 
         ' ============================================================
+        '  Commands & Access — modal launcher (Phase 5d-7c)
+        ' ============================================================
+
+        Private Sub OnCommandsAccess(sender As Object, e As EventArgs)
+            ' Read-only diagnostic surface; self-loads from the
+            ' SlashCommandCatalog and the bot plugin / DB. Nothing
+            ' to flush on close.
+            Using dialog As New DiscordCommandsAccessForm()
+                dialog.ShowDialog(Me)
+            End Using
+        End Sub
+
+        ' ============================================================
         '  Panels — buttons
         ' ============================================================
 
@@ -804,6 +826,10 @@ Namespace GSM.Manager.UI
                             ' silently won't persist.
                             row.LayoutJson = result.LayoutJson
                             row.GroupingKind = result.GroupingKind
+                            row.PanelKind = result.PanelKind
+                            row.ShowEmptyGroups = result.ShowEmptyGroups
+                            row.ShowJoinTime = result.ShowJoinTime
+                            row.ShowTotalInTitle = result.ShowTotalInTitle
                             row.UpdatedUtc = DateTime.UtcNow
                         End If
                         db.SaveChanges()

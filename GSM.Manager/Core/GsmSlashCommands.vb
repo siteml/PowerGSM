@@ -48,6 +48,98 @@ Imports GSM.Notification
 
 Namespace GSM.Manager.Core
 
+    ' ============================================================
+    '  Phase 5d-7a — SlashCommandCatalog
+    '
+    '  Single declarative source of truth for the slash-command
+    '  surface: command name, description, minimum permission
+    '  tier, and a one-line "what it sees" note. Three consumers
+    '  read from here so they can't drift apart:
+    '
+    '    1. The <SlashCommand> attributes on GsmSlashCommands —
+    '       via the *Name / *Description Const fields below.
+    '       DSharpPlus needs compile-time constants for command
+    '       registration, so the catalogue can't drive the
+    '       attributes at runtime; instead each description lives
+    '       in a Const referenced by BOTH the attribute and the
+    '       catalogue entry, giving one source with no drift
+    '       (Phase 5d-7 Decision #4).
+    '    2. /players gating — reads MinimumPermission from here
+    '       instead of an inline literal.
+    '    3. /help rendering — lists every command from here, so
+    '       Discord's /help and (Phase 5d-7c) the Manager's
+    '       Commands & Access surface render identical info.
+    '
+    '  Adding a command (e.g. /lastseen in Phase 5d-8) means:
+    '  add its Name/Description Const, add one row to All, and
+    '  put the <SlashCommand> attribute on its handler. /help and
+    '  the Commands surface then pick it up with no further work.
+    ' ============================================================
+
+    Friend NotInheritable Class SlashCommandCatalog
+
+        ' ---- Command name constants (shared with <SlashCommand>) ----
+        Friend Const HelpName As String = "help"
+        Friend Const PanelsName As String = "panels"
+        Friend Const PlayersName As String = "players"
+        Friend Const LastSeenName As String = "lastseen"
+
+        ' ---- Description constants (shared with <SlashCommand>) ----
+        Friend Const HelpDescription As String = "Show available PowerGSM commands and panels in this server"
+        Friend Const PanelsDescription As String = "List PowerGSM panels in this server"
+        Friend Const PlayersDescription As String = "Show the player list for an instance"
+        Friend Const LastSeenDescription As String = "Show when and where a player was last seen"
+
+        ' Catalogue is a static table; never instantiated.
+        Private Sub New()
+        End Sub
+
+        ''' <summary>
+        ''' One declarative row per slash command.
+        ''' </summary>
+        Friend NotInheritable Class CommandEntry
+            Friend ReadOnly Property Name As String
+            Friend ReadOnly Property Description As String
+            Friend ReadOnly Property MinimumPermission As CommandPermission
+            ''' <summary>One-line "what this command sees / does" note.</summary>
+            Friend ReadOnly Property VisibilityNote As String
+
+            Friend Sub New(name As String,
+                           description As String,
+                           minimumPermission As CommandPermission,
+                           visibilityNote As String)
+                Me.Name = name
+                Me.Description = description
+                Me.MinimumPermission = minimumPermission
+                Me.VisibilityNote = visibilityNote
+            End Sub
+        End Class
+
+        ''' <summary>
+        ''' Every registered slash command, in display order.
+        ''' </summary>
+        Friend Shared ReadOnly All As IReadOnlyList(Of CommandEntry) = New List(Of CommandEntry) From {
+            New CommandEntry(HelpName, HelpDescription, CommandPermission.Everyone,
+                             "Lists the commands and the panels configured in this server."),
+            New CommandEntry(PanelsName, PanelsDescription, CommandPermission.Everyone,
+                             "Lists this server's panels and their channels; nothing instance-specific."),
+            New CommandEntry(PlayersName, PlayersDescription, CommandPermission.ServerOperator,
+                             "Reads the live player list for one instance visible in this server's panels."),
+            New CommandEntry(LastSeenName, LastSeenDescription, CommandPermission.ServerOperator,
+                             "Looks up a player's most recent join/leave across instances visible in this server.")
+        }
+
+        ''' <summary>
+        ''' Look up a command entry by name (case-insensitive).
+        ''' Returns Nothing if no such command is catalogued.
+        ''' </summary>
+        Friend Shared Function Find(commandName As String) As CommandEntry
+            Return All.FirstOrDefault(
+                Function(c) String.Equals(c.Name, commandName, StringComparison.OrdinalIgnoreCase))
+        End Function
+
+    End Class
+
     Public Class GsmSlashCommands
         Inherits ApplicationCommandModule
 
@@ -67,13 +159,15 @@ Namespace GSM.Manager.Core
         '  /help
         ' ============================================================
 
-        <SlashCommand("help", "Show available PowerGSM commands and panels in this server")>
+        <SlashCommand(SlashCommandCatalog.HelpName, SlashCommandCatalog.HelpDescription)>
         Public Async Function HelpAsync(ctx As InteractionContext) As Task
             Dim sb As New StringBuilder()
             sb.AppendLine("## PowerGSM commands")
-            sb.AppendLine("• `/help` — this message")
-            sb.AppendLine("• `/panels` — list the PowerGSM panels in this server")
-            sb.AppendLine("• `/players <instance>` — show the player list for an instance (operators only)")
+            ' Rendered from the SlashCommandCatalog so Discord's /help
+            ' and the Manager's Commands surface stay in lockstep.
+            For Each cmd In SlashCommandCatalog.All
+                sb.AppendLine($"• `/{cmd.Name}` — {cmd.Description}{PermissionTag(cmd.MinimumPermission)}")
+            Next
             sb.AppendLine()
             sb.AppendLine("To start, stop, or restart instances, click **Manage** on a panel above.")
 
@@ -93,7 +187,7 @@ Namespace GSM.Manager.Core
         '  /panels
         ' ============================================================
 
-        <SlashCommand("panels", "List PowerGSM panels in this server")>
+        <SlashCommand(SlashCommandCatalog.PanelsName, SlashCommandCatalog.PanelsDescription)>
         Public Async Function PanelsAsync(ctx As InteractionContext) As Task
             Dim panelLines = Await BuildPanelLinesAsync(ctx)
             Dim sb As New StringBuilder()
@@ -113,7 +207,7 @@ Namespace GSM.Manager.Core
         '  /players <instance>
         ' ============================================================
 
-        <SlashCommand("players", "Show the player list for an instance")>
+        <SlashCommand(SlashCommandCatalog.PlayersName, SlashCommandCatalog.PlayersDescription)>
         Public Async Function PlayersAsync(
                 ctx As InteractionContext,
                 <[Option]("instance", "Which instance"),
@@ -136,10 +230,15 @@ Namespace GSM.Manager.Core
             End If
 
             Dim guildIdStr = ctx.Guild.Id.ToString()
+            ' Minimum tier comes from the catalogue (single source
+            ' of truth) rather than an inline literal, so the gate
+            ' here and the tier shown in /help / the Commands surface
+            ' can't diverge.
+            Dim playersCmd = SlashCommandCatalog.Find(SlashCommandCatalog.PlayersName)
             Dim perm = botPlugin.ResolveUserPermission(ctx.Member, guildIdStr)
-            If perm < CommandPermission.ServerOperator Then
+            If perm < playersCmd.MinimumPermission Then
                 Await ReplyEphemeralAsync(ctx,
-                    "You need a role mapped to ServerOperator (or higher) to run this command.")
+                    $"You need a role mapped to {playersCmd.MinimumPermission} (or higher) to run this command.")
                 Return
             End If
 
@@ -190,7 +289,456 @@ Namespace GSM.Manager.Core
                 Return
             End If
 
+            ' Phase 5g-2d Round 3c — enrich against the resolver so
+            ' the /players list shows resolved character names even
+            ' when this Node snapshot is missing them.
+            players = im.EnrichPlayers(entry.InstanceId, players)
+
             Await EditResponseAsync(ctx, BuildPlayersResponse(entry, players))
+        End Function
+
+        ' ============================================================
+        '  /lastseen <player>
+        ' ============================================================
+
+        <SlashCommand(SlashCommandCatalog.LastSeenName, SlashCommandCatalog.LastSeenDescription)>
+        Public Async Function LastSeenAsync(
+                ctx As InteractionContext,
+                <[Option]("player", "Player name — Steam handle or in-game character"),
+                 Autocomplete(GetType(LastSeenPlayerAutocompleteProvider))>
+                Optional player As String = Nothing,
+                <[Option]("instance", "Limit to one instance"),
+                 Autocomplete(GetType(InstanceAutocompleteProvider))>
+                Optional instanceScope As String = Nothing,
+                <[Option]("game", "Limit to one game"),
+                 Autocomplete(GetType(GameAutocompleteProvider))>
+                Optional gameScope As String = Nothing,
+                <[Option]("installation", "Limit to one installation"),
+                 Autocomplete(GetType(InstallationAutocompleteProvider))>
+                Optional installScope As String = Nothing) As Task
+
+            ' DM context has no guild scope — refuse cleanly, same as
+            ' /players.
+            If ctx.Guild Is Nothing OrElse ctx.Member Is Nothing Then
+                Await ReplyEphemeralAsync(ctx, "This command only works inside a server.")
+                Return
+            End If
+
+            Dim botPlugin = ctx.Services.GetService(Of DiscordBotPlugin)()
+            If botPlugin Is Nothing Then
+                Await ReplyEphemeralAsync(ctx, "Discord bot plugin unavailable.")
+                Return
+            End If
+
+            Dim guildIdStr = ctx.Guild.Id.ToString()
+            ' Minimum tier from the catalogue (single source of truth),
+            ' matching /players.
+            Dim cmd = SlashCommandCatalog.Find(SlashCommandCatalog.LastSeenName)
+            Dim perm = botPlugin.ResolveUserPermission(ctx.Member, guildIdStr)
+            If perm < cmd.MinimumPermission Then
+                Await ReplyEphemeralAsync(ctx,
+                    $"You need a role mapped to {cmd.MinimumPermission} (or higher) to run this command.")
+                Return
+            End If
+
+            ' Need at least a player or a scope; scope filters are
+            ' mutually exclusive.
+            Dim scopeCount = 0
+            If Not String.IsNullOrWhiteSpace(instanceScope) Then scopeCount += 1
+            If Not String.IsNullOrWhiteSpace(gameScope) Then scopeCount += 1
+            If Not String.IsNullOrWhiteSpace(installScope) Then scopeCount += 1
+            If scopeCount > 1 Then
+                Await ReplyEphemeralAsync(ctx,
+                    "Pick just one scope to filter by — instance, game, or installation.")
+                Return
+            End If
+            If String.IsNullOrWhiteSpace(player) AndAlso scopeCount = 0 Then
+                Await ReplyEphemeralAsync(ctx,
+                    "Give me a player to look up, or a scope (instance / game / installation) to list who's been seen.")
+                Return
+            End If
+
+            ' Defer — the history query runs on a thread-pool hop.
+            Try
+                Await ctx.DeferAsync(ephemeral:=True)
+            Catch ex As Exception
+                Dim logger = TryGetLogger(ctx)
+                If logger IsNot Nothing Then
+                    logger.LogWarning(ex, "/lastseen defer failed for {Player}", player)
+                End If
+                Return
+            End Try
+
+            Dim history = ctx.Services.GetService(Of HistoryQueryService)()
+            If history Is Nothing Then
+                Await EditResponseAsync(ctx, "History service unavailable.")
+                Return
+            End If
+
+            ' Only report players seen on instances exposed via this
+            ' server's panels — same scoping as /players. Autocomplete
+            ' suggests; this set enforces.
+            Dim visibleIds As New HashSet(Of String)(
+                botPlugin.GetInstancesVisibleInGuild(guildIdStr).
+                    Select(Function(x) x.InstanceId),
+                StringComparer.OrdinalIgnoreCase)
+            If visibleIds.Count = 0 Then
+                Await EditResponseAsync(ctx, "No instances are visible in this server's panels.")
+                Return
+            End If
+
+            ' Optional scope filter (instance / game / installation —
+            ' mutual exclusivity was validated before the defer). Narrow
+            ' the visible set to the chosen scope; for game/installation
+            ' that resolves to an instance set via the Instances table,
+            ' intersected with what's visible here. Autocomplete suggests
+            ' scope values; this is where they're enforced.
+            Dim scopeIds As HashSet(Of String) = visibleIds
+            Dim scopeLabel As String = Nothing
+            If Not String.IsNullOrWhiteSpace(instanceScope) Then
+                scopeLabel = "the selected instance"
+                scopeIds = New HashSet(Of String)(
+                    visibleIds.Where(Function(id) String.Equals(
+                        id, instanceScope.Trim(), StringComparison.OrdinalIgnoreCase)),
+                    StringComparer.OrdinalIgnoreCase)
+            ElseIf Not String.IsNullOrWhiteSpace(gameScope) OrElse
+                   Not String.IsNullOrWhiteSpace(installScope) Then
+                Dim matchIds As List(Of String) = Nothing
+                Dim scopeError As String = Nothing
+                Try
+                    Using dbScope = ctx.Services.CreateScope()
+                        Dim db = dbScope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                        Dim q = db.Instances.AsQueryable()
+                        If Not String.IsNullOrWhiteSpace(gameScope) Then
+                            Dim g = gameScope.Trim()
+                            scopeLabel = $"game **{EscapeForDiscord(g)}**"
+                            q = q.Where(Function(i) i.GameId = g)
+                        Else
+                            Dim inst = installScope.Trim()
+                            scopeLabel = "the selected installation"
+                            q = q.Where(Function(i) i.InstallationId = inst)
+                        End If
+                        matchIds = q.Select(Function(i) i.InstanceId).ToList()
+                    End Using
+                Catch ex As Exception
+                    scopeError = "Couldn't resolve that scope filter."
+                End Try
+                If scopeError IsNot Nothing Then
+                    Await EditResponseAsync(ctx, scopeError)
+                    Return
+                End If
+                scopeIds = New HashSet(Of String)(
+                    matchIds.Where(Function(id) visibleIds.Contains(id)),
+                    StringComparer.OrdinalIgnoreCase)
+            End If
+            If scopeIds.Count = 0 Then
+                Await EditResponseAsync(ctx,
+                    $"Nothing visible in {If(scopeLabel, "that scope")} in this server.")
+                Return
+            End If
+
+            ' === Roster mode (scope-only, no player) ===
+            ' List the most-recently-seen players in the scope. No
+            ' PlayerNamePattern — fetch all join/leave activity (newest
+            ' first), keep what's in scope, and let BuildRosterResponse
+            ' dedup to one line per player.
+            If String.IsNullOrWhiteSpace(player) Then
+                Dim rosterFilter As New HistoryFilter With {
+                    .StartUtc = DateTime.MinValue,
+                    .EndUtc = DateTime.UtcNow,
+                    .IncludeChat = False,
+                    .IncludeJoins = True,
+                    .IncludeLeaves = True
+                }
+                Dim rosterErr As String = Nothing
+                Dim rosterResult As TimelineResult = Nothing
+                Try
+                    rosterResult = Await history.QueryTimelineAsync(
+                        rosterFilter, System.Threading.CancellationToken.None)
+                Catch ex As Exception
+                    rosterErr = ex.Message
+                End Try
+                If rosterErr IsNot Nothing Then
+                    Await EditResponseAsync(ctx, $"Failed to build roster: {rosterErr}")
+                    Return
+                End If
+                Dim rosterRows As New List(Of TimelineRow)
+                If rosterResult IsNot Nothing AndAlso rosterResult.Rows IsNot Nothing Then
+                    For Each r In rosterResult.Rows
+                        If Not String.IsNullOrEmpty(r.InstanceId) AndAlso
+                           scopeIds.Contains(r.InstanceId) Then
+                            rosterRows.Add(r)
+                        End If
+                    Next
+                End If
+                Await EditResponseAsync(ctx, BuildRosterResponse(rosterRows, scopeLabel))
+                Return
+            End If
+
+            ' Identity-aware lookup: the typed string may be an in-game
+            ' character name, but PlayerActivity.PlayerName stores the
+            ' platform persona (Steam handle on LO, etc.). Resolve the
+            ' typed name to an identity via the resolver and search by
+            ' its persona, so a character-name query finds the same
+            ' history a persona query would. Falls back to the literal
+            ' typed string when nothing resolves.
+            Dim resolver = ctx.Services.GetService(Of IdentityResolver)()
+            Dim resolvedRec = ResolveTypedIdentity(resolver, player.Trim())
+            Dim pattern = player.Trim()
+            If resolvedRec IsNot Nothing Then
+                Dim canonical = If(Not String.IsNullOrEmpty(resolvedRec.PlatformPersona),
+                                   resolvedRec.PlatformPersona, resolvedRec.DisplayName)
+                If Not String.IsNullOrEmpty(canonical) Then pattern = canonical
+            End If
+
+            ' Join/leave history only (no chat), newest-first, across
+            ' all sessions; rows are filtered to this guild's visible
+            ' instances below. StartUtc = MinValue spans all history
+            ' (PlayerActivity is never time-pruned).
+            Dim filter As New HistoryFilter With {
+                .StartUtc = DateTime.MinValue,
+                .EndUtc = DateTime.UtcNow,
+                .PlayerNamePattern = pattern,
+                .IncludeChat = False,
+                .IncludeJoins = True,
+                .IncludeLeaves = True
+            }
+
+            Dim fetchError As String = Nothing
+            Dim result As TimelineResult = Nothing
+            Try
+                result = Await history.QueryTimelineAsync(filter, System.Threading.CancellationToken.None)
+            Catch ex As Exception
+                fetchError = ex.Message
+            End Try
+            If fetchError IsNot Nothing Then
+                Await EditResponseAsync(ctx, $"Failed to look up history: {fetchError}")
+                Return
+            End If
+
+            Dim allRows As IReadOnlyList(Of TimelineRow) =
+                If(result IsNot Nothing AndAlso result.Rows IsNot Nothing,
+                   result.Rows, New List(Of TimelineRow)())
+
+            ' Keep only rows on in-scope instances (the guild-visible
+            ' set, already narrowed by any scope filter above),
+            ' preserving the newest-first order the service returned.
+            Dim visibleRows As New List(Of TimelineRow)
+            For Each r In allRows
+                If Not String.IsNullOrEmpty(r.InstanceId) AndAlso
+                   scopeIds.Contains(r.InstanceId) Then
+                    visibleRows.Add(r)
+                End If
+            Next
+
+            If visibleRows.Count = 0 Then
+                Dim scopeSuffix = If(scopeLabel IsNot Nothing, $" in {scopeLabel}", "")
+                Await EditResponseAsync(ctx,
+                    $"No record of **{EscapeForDiscord(player.Trim())}**{scopeSuffix} on any instance visible in this server.")
+                Return
+            End If
+
+            Await EditResponseAsync(ctx, BuildLastSeenResponse(visibleRows, resolvedRec))
+        End Function
+
+        ''' <summary>
+        ''' Render the /lastseen answer from the newest visible
+        ''' activity row. Reuses HistoryQueryService's SourceLabel
+        ''' verbatim, so /lastseen and the History grid show the
+        ''' identical "where" string. Rows arrive newest-first.
+        '''
+        ''' The "also matched" disambiguation groups by IDENTITY, not
+        ''' display string: a single player whose rows render under
+        ''' both a resolved character name and the raw persona (older
+        ''' rows the resolver hadn't bound yet) collapses to one, so a
+        ''' player never lists itself. resolvedRec (when the typed name
+        ''' resolved to an identity) supplies that identity's facets;
+        ''' otherwise the top row's own facets anchor it.
+        ''' </summary>
+        Private Shared Function BuildLastSeenResponse(
+                rows As IReadOnlyList(Of TimelineRow),
+                resolvedRec As IdentityRecord) As String
+
+            Dim top = rows(0)
+            Dim sb As New StringBuilder()
+
+            Dim character = If(Not String.IsNullOrEmpty(top.CharacterName),
+                               top.CharacterName, top.PlayerName)
+            Dim persona = top.PlatformPersona
+            Dim personaDistinct = Not String.IsNullOrEmpty(persona) AndAlso
+                                  Not String.Equals(persona, character, StringComparison.Ordinal)
+
+            Dim namePart As String = $"**{EscapeForDiscord(character)}**"
+            If personaDistinct Then namePart &= $" ({EscapeForDiscord(persona)})"
+
+            ' The newest event's kind is the current-presence signal:
+            ' a join with no later leave = still on (active now); a
+            ' leave = currently off. Surfacing "active now / offline"
+            ' rather than the raw "joined / left" verb avoids the
+            ' misleading "last seen … (joined)" read for someone who's
+            ' actually still connected.
+            Dim isOnline = (top.Kind = TimelineRow.RowKind.Join)
+
+            ' TimestampUtc is UTC; SpecifyKind before the zero-offset
+            ' DateTimeOffset so <t:R> renders correctly for any viewer.
+            Dim unix = New DateTimeOffset(
+                DateTime.SpecifyKind(top.TimestampUtc, DateTimeKind.Utc),
+                TimeSpan.Zero).ToUnixTimeSeconds()
+
+            Dim where = If(Not String.IsNullOrEmpty(top.SourceLabel),
+                           top.SourceLabel, "(unknown location)")
+
+            If isOnline Then
+                sb.AppendLine($"{namePart} is **active now** — joined <t:{unix}:R>")
+            Else
+                sb.AppendLine($"{namePart} is **offline** — last seen <t:{unix}:R>")
+            End If
+            sb.AppendLine($"• {EscapeForDiscord(where)}")
+
+            ' Collect the target identity's facets so ALL of its rows
+            ' (resolved character name OR raw persona) are excluded from
+            ' "also matched" — the player never lists itself.
+            Dim idIds As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            Dim idNames As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase) From {character}
+            If Not String.IsNullOrEmpty(top.PlatformUserId) Then idIds.Add(top.PlatformUserId)
+            If Not String.IsNullOrEmpty(top.CharacterId) Then idIds.Add(top.CharacterId)
+            If Not String.IsNullOrEmpty(persona) Then idNames.Add(persona)
+            If resolvedRec IsNot Nothing Then
+                For Each i In {resolvedRec.PlatformUserId, resolvedRec.CharacterId}
+                    If Not String.IsNullOrEmpty(i) Then idIds.Add(i)
+                Next
+                For Each s In {resolvedRec.PlatformPersona, resolvedRec.DisplayName}
+                    If Not String.IsNullOrEmpty(s) Then idNames.Add(s)
+                Next
+            End If
+
+            ' Genuinely-other players the search also matched.
+            Dim others As New List(Of String)
+            Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            For Each r In rows
+                If (Not String.IsNullOrEmpty(r.PlatformUserId) AndAlso idIds.Contains(r.PlatformUserId)) OrElse
+                   (Not String.IsNullOrEmpty(r.CharacterId) AndAlso idIds.Contains(r.CharacterId)) Then
+                    Continue For
+                End If
+                Dim nm = If(Not String.IsNullOrEmpty(r.CharacterName), r.CharacterName, r.PlayerName)
+                If String.IsNullOrEmpty(nm) OrElse idNames.Contains(nm) Then Continue For
+                If seen.Add(nm) Then
+                    others.Add(nm)
+                    If others.Count >= 8 Then Exit For
+                End If
+            Next
+            If others.Count > 0 Then
+                sb.AppendLine()
+                sb.AppendLine($"_Also matched: {String.Join(", ", others.Select(AddressOf EscapeForDiscord))} — narrow the name to pick one._")
+            End If
+
+            Return sb.ToString()
+        End Function
+
+        ''' <summary>
+        ''' Roster mode: the most-recently-seen players in the chosen
+        ''' scope, one line each (name + relative last-seen + kind),
+        ''' newest-first, deduplicated by identity (name or id already
+        ''' seen → skip). Caps both the count (~20) and total length to
+        ''' stay under Discord's message limit.
+        ''' </summary>
+        Private Shared Function BuildRosterResponse(
+                rows As IReadOnlyList(Of TimelineRow),
+                scopeLabel As String) As String
+            Dim sb As New StringBuilder()
+            Dim header = If(scopeLabel IsNot Nothing,
+                            $"Recently seen in {scopeLabel}", "Recently seen")
+            sb.AppendLine($"## {header}")
+
+            If rows Is Nothing OrElse rows.Count = 0 Then
+                sb.Append("_No players seen here yet._")
+                Return sb.ToString()
+            End If
+
+            Dim seenNames As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            Dim seenIds As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            Dim shown = 0
+            For Each r In rows   ' newest-first
+                Dim nm = If(Not String.IsNullOrEmpty(r.CharacterName), r.CharacterName, r.PlayerName)
+                If String.IsNullOrEmpty(nm) Then Continue For
+                ' Dedup by identity: skip if this name or any id was seen.
+                If seenNames.Contains(nm) OrElse
+                   (Not String.IsNullOrEmpty(r.PlatformUserId) AndAlso seenIds.Contains(r.PlatformUserId)) OrElse
+                   (Not String.IsNullOrEmpty(r.CharacterId) AndAlso seenIds.Contains(r.CharacterId)) Then
+                    Continue For
+                End If
+                seenNames.Add(nm)
+                If Not String.IsNullOrEmpty(r.PlatformUserId) Then seenIds.Add(r.PlatformUserId)
+                If Not String.IsNullOrEmpty(r.CharacterId) Then seenIds.Add(r.CharacterId)
+
+                ' Newest event per identity → current presence (see
+                ' BuildLastSeenResponse): join = active now, leave =
+                ' offline, instead of the raw joined/left verb.
+                Dim isOnline = (r.Kind = TimelineRow.RowKind.Join)
+                Dim unix = New DateTimeOffset(
+                    DateTime.SpecifyKind(r.TimestampUtc, DateTimeKind.Utc),
+                    TimeSpan.Zero).ToUnixTimeSeconds()
+                Dim persona = r.PlatformPersona
+                Dim personaDistinct = Not String.IsNullOrEmpty(persona) AndAlso
+                                      Not String.Equals(persona, nm, StringComparison.Ordinal)
+                Dim line As String = $"• **{EscapeForDiscord(nm)}**"
+                If personaDistinct Then line &= $" ({EscapeForDiscord(persona)})"
+                line &= If(isOnline,
+                           $" — active now (since <t:{unix}:R>)",
+                           $" — offline (last seen <t:{unix}:R>)")
+
+                If sb.Length + line.Length + 32 > 1800 Then
+                    sb.AppendLine("_…and more_")
+                    Exit For
+                End If
+                sb.AppendLine(line)
+                shown += 1
+                If shown >= 20 Then Exit For
+            Next
+            If shown = 0 Then sb.Append("_No players seen here yet._")
+            Return sb.ToString()
+        End Function
+
+        ''' <summary>
+        ''' Resolve a typed name to its best-guess identity by scanning
+        ''' the resolver's records for an EXACT (case-insensitive) match
+        ''' on any facet — persona, display name, character id, or
+        ''' platform user id. Exact-only avoids a substring collision
+        ''' hijacking the search; an unmatched name falls through to the
+        ''' raw substring query. Newest-observed wins when several match.
+        ''' Returns Nothing when there's no resolver or no exact hit.
+        ''' </summary>
+        Private Shared Function ResolveTypedIdentity(
+                resolver As IdentityResolver, typed As String) As IdentityRecord
+            If resolver Is Nothing OrElse String.IsNullOrWhiteSpace(typed) Then Return Nothing
+            Try
+                Dim hit As IdentityRecord = Nothing
+                For Each r In resolver.GetAllRecords()
+                    If IdentityFacetEquals(r, typed) Then
+                        If hit Is Nothing OrElse r.LastObservedUtc > hit.LastObservedUtc Then
+                            hit = r
+                        End If
+                    End If
+                Next
+                Return hit
+            Catch
+                Return Nothing
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' True when any identity facet of the record equals the typed
+        ''' string (case-insensitive).
+        ''' </summary>
+        Private Shared Function IdentityFacetEquals(
+                r As IdentityRecord, typed As String) As Boolean
+            For Each f In {r.PlatformPersona, r.DisplayName, r.PlatformUserId, r.CharacterId}
+                If Not String.IsNullOrEmpty(f) AndAlso
+                   String.Equals(f, typed, StringComparison.OrdinalIgnoreCase) Then
+                    Return True
+                End If
+            Next
+            Return False
         End Function
 
         ' ============================================================
@@ -277,8 +825,25 @@ Namespace GSM.Manager.Core
                 Dim displayed = IdentityFormatter.Format(p.DisplayName, p.PlatformPersona, "(unknown)")
                 Dim line As New StringBuilder()
                 line.Append($"• **{EscapeForDiscord(displayed)}**")
-                If Not String.IsNullOrEmpty(p.Platform) Then
+                ' Phase 5d-2 — identity format:
+                '   character (Platform: persona)  when the displayed
+                '     name is a distinct character AND we also have the
+                '     platform persona — surfaces both so an operator
+                '     can tie the in-game name to the account handle.
+                '   persona (Platform)             when displayed already
+                '     IS the persona (no distinct character known) —
+                '     repeating it after the colon would be noise.
+                '   bare (Platform) / (persona)    edge cases when only
+                '     one of the two is available.
+                Dim hasPlatform = Not String.IsNullOrEmpty(p.Platform)
+                Dim personaDistinct = Not String.IsNullOrEmpty(p.PlatformPersona) AndAlso
+                                      Not String.Equals(p.PlatformPersona, displayed, StringComparison.Ordinal)
+                If hasPlatform AndAlso personaDistinct Then
+                    line.Append($" ({EscapeForDiscord(p.Platform)}: {EscapeForDiscord(p.PlatformPersona)})")
+                ElseIf hasPlatform Then
                     line.Append($" ({EscapeForDiscord(p.Platform)})")
+                ElseIf personaDistinct Then
+                    line.Append($" ({EscapeForDiscord(p.PlatformPersona)})")
                 End If
                 If p.JoinedUtc <> DateTime.MinValue Then
                     ' JoinedUtc on the wire is UTC. SpecifyKind
@@ -304,6 +869,23 @@ Namespace GSM.Manager.Core
                 shown += 1
             Next
             Return sb.ToString()
+        End Function
+
+        ''' <summary>
+        ''' Friendly parenthetical for /help describing the minimum
+        ''' tier — empty for Everyone-tier commands. Reads the tier
+        ''' from the SlashCommandCatalog entry so the annotation
+        ''' can't drift from what's actually enforced.
+        ''' </summary>
+        Private Shared Function PermissionTag(perm As CommandPermission) As String
+            Select Case perm
+                Case CommandPermission.ServerOperator
+                    Return " (operators only)"
+                Case CommandPermission.Administrator
+                    Return " (admins only)"
+                Case Else
+                    Return ""
+            End Select
         End Function
 
         Private Shared Async Function ReplyEphemeralAsync(
@@ -412,6 +994,143 @@ Namespace GSM.Manager.Core
             Catch
             End Try
             Return Task.FromResult(Of IEnumerable(Of DiscordAutoCompleteChoice))(choices)
+        End Function
+
+    End Class
+
+    ' ============================================================
+    '  Autocomplete provider for /lastseen's player argument.
+    '
+    '  Suggests distinct player names already in the history store
+    '  (resolved DisplayName or raw persona), filtered by the
+    '  partial typed string, capped at the Discord limit of 25.
+    '  Deliberately NOT guild-scoped at the suggestion layer — the
+    '  command body filters the RESULT to guild-visible instances,
+    '  so a suggested name only ever seen elsewhere simply yields
+    '  "no record ... visible in this server." Failures are silent:
+    '  no suggestions, the user types the name manually.
+    ' ============================================================
+
+    Public Class LastSeenPlayerAutocompleteProvider
+        Implements IAutocompleteProvider
+
+        Public Async Function Provider(ctx As AutocompleteContext) _
+                As Task(Of IEnumerable(Of DiscordAutoCompleteChoice)) _
+                Implements IAutocompleteProvider.Provider
+
+            Dim choices As New List(Of DiscordAutoCompleteChoice)
+            Try
+                If ctx.Guild Is Nothing Then Return choices
+
+                Dim history = ctx.Services.GetService(Of HistoryQueryService)()
+                If history Is Nothing Then Return choices
+
+                Dim filterText = If(ctx.OptionValue Is Nothing, "", ctx.OptionValue.ToString())
+                Dim names = Await history.GetKnownPlayerNamesAsync(Nothing)
+                If names Is Nothing Then Return choices
+
+                Dim filtered As IEnumerable(Of String)
+                If String.IsNullOrEmpty(filterText) Then
+                    filtered = names
+                Else
+                    filtered = names.Where(
+                        Function(n) n.IndexOf(filterText, StringComparison.OrdinalIgnoreCase) >= 0)
+                End If
+
+                For Each n In filtered.Take(25)
+                    Dim label = n
+                    If label.Length > 100 Then label = label.Substring(0, 100)
+                    choices.Add(New DiscordAutoCompleteChoice(label, n))
+                Next
+            Catch
+            End Try
+            Return choices
+        End Function
+
+    End Class
+
+    ' ============================================================
+    '  Autocomplete providers for /lastseen's game / installation
+    '  scope arguments. Suggest distinct values from the Instances /
+    '  Installations tables, filtered by the typed string. Not
+    '  guild-scoped at the suggestion layer — the command body
+    '  intersects the chosen scope with the guild-visible instance
+    '  set, so an out-of-guild value just yields "nothing visible in
+    '  that scope." Failures are silent.
+    ' ============================================================
+
+    Public Class GameAutocompleteProvider
+        Implements IAutocompleteProvider
+
+        Public Async Function Provider(ctx As AutocompleteContext) _
+                As Task(Of IEnumerable(Of DiscordAutoCompleteChoice)) _
+                Implements IAutocompleteProvider.Provider
+
+            Dim choices As New List(Of DiscordAutoCompleteChoice)
+            Try
+                If ctx.Guild Is Nothing Then Return choices
+                Dim filterText = If(ctx.OptionValue Is Nothing, "", ctx.OptionValue.ToString())
+
+                Dim games As List(Of String)
+                Using scope = ctx.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    games = Await db.Instances.
+                        Where(Function(i) i.GameId IsNot Nothing AndAlso i.GameId <> "").
+                        Select(Function(i) i.GameId).
+                        Distinct().
+                        ToListAsync()
+                End Using
+
+                For Each g In games.
+                        Where(Function(x) String.IsNullOrEmpty(filterText) OrElse
+                              x.IndexOf(filterText, StringComparison.OrdinalIgnoreCase) >= 0).
+                        Take(25)
+                    Dim label = g
+                    If label.Length > 100 Then label = label.Substring(0, 100)
+                    choices.Add(New DiscordAutoCompleteChoice(label, g))
+                Next
+            Catch
+            End Try
+            Return choices
+        End Function
+
+    End Class
+
+    Public Class InstallationAutocompleteProvider
+        Implements IAutocompleteProvider
+
+        Public Async Function Provider(ctx As AutocompleteContext) _
+                As Task(Of IEnumerable(Of DiscordAutoCompleteChoice)) _
+                Implements IAutocompleteProvider.Provider
+
+            Dim choices As New List(Of DiscordAutoCompleteChoice)
+            Try
+                If ctx.Guild Is Nothing Then Return choices
+                Dim filterText = If(ctx.OptionValue Is Nothing, "", ctx.OptionValue.ToString())
+
+                ' Anonymous-typed projection is consumed inside the Using
+                ' so its type stays inferred (Option Strict friendly).
+                Using scope = ctx.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim installs = Await db.Installations.
+                        OrderBy(Function(x) x.DisplayName).
+                        Select(Function(x) New With {x.InstallationId, x.DisplayName}).
+                        ToListAsync()
+                    For Each ins In installs
+                        Dim label = If(String.IsNullOrEmpty(ins.DisplayName),
+                                       ins.InstallationId, ins.DisplayName)
+                        If Not String.IsNullOrEmpty(filterText) AndAlso
+                           label.IndexOf(filterText, StringComparison.OrdinalIgnoreCase) < 0 Then
+                            Continue For
+                        End If
+                        If label.Length > 100 Then label = label.Substring(0, 100)
+                        choices.Add(New DiscordAutoCompleteChoice(label, ins.InstallationId))
+                        If choices.Count >= 25 Then Exit For
+                    Next
+                End Using
+            Catch
+            End Try
+            Return choices
         End Function
 
     End Class

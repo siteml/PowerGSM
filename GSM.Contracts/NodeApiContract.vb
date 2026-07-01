@@ -60,10 +60,20 @@ Namespace GSM.Node.Api
         ''' <summary>
         ''' Plugin-facing contracts version. Bumps only when types
         ''' in GSM.Contracts change in a breaking way (member removed,
-        ''' signature changed, enum member removed). New members and
-        ''' new types do NOT bump it.
+        ''' signature changed, enum member removed) — OR when a major
+        ''' new plugin-facing surface is introduced (e.g. the Phase 7
+        ''' utility-plugin kind) so plugins requiring it can fail fast
+        ''' on older Managers. Routine new members and new types do
+        ''' NOT bump it. v2 = utility-plugin surface (GSM.Utility) +
+        ''' startup config render (IStartupFileProvider). v2 has not
+        ''' shipped, so the render surface folds into it rather than
+        ''' bumping — there's no released v2 Manager to gate against.
+        ''' (Additive members on existing plugin-facing interfaces —
+        ''' e.g. the 7-5 shared web-session methods on IUtilityContext
+        ''' — are routine and do NOT bump: their only consumer ships
+        ''' with them, so there's no version skew to gate.)
         ''' </summary>
-        Public Const ContractsVersion As Integer = 1
+        Public Const ContractsVersion As Integer = 2
 
     End Module
 
@@ -328,6 +338,14 @@ Namespace GSM.Node.Api
         Public Property InstanceId As String
         Public Property CurrentState As InstanceState
         Public Property Pid As Integer?
+
+        ''' <summary>
+        ''' PID of the per-instance GSM.Shim supervisor when the instance
+        ''' runs under one (Phase 8-1); Nothing for directly-spawned
+        ''' instances. Pid stays the GAME pid in both modes. Optional/
+        ''' additive — older managers ignore it.
+        ''' </summary>
+        Public Property SupervisorPid As Integer?
         Public Property UptimeSeconds As Long
         Public Property CpuPercent As Double
         Public Property MemoryMb As Long

@@ -73,9 +73,9 @@ Namespace GSM.Manager.UI
 
         Private Sub InitializeControls()
             Me.Text = "Discord Role Mappings"
-            Me.Size = New Size(720, 500)
+            Me.Size = New Size(720, 524)
             Me.StartPosition = FormStartPosition.CenterParent
-            Me.MinimumSize = New Size(640, 400)
+            Me.MinimumSize = New Size(640, 424)
 
             Dim root As New TableLayoutPanel With {
                 .Dock = DockStyle.Fill,
@@ -86,7 +86,7 @@ Namespace GSM.Manager.UI
             root.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
             root.RowStyles.Add(New RowStyle(SizeType.Absolute, 36))
             root.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
-            root.RowStyles.Add(New RowStyle(SizeType.Absolute, 28))
+            root.RowStyles.Add(New RowStyle(SizeType.Absolute, 52))
             root.RowStyles.Add(New RowStyle(SizeType.Absolute, 48))
 
             ' Guild picker row
@@ -151,13 +151,33 @@ Namespace GSM.Manager.UI
             middleRow.Controls.Add(buttonStack, 1, 0)
             root.Controls.Add(middleRow, 0, 1)
 
-            ' Hint label
+            ' Hint area — dynamic per-guild state hint on top, plus
+            ' a static Phase 5d-7b note making explicit that these
+            ' guild-default mappings also gate slash commands.
             _hintLabel = New Label With {
                 .Dock = DockStyle.Fill,
                 .ForeColor = SystemColors.GrayText,
                 .TextAlign = ContentAlignment.MiddleLeft
             }
-            root.Controls.Add(_hintLabel, 0, 2)
+            Dim hintHost As New TableLayoutPanel With {
+                .Dock = DockStyle.Fill,
+                .ColumnCount = 1,
+                .RowCount = 2,
+                .Padding = New Padding(0)
+            }
+            hintHost.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
+            hintHost.RowStyles.Add(New RowStyle(SizeType.Absolute, 22))
+            hintHost.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
+            hintHost.Controls.Add(_hintLabel, 0, 0)
+            Dim slashNote As New Label With {
+                .Dock = DockStyle.Fill,
+                .ForeColor = SystemColors.GrayText,
+                .AutoSize = False,
+                .TextAlign = ContentAlignment.TopLeft,
+                .Text = "These role mappings also govern who can run slash commands (e.g. /players) in this guild — not just the panel buttons."
+            }
+            hintHost.Controls.Add(slashNote, 0, 1)
+            root.Controls.Add(hintHost, 0, 2)
 
             ' Close button
             Dim closeRow As New FlowLayoutPanel With {

@@ -182,6 +182,162 @@ Namespace GSM.Manager.Core
             End Try
         End Function
 
+        ' ---- Self-update push (Phase 8-2 slice 7) ----
+
+        ''' <summary>
+        ''' Stage a binary on the node via the chunked staged-binary endpoint:
+        ''' SHA-256 + size the local file, POST begin, stream it in fixed-size
+        ''' chunks (append-only, offset-validated — a 409 mismatch re-seeks to
+        ''' the node's reported offset and resumes), then commit (the node
+        ''' re-verifies size + SHA-256 over the whole file before atomic-renaming
+        ''' it to the target's ".new"). Sourcing-decoupled: the caller supplies a
+        ''' local file path; release-feed download/verify is layered on later.
+        ''' targetName is the node-side target ("node" today; "shim" /
+        ''' "nodesetup" land in later slices). Throws NodeApiException /
+        ''' NodeConnectionException on failure; returns the node's commit result
+        ''' (target + staged path + version) on success. Uses a one-shot
+        ''' infinite-timeout client (same rationale as UploadFileAsync) so a
+        ''' tens-of-MB push isn't chopped by the shared 30s timeout.
+        ''' </summary>
+        Public Async Function StageBinaryAsync(targetName As String,
+                                               localFilePath As String,
+                                               version As String,
+                                               cancellation As CancellationToken) As Task(Of NodeStageResult)
+            If String.IsNullOrEmpty(localFilePath) OrElse Not File.Exists(localFilePath) Then
+                Throw New NodeApiException($"StageBinary: local file not found: {localFilePath}")
+            End If
+
+            Dim target = If(String.IsNullOrWhiteSpace(targetName), "node", targetName.Trim())
+            Dim totalBytes As Long = New FileInfo(localFilePath).Length
+            Dim sha As String = Await ComputeFileSha256Async(localFilePath, cancellation)
+
+            Using pushClient As New HttpClient()
+                pushClient.BaseAddress = _httpClient.BaseAddress
+                pushClient.Timeout = Timeout.InfiniteTimeSpan
+                If _httpClient.DefaultRequestHeaders.Authorization IsNot Nothing Then
+                    pushClient.DefaultRequestHeaders.Authorization = _httpClient.DefaultRequestHeaders.Authorization
+                End If
+
+                Try
+                    ' --- begin ---
+                    Dim beginBody = New With {.targetName = target, .totalBytes = totalBytes, .sha256 = sha, .version = version}
+                    Dim uploadId As String
+                    Using beginResp = Await pushClient.PostAsJsonAsync("/api/system/staged-binary/begin", beginBody, cancellation)
+                        beginResp.EnsureSuccessStatusCode()
+                        Dim begun = Await beginResp.Content.ReadFromJsonAsync(Of StageBeginResponse)(cancellationToken:=cancellation)
+                        If begun Is Nothing OrElse String.IsNullOrEmpty(begun.uploadId) Then
+                            Throw New NodeApiException("StageBinary: begin returned no uploadId")
+                        End If
+                        uploadId = begun.uploadId
+                    End Using
+
+                    _logger.LogInformation("Staging '{Target}' to node ({Bytes} bytes, id {Id})...", target, totalBytes, uploadId)
+
+                    ' --- chunk* ---
+                    Const chunkSize As Integer = 8 * 1024 * 1024
+                    Dim buffer(chunkSize - 1) As Byte
+                    Dim offset As Long = 0
+                    Using fs As New FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync:=True)
+                        While offset < totalBytes
+                            ' Re-seek defensively (a prior 409 may have moved offset).
+                            If fs.Position <> offset Then fs.Seek(offset, SeekOrigin.Begin)
+                            Dim toRead As Integer = CInt(Math.Min(CLng(chunkSize), totalBytes - offset))
+                            Dim read As Integer = 0
+                            While read < toRead
+                                Dim n = Await fs.ReadAsync(buffer, read, toRead - read, cancellation)
+                                If n <= 0 Then Exit While
+                                read += n
+                            End While
+                            If read <= 0 Then Exit While
+
+                            Dim chunkUrl = $"/api/system/staged-binary/{uploadId}/chunk?offset={offset}"
+                            Using content As New ByteArrayContent(buffer, 0, read)
+                                content.Headers.ContentType = New System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream")
+                                Using chunkResp = Await pushClient.PostAsync(chunkUrl, content, cancellation)
+                                    If chunkResp.StatusCode = HttpStatusCode.Conflict Then
+                                        ' Node reports where it actually is — resync and retry this chunk.
+                                        Dim resync = Await ReadExpectedOffsetAsync(chunkResp, cancellation)
+                                        If resync.HasValue Then
+                                            _logger.LogWarning("Stage chunk offset resync for '{Target}': {Old} -> {New}", target, offset, resync.Value)
+                                            offset = resync.Value
+                                            Continue While
+                                        End If
+                                    End If
+                                    chunkResp.EnsureSuccessStatusCode()
+                                End Using
+                            End Using
+                            offset += read
+                        End While
+                    End Using
+
+                    ' --- commit ---
+                    Using commitResp = Await pushClient.PostAsync($"/api/system/staged-binary/{uploadId}/commit", Nothing, cancellation)
+                        commitResp.EnsureSuccessStatusCode()
+                        Dim committed = Await commitResp.Content.ReadFromJsonAsync(Of StageCommitResponse)(cancellationToken:=cancellation)
+                        _logger.LogInformation("Staged '{Target}' on node -> {Path}", target, If(committed?.path, "(unknown)"))
+                        Return New NodeStageResult With {
+                            .Target = If(committed?.target, target),
+                            .StagedPath = committed?.path,
+                            .Version = If(committed?.version, version)
+                        }
+                    End Using
+
+                Catch ex As Exception
+                    Throw WrapException("StageBinary", ex)
+                End Try
+            End Using
+        End Function
+
+        ''' <summary>
+        ''' Trigger the node's graceful update-exit for a staged target. The node
+        ''' replies 202 (it detaches its shims, then a survivor swaps ".new" over
+        ''' the live binary and relaunches) or 409 if nothing is staged. Returns
+        ''' the survivor the node chose; throws NodeApiException (StatusCode =
+        ''' Conflict) when there's no staged update. The node tears down right
+        ''' after replying, so calls immediately after this fail until it
+        ''' relaunches — the caller polls /api/version to confirm the new build.
+        ''' </summary>
+        Public Async Function ApplyUpdateAsync(targetName As String,
+                                               cancellation As CancellationToken) As Task(Of NodeApplyUpdateResult)
+            Dim target = If(String.IsNullOrWhiteSpace(targetName), "node", targetName.Trim())
+            Try
+                Dim url = $"/api/system/apply-update?target={Uri.EscapeDataString(target)}"
+                Using resp = Await _httpClient.PostAsync(url, Nothing, cancellation)
+                    resp.EnsureSuccessStatusCode()   ' 202 = success; 409 throws -> NodeApiException(Conflict)
+                    Dim applied = Await resp.Content.ReadFromJsonAsync(Of StageApplyResponse)(cancellationToken:=cancellation)
+                    _logger.LogInformation("Apply-update accepted by node for '{Target}' (survivor {Survivor})", target, If(applied?.survivor, "(unknown)"))
+                    Return New NodeApplyUpdateResult With {.Survivor = applied?.survivor}
+                End Using
+            Catch ex As Exception
+                Throw WrapException("ApplyUpdate", ex)
+            End Try
+        End Function
+
+        ''' <summary>SHA-256 (lowercase hex) of a file, streamed.</summary>
+        Private Shared Async Function ComputeFileSha256Async(path As String, ct As CancellationToken) As Task(Of String)
+            Using sha = System.Security.Cryptography.SHA256.Create()
+                Using fs As New FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync:=True)
+                    Dim hash = Await sha.ComputeHashAsync(fs, ct)
+                    Return Convert.ToHexString(hash).ToLowerInvariant()
+                End Using
+            End Using
+        End Function
+
+        ''' <summary>Pull the node's reported expectedOffset off a 409 chunk response, or Nothing.</summary>
+        Private Shared Async Function ReadExpectedOffsetAsync(resp As HttpResponseMessage, ct As CancellationToken) As Task(Of Long?)
+            Try
+                Dim s = Await resp.Content.ReadAsStringAsync(ct)
+                Using doc = System.Text.Json.JsonDocument.Parse(s)
+                    Dim el As System.Text.Json.JsonElement = Nothing
+                    If doc.RootElement.TryGetProperty("expectedOffset", el) Then
+                        Return el.GetInt64()
+                    End If
+                End Using
+            Catch
+            End Try
+            Return Nothing
+        End Function
+
         ' ---- Instance lifecycle ----
 
         Public Async Function StartInstanceAsync(request As StartInstanceRequest,
@@ -737,6 +893,50 @@ Namespace GSM.Manager.Core
     Friend Class DeleteFileResult
         Public Property deleted As Boolean
         Public Property reason As String
+    End Class
+
+    ''' <summary>
+    ''' Deserialization shape for the staged-binary begin response
+    ''' (POST /api/system/staged-binary/begin -> { uploadId }). Field
+    ''' name is lowercase to match the node's anonymous-object JSON;
+    ''' ReadFromJsonAsync binds case-insensitively regardless.
+    ''' </summary>
+    Friend Class StageBeginResponse
+        Public Property uploadId As String
+    End Class
+
+    ''' <summary>
+    ''' Deserialization shape for the commit response
+    ''' ({ staged, target, path, version }) the node returns after it
+    ''' re-verifies size + SHA-256 and renames the .part to the
+    ''' target's .new.
+    ''' </summary>
+    Friend Class StageCommitResponse
+        Public Property staged As Boolean
+        Public Property target As String
+        Public Property path As String
+        Public Property version As String
+    End Class
+
+    ''' <summary>
+    ''' Deserialization shape for the apply-update 202 body
+    ''' ({ accepted, survivor }).
+    ''' </summary>
+    Friend Class StageApplyResponse
+        Public Property accepted As Boolean
+        Public Property survivor As String
+    End Class
+
+    ''' <summary>Outcome of a successful StageBinaryAsync (the node's commit echo).</summary>
+    Public Class NodeStageResult
+        Public Property Target As String
+        Public Property StagedPath As String
+        Public Property Version As String
+    End Class
+
+    ''' <summary>Outcome of a successful ApplyUpdateAsync (the survivor the node chose).</summary>
+    Public Class NodeApplyUpdateResult
+        Public Property Survivor As String
     End Class
 
     ' ============================================================

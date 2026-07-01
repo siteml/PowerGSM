@@ -36,6 +36,14 @@
     <ProjectReference Include="..\GSM.Contracts\GSM.Contracts.vbproj" />
 
     <!--
+      GSM.Shim.Protocol is a normal managed reference: the Node links it
+      to speak the shim wire protocol (FrameConnection, SpawnSpec, the
+      transport). Cross-platform (declares win-x64;linux-x64), so no RID
+      gating is needed.
+    -->
+    <ProjectReference Include="..\GSM.Shim.Protocol\GSM.Shim.Protocol.vbproj" />
+
+    <!--
       GSM.CtrlCSender is a runtime helper, not a referenced
       assembly. Build-order dependency only: ReferenceOutputAssembly=false
       keeps Roslyn from trying to link an Exe as a managed reference,
@@ -74,6 +82,25 @@
     -->
     <ProjectReference Include="..\GSM.CtrlCSender\GSM.CtrlCSender.vbproj"
                       Condition="'$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win'))">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+      <UndefineProperties>RuntimeIdentifier</UndefineProperties>
+    </ProjectReference>
+
+    <!--
+      GSM.Shim is the per-instance supervisor exe the Node spawns at
+      runtime. Like CtrlCSender it's a build-order dependency only
+      (ReferenceOutputAssembly=false — never linked; the Node talks to it
+      over a pipe/socket, not via its types), but UNLIKE CtrlCSender it is
+      cross-platform: the Linux node needs it too. So there is NO win-only
+      condition here, and the co-location targets below deploy it on every
+      RID. UndefineProperties=RuntimeIdentifier keeps the build-order
+      reference producing the plain net8.0 build output the Build-path copy
+      consumes; the publish path drives a RID-specific self-contained
+      publish explicitly.
+    -->
+    <ProjectReference Include="..\GSM.Shim\GSM.Shim.vbproj">
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <Private>false</Private>
       <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
@@ -205,6 +232,85 @@
     <Copy SourceFiles="..\GSM.CtrlCSender\bin\$(Configuration)\win-x64\selfcontained\GSM.CtrlCSender.exe"
           DestinationFolder="$(PublishDir)"
           SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- ============================================================
+       GSM.Shim deployment (Phase 8-1)
+
+       GSM.Shim is the per-instance supervisor the Node spawns. It is
+       versioned side-by-side on disk (decision 6): the Node launches
+       GSM.Shim\<version>\GSM.Shim(.exe), and a running shim is never
+       overwritten. So both the Build and Publish drops land in a
+       version subfolder, not next to GSM.Node directly.
+
+       Unlike CtrlCSender, the shim is cross-platform — the Linux node
+       runs it too — so these targets are NOT gated on a win RID. The
+       publish path publishes the shim self-contained / single-file for
+       whatever RID the Node is being published as.
+
+       $(Version) comes from Directory.Build.props (stamped identically
+       across every project), so it matches the shim's own self-reported
+       version (ShimVersionInfo strips the +sha to the same base).
+       ============================================================ -->
+
+  <!--
+    BUILD path (dev): copy the framework-dependent shim output into
+    $(OutDir)GSM.Shim\$(Version)\ so a dev run of the Node finds it.
+    Includes GSM.Shim.Protocol.dll (the shim's only managed dependency).
+    Gated on RID being unset so a RID-set publish does NOT drop
+    framework-dependent files that would pollute the self-contained
+    publish output (the publish path below handles RID builds). Exists()
+    guards tolerate per-config/per-OS differences (no .pdb in some
+    configs; .exe on Windows vs extensionless apphost on Linux).
+  -->
+  <Target Name="CopyShimToOutput" AfterTargets="Build"
+          Condition="'$(RuntimeIdentifier)' == ''">
+    <ItemGroup>
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.exe" />
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim" />
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.dll" />
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.runtimeconfig.json" />
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.deps.json" />
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.pdb" />
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.Protocol.dll" />
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.Protocol.pdb" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_ShimBuildOutput)"
+          DestinationFolder="$(OutDir)GSM.Shim\$(Version)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('%(Identity)')" />
+  </Target>
+
+  <!--
+    PUBLISH path (prod): publish the shim self-contained / single-file for
+    the Node's target RID into a dedicated subfolder, then copy the one
+    resulting binary into $(PublishDir)GSM.Shim\$(Version)\.
+
+    Gated on RuntimeIdentifier being set: a self-contained single-file
+    publish needs a RID. When RID is unset (framework-dependent publish)
+    the Build-path drop above is swept into PublishDir by the Web SDK, so
+    the shim is still present.
+
+    EnableWindowsTargeting=true lets a win-x64 shim publish from a Linux
+    CI host (no-op on Windows / for linux-x64), matching CtrlCSender.
+  -->
+  <Target Name="PublishShim" BeforeTargets="Publish"
+          Condition="'$(RuntimeIdentifier)' != ''">
+    <MSBuild Projects="..\GSM.Shim\GSM.Shim.vbproj"
+             Targets="Publish"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=$(RuntimeIdentifier);SelfContained=true;PublishSingleFile=true;EnableWindowsTargeting=true;PublishDir=$(MSBuildThisFileDirectory)..\GSM.Shim\bin\$(Configuration)\$(RuntimeIdentifier)\selfcontained\" />
+  </Target>
+
+  <Target Name="CopyShimToPublish" AfterTargets="Publish"
+          Condition="'$(RuntimeIdentifier)' != ''">
+    <ItemGroup>
+      <_ShimPublished Include="..\GSM.Shim\bin\$(Configuration)\$(RuntimeIdentifier)\selfcontained\GSM.Shim.exe" />
+      <_ShimPublished Include="..\GSM.Shim\bin\$(Configuration)\$(RuntimeIdentifier)\selfcontained\GSM.Shim" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_ShimPublished)"
+          DestinationFolder="$(PublishDir)GSM.Shim\$(Version)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('%(Identity)')" />
   </Target>
 
 </Project>

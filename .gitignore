@@ -362,3 +362,9 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 /CHANGELOG.pdf
+
+# Project-local sandbox for inspection artefacts that should
+# never end up in git history (sample game.db files, captured
+# logs, ad-hoc test data, etc.). Anything dropped under this
+# folder is local-only.
+Examining/

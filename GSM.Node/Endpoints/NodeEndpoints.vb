@@ -3,6 +3,8 @@ Imports System.IO
 Imports System.Reflection
 Imports Microsoft.AspNetCore.Builder
 Imports Microsoft.AspNetCore.Http
+Imports Microsoft.AspNetCore.Http.Features
+Imports Microsoft.Extensions.Hosting
 Imports Microsoft.Extensions.Logging
 Imports GSM.Plugin
 Imports GSM.Node
@@ -99,6 +101,64 @@ Namespace GSM.Node.Endpoints
                         names.Split(","c, StringSplitOptions.RemoveEmptyEntries))
                     Dim probe As New PrerequisiteProbe()
                     Return Results.Ok(probe.Check(parsed))
+                End Function)
+
+            ' ---- Phase 8-2 — Node self-update staging + update-exit ----
+            ' Chunked binary push: begin -> chunk* -> commit. The Manager
+            ' (slice 7) verifies the bytes first and pushes only vetted data;
+            ' the node streams each chunk to a temp .part, verifies SHA-256 +
+            ' size on commit, then atomic-renames to GSM.Node.new. apply-update
+            ' triggers the graceful update-exit (detach shims, then a survivor
+            ' swaps .new over the live binary and relaunches). All authenticated
+            ' by the standard bearer middleware (only /api/version is exempt).
+            app.MapPost("/api/system/staged-binary/begin",
+                Function(request As StageBeginRequest,
+                         selfUpdate As SelfUpdateService) As IResult
+                    Dim r = selfUpdate.Begin(request)
+                    Return Results.Json(r.Payload, statusCode:=r.Code)
+                End Function)
+
+            app.MapPost("/api/system/staged-binary/{uploadId}/chunk",
+                Async Function(uploadId As String,
+                               offset As Long,
+                               selfUpdate As SelfUpdateService,
+                               context As HttpContext) As Task(Of IResult)
+                    ' Lift the per-request body cap for this streamed chunk
+                    ' (auth-gated, and bounded against the declared totalBytes
+                    ' in the service). Must be set before the body is read.
+                    Dim sizeFeature = context.Features.Get(Of IHttpMaxRequestBodySizeFeature)()
+                    If sizeFeature IsNot Nothing AndAlso Not sizeFeature.IsReadOnly Then
+                        sizeFeature.MaxRequestBodySize = SelfUpdateService.ChunkBodyCapBytes
+                    End If
+                    Dim r = Await selfUpdate.AppendChunkAsync(uploadId, offset,
+                                                              context.Request.Body,
+                                                              context.RequestAborted)
+                    Return Results.Json(r.Payload, statusCode:=r.Code)
+                End Function)
+
+            app.MapPost("/api/system/staged-binary/{uploadId}/commit",
+                Async Function(uploadId As String,
+                               selfUpdate As SelfUpdateService,
+                               context As HttpContext) As Task(Of IResult)
+                    Dim r = Await selfUpdate.CommitAsync(uploadId, context.RequestAborted)
+                    Return Results.Json(r.Payload, statusCode:=r.Code)
+                End Function)
+
+            app.MapPost("/api/system/apply-update",
+                Function(target As String,
+                         selfUpdate As SelfUpdateService,
+                         lifetime As IHostApplicationLifetime) As IResult
+                    Dim r = selfUpdate.ApplyUpdate(
+                        If(String.IsNullOrWhiteSpace(target), "node", target))
+                    If Not r.Accepted Then
+                        Return Results.Conflict(New With {.error = r.Reason})
+                    End If
+                    ' Only the node target bounces the host; nodesetup (in-place
+                    ' swap) and shim (no-op) keep the node running.
+                    If r.RequiresExit Then
+                        selfUpdate.ScheduleStop(lifetime)
+                    End If
+                    Return Results.Accepted(Nothing, New With {.accepted = True, .survivor = r.Survivor})
                 End Function)
 
         End Sub

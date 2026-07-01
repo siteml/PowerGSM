@@ -10,6 +10,7 @@ Imports GSM.Manager.Core
 Imports GSM.Manager.Data
 Imports GSM.Node.Api
 Imports GSM.Plugin
+Imports GSM.Utility
 Imports GSM.Automation
 
 ' ============================================================
@@ -27,17 +28,27 @@ Namespace GSM.Manager.UI
 
         Private _pluginListView As ListView
         Private _reloadButton As Button
+        Private _configureButton As Button
         Private _errorTextBox As TextBox
+
+        ' Phase 5m-2d — plugin file enable/disable list + buttons.
+        Private _fileListView As ListView
+        Private _enableButton As Button
+        Private _disableButton As Button
+        Private _uninstallButton As Button
+        Private _fileSelectAll As CheckBox
+        Private _suppressCheckEvents As Boolean
 
         Public Sub New()
             FormIconHelper.ApplyTo(Me)
             InitializeControls()
             RefreshPluginList()
+            RefreshFileList()
         End Sub
 
         Private Sub InitializeControls()
             Me.Text = "Plugin Status"
-            Me.Size = New Size(700, 500)
+            Me.Size = New Size(700, 640)
             Me.StartPosition = FormStartPosition.CenterParent
 
             _reloadButton = New Button()
@@ -47,26 +58,112 @@ Namespace GSM.Manager.UI
             AddHandler _reloadButton.Click, AddressOf OnReload
             Me.Controls.Add(_reloadButton)
 
+            ' Phase 7-3 — configure the selected UTILITY plugin
+            ' (SchemaFormBuilder over GetConfigSchema, values in the
+            ' per-plugin config bag). Disabled until a utility row is
+            ' selected; game plugins configure per-installation/
+            ' instance as before.
+            _configureButton = New Button()
+            _configureButton.Text = "Configure..."
+            _configureButton.Size = New Size(120, 32)
+            _configureButton.Location = New Point(160, 15)
+            _configureButton.Enabled = False
+            AddHandler _configureButton.Click, AddressOf OnConfigure
+            Me.Controls.Add(_configureButton)
+
+            Dim loadedLabel As New Label()
+            loadedLabel.Text = "Loaded plugins"
+            loadedLabel.Font = New Font("Segoe UI", 10, FontStyle.Bold)
+            loadedLabel.AutoSize = True
+            loadedLabel.Location = New Point(20, 55)
+            Me.Controls.Add(loadedLabel)
+
             _pluginListView = New ListView()
             _pluginListView.View = View.Details
             _pluginListView.FullRowSelect = True
             _pluginListView.GridLines = True
-            _pluginListView.Location = New Point(20, 55)
-            _pluginListView.Size = New Size(640, 200)
+            _pluginListView.Location = New Point(20, 78)
+            _pluginListView.Size = New Size(640, 150)
             _pluginListView.Anchor = AnchorStyles.Top Or AnchorStyles.Left Or
                                       AnchorStyles.Right
-            _pluginListView.Columns.Add("Game ID", 150)
-            _pluginListView.Columns.Add("Display Name", 200)
-            _pluginListView.Columns.Add("Status", 100)
+            _pluginListView.Columns.Add("Plugin ID", 120)
+            _pluginListView.Columns.Add("Display Name", 160)
+            _pluginListView.Columns.Add("Kind", 55)
+            _pluginListView.Columns.Add("Version", 65)
+            _pluginListView.Columns.Add("Author", 90)
+            _pluginListView.Columns.Add("Source", 70)
+            _pluginListView.Columns.Add("Status", 80)
             _pluginListView.Columns.Add("Contracts", 75)
             _pluginListView.Columns.Add("Install Methods", 180)
+            AddHandler _pluginListView.SelectedIndexChanged, Sub(s, e) UpdateConfigureButton()
             Me.Controls.Add(_pluginListView)
+
+            ' Phase 5m-2d — plugin files, with enable/disable. Lists
+            ' every .vb in Plugins\ (Enabled) and Plugins\Disabled\
+            ' (Disabled). A disabled plugin isn't loaded, so it can
+            ' only be surfaced here, not in the loaded list above.
+            Dim filesLabel As New Label()
+            filesLabel.Text = "Plugin files (enable / disable)"
+            filesLabel.Font = New Font("Segoe UI", 10, FontStyle.Bold)
+            filesLabel.AutoSize = True
+            filesLabel.Location = New Point(20, 240)
+            Me.Controls.Add(filesLabel)
+
+            ' Phase 6 batch UX — checkbox selection with a select-all
+            ' toggle; Enable/Disable/Uninstall act on CHECKED files.
+            _fileSelectAll = New CheckBox()
+            _fileSelectAll.Text = "Select all"
+            _fileSelectAll.AutoSize = True
+            _fileSelectAll.Location = New Point(400, 241)
+            AddHandler _fileSelectAll.CheckedChanged, AddressOf OnFileSelectAllChanged
+            Me.Controls.Add(_fileSelectAll)
+
+            _fileListView = New ListView()
+            _fileListView.View = View.Details
+            _fileListView.FullRowSelect = True
+            _fileListView.GridLines = True
+            _fileListView.MultiSelect = True
+            _fileListView.CheckBoxes = True
+            _fileListView.HideSelection = False
+            _fileListView.Location = New Point(20, 263)
+            _fileListView.Size = New Size(490, 150)
+            _fileListView.Anchor = AnchorStyles.Top Or AnchorStyles.Left
+            _fileListView.Columns.Add("File", 330)
+            _fileListView.Columns.Add("State", 120)
+            AddHandler _fileListView.ItemChecked, Sub(s, e) OnFileItemChecked()
+            Me.Controls.Add(_fileListView)
+
+            _enableButton = New Button()
+            _enableButton.Text = "Enable"
+            _enableButton.Size = New Size(130, 30)
+            _enableButton.Location = New Point(525, 263)
+            _enableButton.Enabled = False
+            AddHandler _enableButton.Click, AddressOf OnEnable
+            Me.Controls.Add(_enableButton)
+
+            _disableButton = New Button()
+            _disableButton.Text = "Disable"
+            _disableButton.Size = New Size(130, 30)
+            _disableButton.Location = New Point(525, 298)
+            _disableButton.Enabled = False
+            AddHandler _disableButton.Click, AddressOf OnDisable
+            Me.Controls.Add(_disableButton)
+
+            ' Phase 6-4 — uninstall: deletes the selected plugin file
+            ' (enabled or disabled) outright, after consent.
+            _uninstallButton = New Button()
+            _uninstallButton.Text = "Uninstall"
+            _uninstallButton.Size = New Size(130, 30)
+            _uninstallButton.Location = New Point(525, 333)
+            _uninstallButton.Enabled = False
+            AddHandler _uninstallButton.Click, AddressOf OnUninstall
+            Me.Controls.Add(_uninstallButton)
 
             Dim errLabel As New Label()
             errLabel.Text = "Compilation Errors"
             errLabel.Font = New Font("Segoe UI", 10, FontStyle.Bold)
             errLabel.AutoSize = True
-            errLabel.Location = New Point(20, 265)
+            errLabel.Location = New Point(20, 425)
             Me.Controls.Add(errLabel)
 
             _errorTextBox = New TextBox()
@@ -74,8 +171,8 @@ Namespace GSM.Manager.UI
             _errorTextBox.ReadOnly = True
             _errorTextBox.ScrollBars = ScrollBars.Both
             _errorTextBox.Font = New Font("Consolas", 9)
-            _errorTextBox.Location = New Point(20, 290)
-            _errorTextBox.Size = New Size(640, 150)
+            _errorTextBox.Location = New Point(20, 448)
+            _errorTextBox.Size = New Size(640, 145)
             _errorTextBox.Anchor = AnchorStyles.Top Or AnchorStyles.Left Or
                                     AnchorStyles.Right Or AnchorStyles.Bottom
             Me.Controls.Add(_errorTextBox)
@@ -91,6 +188,19 @@ Namespace GSM.Manager.UI
             For Each gamePlugin In registry.GetAllPlugins()
                 Dim item As New ListViewItem(gamePlugin.GameId)
                 item.SubItems.Add(gamePlugin.DisplayName)
+                item.SubItems.Add("Game")
+
+                ' Phase 6-1 — manifest columns. Version/Author come from
+                ' the inline <plugin> block; files without one (legacy or
+                ' manifest-less) render "—" and aren't update-tracked.
+                ' Source is "local" for everything until 6-2/6-3 record
+                ' real origins (official / named third-party source).
+                Dim manifest = registry.GetManifest(gamePlugin.GameId)
+                Dim hasBlock = manifest IsNot Nothing AndAlso manifest.HasPluginBlock
+                item.SubItems.Add(If(hasBlock AndAlso manifest.Version IsNot Nothing, manifest.Version, "—"))
+                item.SubItems.Add(If(hasBlock AndAlso manifest.Author IsNot Nothing, manifest.Author, "—"))
+                item.SubItems.Add("local")
+
                 item.SubItems.Add("Loaded")
 
                 ' Phase 5f-3 — declared contracts version. Renders
@@ -119,6 +229,119 @@ Namespace GSM.Manager.UI
                 item.SubItems.Add(String.Join(", ", methods.Select(Function(m) m.ToString())))
                 _pluginListView.Items.Add(item)
             Next
+
+            ' Phase 7-1 — utility plugins (second plugin kind). Always
+            ' manifest-backed (the registry refuses manifest-less
+            ' utility plugins), so Version/Author come straight from
+            ' the manifest. No install methods — they don't manage
+            ' game installations.
+            For Each utilityPlugin In registry.GetUtilityPlugins()
+                Dim item As New ListViewItem(utilityPlugin.PluginId)
+                item.Tag = utilityPlugin
+                item.SubItems.Add(utilityPlugin.DisplayName)
+                item.SubItems.Add("Utility")
+
+                Dim manifest = registry.GetManifest(utilityPlugin.PluginId)
+                item.SubItems.Add(If(manifest?.Version, "—"))
+                item.SubItems.Add(If(manifest?.Author, "—"))
+                item.SubItems.Add("local")
+
+                ' Phase 7-2 — a plugin whose event delivery was
+                ' suspended after repeated failures shows it here;
+                ' reloading plugins reinstates it.
+                Dim host = ManagerProgram.Services.GetService(Of UtilityPluginHost)()
+                item.SubItems.Add(If(host IsNot Nothing AndAlso host.IsSuspended(utilityPlugin.PluginId),
+                                     "Suspended", "Loaded"))
+
+                Dim declared = registry.GetDeclaredContractsVersion(utilityPlugin.PluginId)
+                If declared.HasValue Then
+                    item.SubItems.Add(If(declared.Value < runningContracts,
+                                         $"v{declared.Value} (old)", $"v{declared.Value}"))
+                Else
+                    item.SubItems.Add("—")
+                End If
+
+                item.SubItems.Add("—")
+                _pluginListView.Items.Add(item)
+            Next
+            UpdateConfigureButton()
+        End Sub
+
+        ''' <summary>Phase 7-3 — the Configure... button lights up for
+        ''' utility rows only (their items carry the plugin in Tag).</summary>
+        Private Sub UpdateConfigureButton()
+            If _configureButton Is Nothing Then Return
+            Dim selectedUtility As GSM.Utility.IUtilityPlugin = Nothing
+            If _pluginListView.SelectedItems.Count > 0 Then
+                selectedUtility = TryCast(_pluginListView.SelectedItems(0).Tag, GSM.Utility.IUtilityPlugin)
+            End If
+            _configureButton.Enabled = selectedUtility IsNot Nothing
+        End Sub
+
+        ''' <summary>
+        ''' Phase 7-3 — edit the selected utility plugin's config
+        ''' (GetConfigSchema rendered via SchemaFormBuilder; values
+        ''' persist in the per-plugin config bag the plugin reads
+        ''' through Get/SetConfigValue).
+        ''' </summary>
+        Private Sub OnConfigure(sender As Object, e As EventArgs)
+            If _pluginListView.SelectedItems.Count = 0 Then Return
+            Dim utilityPlugin = TryCast(_pluginListView.SelectedItems(0).Tag, GSM.Utility.IUtilityPlugin)
+            If utilityPlugin Is Nothing Then Return
+
+            Dim schema As List(Of ConfigFieldDescriptor) = Nothing
+            Try
+                schema = utilityPlugin.GetConfigSchema()
+            Catch ex As Exception
+                MessageBox.Show($"The plugin's GetConfigSchema threw: {ex.Message}",
+                                "Configure Plugin", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                Return
+            End Try
+
+            If schema Is Nothing OrElse schema.Count = 0 Then
+                MessageBox.Show("This plugin has no configuration.", "Configure Plugin",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Return
+            End If
+
+            Dim currentValues = UtilityPluginConfigStore.Load(ManagerProgram.Services, utilityPlugin.PluginId)
+            Dim built = SchemaFormBuilder.Build(schema, currentValues)
+
+            Using dlg As New Form()
+                FormIconHelper.ApplyTo(dlg)
+                dlg.Text = $"Configure — {utilityPlugin.DisplayName}"
+                dlg.Size = New Size(520, 440)
+                dlg.StartPosition = FormStartPosition.CenterParent
+                dlg.MinimizeBox = False
+                dlg.MaximizeBox = False
+
+                built.Panel.Dock = DockStyle.Fill
+                dlg.Controls.Add(built.Panel)
+
+                Dim buttonStrip As New Panel With {.Dock = DockStyle.Bottom, .Height = 46}
+                Dim okButton As New Button With {
+                    .Text = "OK", .Size = New Size(90, 30), .Location = New Point(310, 8),
+                    .DialogResult = DialogResult.OK}
+                Dim cancelButton As New Button With {
+                    .Text = "Cancel", .Size = New Size(90, 30), .Location = New Point(408, 8),
+                    .DialogResult = DialogResult.Cancel}
+                buttonStrip.Controls.Add(okButton)
+                buttonStrip.Controls.Add(cancelButton)
+                dlg.Controls.Add(buttonStrip)
+                dlg.AcceptButton = okButton
+                dlg.CancelButton = cancelButton
+
+                If dlg.ShowDialog(Me) = DialogResult.OK Then
+                    Try
+                        UtilityPluginConfigStore.Save(ManagerProgram.Services,
+                                                      utilityPlugin.PluginId,
+                                                      built.ValueExtractor.Invoke())
+                    Catch ex As Exception
+                        MessageBox.Show($"Couldn't save the configuration: {ex.Message}",
+                                        "Configure Plugin", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                    End Try
+                End If
+            End Using
         End Sub
 
         Private Sub OnReload(sender As Object, e As EventArgs)
@@ -129,17 +352,8 @@ Namespace GSM.Manager.UI
             Dim summary = registry.ReloadAll(orphanDetector)
 
             RefreshPluginList()
-
-            ' Show errors
-            _errorTextBox.Clear()
-            If summary.CompilationErrors.Count > 0 Then
-                For Each compErr In summary.CompilationErrors
-                    _errorTextBox.AppendText(
-                        $"{compErr.FileName}({compErr.Line},{compErr.Column}): {compErr.ErrorCode} {compErr.Message}{vbCrLf}")
-                Next
-            Else
-                _errorTextBox.Text = "No compilation errors."
-            End If
+            RefreshFileList()
+            PopulateErrors(summary)
 
             ' Show summary
             Dim msg = $"Loaded: {summary.LoadedPlugins.Count}, " &
@@ -152,6 +366,272 @@ Namespace GSM.Manager.UI
 
             MessageBox.Show(msg, "Reload Complete",
                           MessageBoxButtons.OK, MessageBoxIcon.Information)
+        End Sub
+
+        Private Sub PopulateErrors(summary As PluginReloadSummary)
+            _errorTextBox.Clear()
+            If summary.CompilationErrors.Count > 0 Then
+                For Each compErr In summary.CompilationErrors
+                    _errorTextBox.AppendText(
+                        $"{compErr.FileName}({compErr.Line},{compErr.Column}): {compErr.ErrorCode} {compErr.Message}{vbCrLf}")
+                Next
+            Else
+                _errorTextBox.Text = "No compilation errors."
+            End If
+        End Sub
+
+        ' ============================================================
+        '  Phase 5m-2d — plugin file enable/disable
+        '
+        '  Disabling moves a file into Plugins\Disabled\; ReloadAll
+        '  scans only the top Plugins directory for *.vb, so the file
+        '  drops out of the load set with no rename/extension trickery
+        '  (and the Windows *.vb glob quirk never comes into play).
+        '  Enabling moves it back. Both then reload.
+        ' ============================================================
+
+        Private Shared Function PluginsDir() As String
+            Return IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Plugins")
+        End Function
+
+        Private Shared Function DisabledDir() As String
+            Return IO.Path.Combine(PluginsDir(), "Disabled")
+        End Function
+
+        Private Sub RefreshFileList()
+            _fileListView.Items.Clear()
+            Try
+                Dim pdir = PluginsDir()
+                If IO.Directory.Exists(pdir) Then
+                    For Each f In IO.Directory.GetFiles(pdir, "*.vb", IO.SearchOption.TopDirectoryOnly)
+                        Dim item As New ListViewItem(IO.Path.GetFileName(f))
+                        item.SubItems.Add("Enabled")
+                        item.Tag = "enabled"
+                        _fileListView.Items.Add(item)
+                    Next
+                End If
+                Dim ddir = DisabledDir()
+                If IO.Directory.Exists(ddir) Then
+                    For Each f In IO.Directory.GetFiles(ddir, "*.vb", IO.SearchOption.TopDirectoryOnly)
+                        Dim item As New ListViewItem(IO.Path.GetFileName(f))
+                        item.SubItems.Add("Disabled")
+                        item.Tag = "disabled"
+                        item.ForeColor = Color.Gray
+                        _fileListView.Items.Add(item)
+                    Next
+                End If
+            Catch
+                ' Best-effort listing.
+            End Try
+            ' Fresh list = nothing checked; sync the select-all box.
+            _suppressCheckEvents = True
+            Try
+                If _fileSelectAll IsNot Nothing Then _fileSelectAll.Checked = False
+            Finally
+                _suppressCheckEvents = False
+            End Try
+            UpdateFileButtons()
+        End Sub
+
+        ''' <summary>
+        ''' CHECKED file names matching a state ("enabled" /
+        ''' "disabled"), or all checked when state is Nothing.
+        ''' </summary>
+        Private Function CheckedFiles(state As String) As List(Of String)
+            Dim files As New List(Of String)
+            For Each item As ListViewItem In _fileListView.CheckedItems
+                Dim itemState = TryCast(item.Tag, String)
+                If state Is Nothing OrElse itemState = state Then
+                    files.Add(item.Text)
+                End If
+            Next
+            Return files
+        End Function
+
+        Private Sub OnFileSelectAllChanged(sender As Object, e As EventArgs)
+            If _suppressCheckEvents Then Return
+            _suppressCheckEvents = True
+            Try
+                For Each item As ListViewItem In _fileListView.Items
+                    item.Checked = _fileSelectAll.Checked
+                Next
+            Finally
+                _suppressCheckEvents = False
+            End Try
+            UpdateFileButtons()
+        End Sub
+
+        Private Sub OnFileItemChecked()
+            If _suppressCheckEvents Then Return
+            _suppressCheckEvents = True
+            Try
+                _fileSelectAll.Checked = _fileListView.Items.Count > 0 AndAlso
+                                         _fileListView.CheckedItems.Count = _fileListView.Items.Count
+            Finally
+                _suppressCheckEvents = False
+            End Try
+            UpdateFileButtons()
+        End Sub
+
+        Private Sub UpdateFileButtons()
+            If _enableButton Is Nothing OrElse _disableButton Is Nothing Then Return
+            Dim disabledCount = CheckedFiles("disabled").Count
+            Dim enabledCount = CheckedFiles("enabled").Count
+            Dim totalCount = _fileListView.CheckedItems.Count
+
+            _enableButton.Enabled = disabledCount > 0
+            _enableButton.Text = If(disabledCount > 1, $"Enable ({disabledCount})", "Enable")
+            _disableButton.Enabled = enabledCount > 0
+            _disableButton.Text = If(enabledCount > 1, $"Disable ({enabledCount})", "Disable")
+            If _uninstallButton IsNot Nothing Then
+                _uninstallButton.Enabled = totalCount > 0
+                _uninstallButton.Text = If(totalCount > 1, $"Uninstall ({totalCount})", "Uninstall")
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Phase 6-4 — delete the selected plugin file(s) outright
+        ''' (from Plugins\ or Disabled\, whichever holds each) and
+        ''' reload once. Unlike Disable, this is not reversible from
+        ''' the UI — the files are gone; reinstall from a plugin source
+        ''' to get them back. One consent for the whole batch.
+        ''' </summary>
+        Private Sub OnUninstall(sender As Object, e As EventArgs)
+            If _fileListView.CheckedItems.Count = 0 Then Return
+
+            ' (fileName, state) pairs for everything checked.
+            Dim targets As New List(Of (FileName As String, State As String))
+            For Each item As ListViewItem In _fileListView.CheckedItems
+                targets.Add((item.Text, TryCast(item.Tag, String)))
+            Next
+
+            Dim prompt = If(targets.Count = 1,
+                            $"Uninstall '{targets(0).FileName}'?",
+                            $"Uninstall {targets.Count} plugin files?" & Environment.NewLine & Environment.NewLine &
+                            "  • " & String.Join(Environment.NewLine & "  • ", targets.Select(Function(t) t.FileName))) &
+                         Environment.NewLine & Environment.NewLine &
+                         If(targets.Count = 1,
+                            "The plugin file will be deleted. Any installations or instances that " &
+                            "use this plugin will be orphaned and can't be started until it's " &
+                            "reinstalled (Sources tab). Their data and configuration are kept.",
+                            "The plugin files will be deleted. Any installations or instances that " &
+                            "use these plugins will be orphaned and can't be started until they're " &
+                            "reinstalled (Sources tab). Their data and configuration are kept.")
+            If MessageBox.Show(prompt, "Uninstall Plugins",
+                               MessageBoxButtons.YesNo, MessageBoxIcon.Warning) <> DialogResult.Yes Then
+                Return
+            End If
+
+            Dim failures As New List(Of String)
+            For Each t In targets
+                Try
+                    Dim src = IO.Path.Combine(If(t.State = "disabled", DisabledDir(), PluginsDir()), t.FileName)
+                    If IO.File.Exists(src) Then IO.File.Delete(src)
+                Catch ex As Exception
+                    failures.Add($"{t.FileName}: {ex.Message}")
+                End Try
+            Next
+
+            If failures.Count > 0 Then
+                MessageBox.Show("Some plugin files couldn't be deleted:" & Environment.NewLine & Environment.NewLine &
+                                "  • " & String.Join(Environment.NewLine & "  • ", failures),
+                                "Uninstall Plugins", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            End If
+
+            ReloadAndRefresh()
+        End Sub
+
+        Private Sub OnDisable(sender As Object, e As EventArgs)
+            Dim files = CheckedFiles("enabled")
+            If files.Count = 0 Then Return
+
+            Dim prompt = If(files.Count = 1,
+                            $"Disable '{files(0)}'?",
+                            $"Disable {files.Count} plugin files?" & Environment.NewLine & Environment.NewLine &
+                            "  • " & String.Join(Environment.NewLine & "  • ", files)) &
+                         Environment.NewLine & Environment.NewLine &
+                         If(files.Count = 1,
+                            "It will be moved to the Disabled folder and unloaded on reload. Any " &
+                            "installations or instances that use this plugin will be orphaned — they " &
+                            "can't be started until you re-enable it.",
+                            "They will be moved to the Disabled folder and unloaded on reload. Any " &
+                            "installations or instances that use these plugins will be orphaned — they " &
+                            "can't be started until you re-enable them.")
+            If MessageBox.Show(prompt, "Disable Plugins",
+                               MessageBoxButtons.YesNo, MessageBoxIcon.Warning) <> DialogResult.Yes Then
+                Return
+            End If
+
+            Dim failures As New List(Of String)
+            For Each fileName In files
+                Try
+                    Dim src = IO.Path.Combine(PluginsDir(), fileName)
+                    If Not IO.File.Exists(src) Then Continue For
+                    Dim ddir = DisabledDir()
+                    If Not IO.Directory.Exists(ddir) Then IO.Directory.CreateDirectory(ddir)
+                    Dim dst = IO.Path.Combine(ddir, fileName)
+                    ' Replace a stale same-named copy left in Disabled\.
+                    If IO.File.Exists(dst) Then IO.File.Delete(dst)
+                    IO.File.Move(src, dst)
+                Catch ex As Exception
+                    failures.Add($"{fileName}: {ex.Message}")
+                End Try
+            Next
+
+            If failures.Count > 0 Then
+                MessageBox.Show("Some plugins couldn't be disabled:" & Environment.NewLine & Environment.NewLine &
+                                "  • " & String.Join(Environment.NewLine & "  • ", failures),
+                                "Disable Plugins", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            End If
+
+            ReloadAndRefresh()
+        End Sub
+
+        Private Sub OnEnable(sender As Object, e As EventArgs)
+            Dim files = CheckedFiles("disabled")
+            If files.Count = 0 Then Return
+
+            Dim failures As New List(Of String)
+            Dim movedAny = False
+            For Each fileName In files
+                Try
+                    Dim src = IO.Path.Combine(DisabledDir(), fileName)
+                    If Not IO.File.Exists(src) Then Continue For
+                    Dim dst = IO.Path.Combine(PluginsDir(), fileName)
+                    If IO.File.Exists(dst) Then
+                        failures.Add($"{fileName}: a plugin file with this name already exists in the Plugins folder")
+                        Continue For
+                    End If
+                    IO.File.Move(src, dst)
+                    movedAny = True
+                Catch ex As Exception
+                    failures.Add($"{fileName}: {ex.Message}")
+                End Try
+            Next
+
+            If failures.Count > 0 Then
+                MessageBox.Show("Some plugins couldn't be enabled:" & Environment.NewLine & Environment.NewLine &
+                                "  • " & String.Join(Environment.NewLine & "  • ", failures),
+                                "Enable Plugins", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            End If
+
+            If movedAny Then ReloadAndRefresh() Else UpdateFileButtons()
+        End Sub
+
+        ''' <summary>
+        ''' Reload plugins after an enable/disable and refresh both
+        ''' lists + the error box. No summary dialog — the file-list
+        ''' state change is the feedback. MainForm refreshes the orphan
+        ''' banner/badges when this dialog closes (MainForm.OnPluginStatus).
+        ''' </summary>
+        Private Sub ReloadAndRefresh()
+            Dim registry = ManagerProgram.Services.GetService(Of PluginRegistry)()
+            If registry Is Nothing Then Return
+            Dim orphanDetector = ManagerProgram.Services.GetService(Of PluginOrphanDetector)()
+            Dim summary = registry.ReloadAll(orphanDetector)
+            RefreshPluginList()
+            RefreshFileList()
+            PopulateErrors(summary)
         End Sub
 
     End Class
@@ -541,6 +1021,25 @@ Namespace GSM.Manager.UI
                 End Sub
             host.Controls.Add(deleteBtn)
 
+            ' Phase 7-6 — portal onboarding entry point. Shown only when
+            ' a utility plugin can scrape importable records (lo-myrealm
+            ' for Last Oasis realms). Discovery filters to THIS tab's
+            ' game + shared-config key, so the button is harmless on
+            ' other tabs (it just finds nothing there).
+            Dim utilityHost = ManagerProgram.Services.GetService(Of UtilityPluginHost)()
+            If utilityHost IsNot Nothing AndAlso utilityHost.HasAnyPortalProvider() Then
+                Dim importBtn As New Button() With {
+                    .Text = "Import…",
+                    .Size = New Size(120, 30),
+                    .Location = New Point(310, 12)
+                }
+                AddHandler importBtn.Click,
+                    Async Sub(s, e)
+                        Await RunImportAsync(gamePlugin, provider, refreshList)
+                    End Sub
+                host.Controls.Add(importBtn)
+            End If
+
             refreshList()
             Return host
         End Function
@@ -587,6 +1086,195 @@ Namespace GSM.Manager.UI
                 Return db.Installations.Count(Function(i) i.SharedConfigGroupId = groupId)
             End Using
         End Function
+
+        ''' <summary>Phase 7-6 — portal onboarding: discover importable
+        ''' records across loaded portal providers, keep the ones for
+        ''' this tab's plugin + shared-config key, show the user a
+        ''' Create/Update plan, and apply the chosen subset. Read-only
+        ''' against the portal; the only writes are the chosen group
+        ''' creates/updates.</summary>
+        Private Async Function RunImportAsync(gamePlugin As IGamePlugin,
+                                              provider As ISharedConfigProvider,
+                                              refreshList As Action) As Task
+            Dim utilityHost = ManagerProgram.Services.GetService(Of UtilityPluginHost)()
+            Dim importSvc = ManagerProgram.Services.GetService(Of PortalImportService)()
+            If utilityHost Is Nothing OrElse importSvc Is Nothing Then Return
+
+            Dim discovered As IReadOnlyList(Of WebPortalImportRecord) = Nothing
+            Me.Cursor = Cursors.WaitCursor
+            Me.Enabled = False
+            Try
+                discovered = Await utilityHost.DiscoverAllPortalRecordsAsync(allowPrompt:=True)
+            Finally
+                Me.Enabled = True
+                Me.Cursor = Cursors.Default
+            End Try
+            If discovered Is Nothing Then Return
+
+            Dim mine = discovered.Where(
+                Function(r) String.Equals(r.GameId, gamePlugin.GameId, StringComparison.OrdinalIgnoreCase) AndAlso
+                            String.Equals(r.SharedConfigKey, provider.SharedConfigKey, StringComparison.OrdinalIgnoreCase)).ToList()
+
+            Dim labelLower = provider.SharedConfigLabel.ToLowerInvariant()
+            If mine.Count = 0 Then
+                MessageBox.Show(Me,
+                    $"No {labelLower}s were found to import." & vbCrLf & vbCrLf &
+                    "If you expected some, make sure the portal sign-in completed and that the " &
+                    "signed-in account can access them.",
+                    "Nothing to import", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Return
+            End If
+
+            Dim plan As IReadOnlyList(Of PortalImportPlanItem)
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                plan = importSvc.ComputeImportPlan(db, mine)
+            End Using
+
+            Using dlg As New PortalImportForm(provider.SharedConfigLabel, plan)
+                If dlg.ShowDialog(Me) <> DialogResult.OK Then Return
+                Dim chosen = dlg.SelectedItems
+                If chosen.Count = 0 Then Return
+
+                Dim created = 0
+                Dim updated = 0
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim res = importSvc.ApplyImportPlan(db, chosen)
+                    created = res.Created
+                    updated = res.Updated
+                End Using
+                refreshList()
+                MessageBox.Show(Me,
+                    $"Import complete: {created} created, {updated} updated.",
+                    "Import", MessageBoxButtons.OK, MessageBoxIcon.Information)
+            End Using
+        End Function
+
+    End Class
+
+    ' ============================================================
+    '  PortalImportForm — Phase 7-6 onboarding import picker.
+    '
+    '  Shows the classified import plan (one row per discovered
+    '  record: New / Update / Unchanged) with checkboxes. New and
+    '  Update rows are pre-checked; Unchanged rows are listed for
+    '  context but can't be selected (nothing would change). The
+    '  caller reads SelectedItems and applies them.
+    ' ============================================================
+
+    Friend Class PortalImportForm
+        Inherits Form
+
+        Private ReadOnly _items As IReadOnlyList(Of PortalImportPlanItem)
+        Private _listView As ListView
+
+        ''' <summary>The checked, actionable (non-Unchanged) plan items
+        ''' the user chose to import.</summary>
+        Public ReadOnly Property SelectedItems As List(Of PortalImportPlanItem)
+            Get
+                Dim result As New List(Of PortalImportPlanItem)
+                For Each lvi As ListViewItem In _listView.Items
+                    If lvi.Checked Then
+                        Dim it = TryCast(lvi.Tag, PortalImportPlanItem)
+                        If it IsNot Nothing AndAlso it.Action <> PortalImportAction.Unchanged Then
+                            result.Add(it)
+                        End If
+                    End If
+                Next
+                Return result
+            End Get
+        End Property
+
+        Public Sub New(label As String, items As IReadOnlyList(Of PortalImportPlanItem))
+            _items = If(items, New List(Of PortalImportPlanItem)())
+            FormIconHelper.ApplyTo(Me)
+            InitializeControls(label)
+        End Sub
+
+        Private Sub InitializeControls(label As String)
+            Me.Text = $"Import {label}s"
+            Me.Size = New Size(660, 460)
+            Me.StartPosition = FormStartPosition.CenterParent
+            Me.MinimumSize = New Size(520, 360)
+
+            _listView = New ListView() With {
+                .View = View.Details,
+                .CheckBoxes = True,
+                .FullRowSelect = True,
+                .GridLines = True,
+                .Dock = DockStyle.Fill
+            }
+            _listView.Columns.Add("Action", 80)
+            _listView.Columns.Add("Name", 250)
+            _listView.Columns.Add("Provider", 120)
+            _listView.Columns.Add("Currently", 170)
+
+            For Each item In _items
+                Dim actionText As String
+                Select Case item.Action
+                    Case PortalImportAction.CreateNew : actionText = "New"
+                    Case PortalImportAction.Update : actionText = "Update"
+                    Case Else : actionText = "Unchanged"
+                End Select
+                Dim lvi As New ListViewItem(actionText)
+                lvi.SubItems.Add(If(item.DisplayName, ""))
+                lvi.SubItems.Add(If(item.Record IsNot Nothing, item.Record.UsedBy, ""))
+                Dim currently As String = ""
+                If item.Action <> PortalImportAction.CreateNew Then currently = If(item.ExistingDisplayName, "")
+                lvi.SubItems.Add(currently)
+                lvi.Tag = item
+                lvi.Checked = (item.Action <> PortalImportAction.Unchanged)
+                If item.Action = PortalImportAction.Unchanged Then lvi.ForeColor = Color.DimGray
+                _listView.Items.Add(lvi)
+            Next
+
+            ' Unchanged rows can't be ticked — nothing would change.
+            AddHandler _listView.ItemCheck,
+                Sub(s, e)
+                    Dim it = TryCast(_listView.Items(e.Index).Tag, PortalImportPlanItem)
+                    If it IsNot Nothing AndAlso it.Action = PortalImportAction.Unchanged AndAlso
+                       e.NewValue = CheckState.Checked Then
+                        e.NewValue = CheckState.Unchecked
+                    End If
+                End Sub
+
+            Dim intro As New Label() With {
+                .Text = $"Found {_items.Count} {label.ToLowerInvariant()}(s). Tick the ones to import — new ones are created, matched ones are updated. Unchanged entries can't be selected.",
+                .Dock = DockStyle.Top,
+                .Height = 52,
+                .Padding = New Padding(12, 10, 12, 4),
+                .ForeColor = Color.DimGray
+            }
+
+            Dim buttonPanel As New FlowLayoutPanel() With {
+                .Dock = DockStyle.Bottom,
+                .FlowDirection = FlowDirection.RightToLeft,
+                .Height = 48,
+                .Padding = New Padding(10, 8, 10, 8)
+            }
+            Dim cancelButton As New Button() With {
+                .Text = "Cancel",
+                .Size = New Size(100, 30),
+                .DialogResult = DialogResult.Cancel
+            }
+            Dim importButton As New Button() With {
+                .Text = "Import",
+                .Size = New Size(100, 30),
+                .DialogResult = DialogResult.OK
+            }
+            buttonPanel.Controls.Add(cancelButton)
+            buttonPanel.Controls.Add(importButton)
+
+            Me.AcceptButton = importButton
+            Me.CancelButton = cancelButton
+
+            ' Z-order so Dock.Fill keeps the centre: list first, then
+            ' the Top and Bottom bands.
+            Me.Controls.Add(_listView)
+            Me.Controls.Add(intro)
+            Me.Controls.Add(buttonPanel)
+        End Sub
 
     End Class
 
@@ -1752,13 +2440,19 @@ Namespace GSM.Manager.UI
         Inherits Form
 
         Private _retentionDaysNumeric As NumericUpDown
+        Private _minimizeToTrayCheck As CheckBox
+        Private _closeToTrayCheck As CheckBox
+        Private _startMinimizedCheck As CheckBox
+        Private _autoStartCheck As CheckBox
+        Private _includePrereleasesCheck As CheckBox
+        Private _updateIntervalNumeric As NumericUpDown
         Private _saveButton As Button
         Private _cancelButton As Button
 
         Public Sub New()
             FormIconHelper.ApplyTo(Me)
             Me.Text = "Settings"
-            Me.Size = New Size(540, 360)
+            Me.Size = New Size(540, 690)
             Me.FormBorderStyle = FormBorderStyle.FixedDialog
             Me.MaximizeBox = False
             Me.MinimizeBox = False
@@ -1817,35 +2511,182 @@ Namespace GSM.Manager.UI
             Me.Controls.Add(pathsHdr)
             y += 28
 
-            ' Full-path resolution so the user sees exactly where the
-            ' files live — particularly useful when the Manager is
-            ' launched from a shortcut with a different working dir.
-            Dim dbPathLbl As New Label() With {
-                .Text = $"Database: {ResolveFullPath("gsm.db")}",
-                .AutoSize = False,
-                .Size = New Size(490, 20),
-                .AutoEllipsis = True,
-                .Location = New Point(20, y),
+            ' Read-only path fields: the full path is selectable and
+            ' scrollable, with a Copy button each. Display-only — the
+            ' DB lives at BaseDirectory\gsm.db and plugins at
+            ' BaseDirectory\Plugins (both fixed; see ManagerProgram).
+            Dim dbFullPath = ResolveFullPath("gsm.db")
+            Dim dbCaption As New Label() With {
+                .Text = "Database:",
+                .AutoSize = True,
+                .Location = New Point(20, y + 3),
                 .Font = New Font("Segoe UI", 9)
             }
-            Me.Controls.Add(dbPathLbl)
-            y += 22
+            Me.Controls.Add(dbCaption)
+            Dim dbPathBox As New TextBox() With {
+                .Text = dbFullPath,
+                .ReadOnly = True,
+                .Location = New Point(140, y),
+                .Size = New Size(305, 23),
+                .Font = New Font("Segoe UI", 9)
+            }
+            Me.Controls.Add(dbPathBox)
+            Dim dbCopyBtn As New Button() With {
+                .Text = "Copy",
+                .Location = New Point(452, y - 1),
+                .Size = New Size(62, 25)
+            }
+            AddHandler dbCopyBtn.Click, Sub(s, e) CopyPathToClipboard(dbFullPath)
+            Me.Controls.Add(dbCopyBtn)
+            y += 30
 
-            Dim pluginPathLbl As New Label() With {
-                .Text = $"Plugins directory: {ResolveFullPath("Plugins")}",
-                .AutoSize = False,
-                .Size = New Size(490, 20),
-                .AutoEllipsis = True,
-                .Location = New Point(20, y),
+            Dim pluginFullPath = ResolveFullPath("Plugins")
+            Dim pluginCaption As New Label() With {
+                .Text = "Plugins directory:",
+                .AutoSize = True,
+                .Location = New Point(20, y + 3),
                 .Font = New Font("Segoe UI", 9)
             }
-            Me.Controls.Add(pluginPathLbl)
+            Me.Controls.Add(pluginCaption)
+            Dim pluginPathBox As New TextBox() With {
+                .Text = pluginFullPath,
+                .ReadOnly = True,
+                .Location = New Point(140, y),
+                .Size = New Size(305, 23),
+                .Font = New Font("Segoe UI", 9)
+            }
+            Me.Controls.Add(pluginPathBox)
+            Dim pluginCopyBtn As New Button() With {
+                .Text = "Copy",
+                .Location = New Point(452, y - 1),
+                .Size = New Size(62, 25)
+            }
+            AddHandler pluginCopyBtn.Click, Sub(s, e) CopyPathToClipboard(pluginFullPath)
+            Me.Controls.Add(pluginCopyBtn)
+            y += 40
+
+            ' ---- Window (Phase 5m-1) ----
+            Dim windowHdr As New Label() With {
+                .Text = "Window",
+                .Font = New Font("Segoe UI", 11, FontStyle.Bold),
+                .ForeColor = Color.FromArgb(50, 50, 120),
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(windowHdr)
+            y += 28
+
+            _minimizeToTrayCheck = New CheckBox() With {
+                .Text = "Minimize to the system tray",
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(_minimizeToTrayCheck)
+            y += 26
+
+            _closeToTrayCheck = New CheckBox() With {
+                .Text = "Close to the system tray (the X hides the window instead of exiting)",
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(_closeToTrayCheck)
+            y += 26
+
+            _startMinimizedCheck = New CheckBox() With {
+                .Text = "Start minimized",
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(_startMinimizedCheck)
+            y += 32
+
+            ' ---- Startup (Phase 5m-3) ----
+            Dim startupHdr As New Label() With {
+                .Text = "Startup",
+                .Font = New Font("Segoe UI", 11, FontStyle.Bold),
+                .ForeColor = Color.FromArgb(50, 50, 120),
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(startupHdr)
+            y += 28
+
+            _autoStartCheck = New CheckBox() With {
+                .Text = "Start PowerGSM automatically when I sign in",
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(_autoStartCheck)
+            y += 24
+
+            Dim startupHelp As New Label() With {
+                .Text = "Installs a per-user scheduled task that launches the PowerGSM watchdog at sign-in." & vbCrLf &
+                        "The watchdog keeps the Manager running and relaunches it if it exits unexpectedly." & vbCrLf &
+                        "Applies to this Windows account only and needs no administrator rights.",
+                .ForeColor = Color.DimGray,
+                .Font = New Font("Segoe UI", 8.5F),
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(startupHelp)
+            y += 64
+
+            ' ---- Updates (Phase 5l-1) ----
+            Dim updatesHdr As New Label() With {
+                .Text = "Updates",
+                .Font = New Font("Segoe UI", 11, FontStyle.Bold),
+                .ForeColor = Color.FromArgb(50, 50, 120),
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(updatesHdr)
+            y += 28
+
+            _includePrereleasesCheck = New CheckBox() With {
+                .Text = "Include pre-release versions",
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(_includePrereleasesCheck)
+            y += 26
+
+            Dim intervalLabel As New Label() With {
+                .Text = "Check for updates every",
+                .AutoSize = True,
+                .Location = New Point(20, y + 3)
+            }
+            Me.Controls.Add(intervalLabel)
+            _updateIntervalNumeric = New NumericUpDown() With {
+                .Minimum = 1,
+                .Maximum = 168,
+                .Value = GsmDataExtensions.DefaultUpdateCheckIntervalHours,
+                .Width = 55,
+                .Location = New Point(190, y)
+            }
+            Me.Controls.Add(_updateIntervalNumeric)
+            Dim hoursLabel As New Label() With {
+                .Text = "hours",
+                .AutoSize = True,
+                .Location = New Point(250, y + 3)
+            }
+            Me.Controls.Add(hoursLabel)
+            y += 32
+
+            Dim updatesHelp As New Label() With {
+                .Text = "PowerGSM checks GitHub for new releases and shows a notice when one is available. Nothing is downloaded automatically.",
+                .ForeColor = Color.DimGray,
+                .Font = New Font("Segoe UI", 8.5F),
+                .MaximumSize = New Size(500, 0),
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(updatesHelp)
 
             ' ---- Buttons (anchored near the bottom) ----
             _saveButton = New Button() With {
                 .Text = "Save",
                 .Size = New Size(90, 30),
-                .Location = New Point(320, 280)
+                .Location = New Point(320, 600)
             }
             AddHandler _saveButton.Click, AddressOf OnSave
             Me.Controls.Add(_saveButton)
@@ -1853,7 +2694,7 @@ Namespace GSM.Manager.UI
             _cancelButton = New Button() With {
                 .Text = "Cancel",
                 .Size = New Size(90, 30),
-                .Location = New Point(420, 280),
+                .Location = New Point(420, 600),
                 .DialogResult = DialogResult.Cancel
             }
             Me.Controls.Add(_cancelButton)
@@ -1862,6 +2703,7 @@ Namespace GSM.Manager.UI
             Me.CancelButton = _cancelButton
 
             LoadCurrentValues()
+            ReflectWatchdogState()
         End Sub
 
         ''' <summary>
@@ -1878,6 +2720,19 @@ Namespace GSM.Manager.UI
             End Try
         End Function
 
+        ''' <summary>
+        ''' Copy a path to the clipboard, swallowing the transient
+        ''' failures Clipboard.SetText can throw when another process
+        ''' briefly holds the clipboard — not worth interrupting the
+        ''' user over a failed copy.
+        ''' </summary>
+        Private Shared Sub CopyPathToClipboard(path As String)
+            Try
+                If Not String.IsNullOrEmpty(path) Then Clipboard.SetText(path)
+            Catch
+            End Try
+        End Sub
+
         Private Sub LoadCurrentValues()
             Try
                 Using scope = ManagerProgram.Services.CreateScope()
@@ -1890,9 +2745,39 @@ Namespace GSM.Manager.UI
                     If days < _retentionDaysNumeric.Minimum Then days = CInt(_retentionDaysNumeric.Minimum)
                     If days > _retentionDaysNumeric.Maximum Then days = CInt(_retentionDaysNumeric.Maximum)
                     _retentionDaysNumeric.Value = days
+                    ' Phase 5m-1 tray preferences.
+                    _minimizeToTrayCheck.Checked = db.GetSettingBool(GsmDataExtensions.SettingKeys.MinimizeToTray, True)
+                    _closeToTrayCheck.Checked = db.GetSettingBool(GsmDataExtensions.SettingKeys.CloseToTray, False)
+                    _startMinimizedCheck.Checked = db.GetSettingBool(GsmDataExtensions.SettingKeys.StartMinimized, False)
+                    ' Phase 5l-1 — update settings.
+                    _includePrereleasesCheck.Checked = db.GetSettingBool(GsmDataExtensions.SettingKeys.UpdateIncludePrereleases, False)
+                    Dim hours = db.GetSettingInt(GsmDataExtensions.SettingKeys.UpdateCheckIntervalHours, GsmDataExtensions.DefaultUpdateCheckIntervalHours)
+                    If hours < _updateIntervalNumeric.Minimum Then hours = CInt(_updateIntervalNumeric.Minimum)
+                    If hours > _updateIntervalNumeric.Maximum Then hours = CInt(_updateIntervalNumeric.Maximum)
+                    _updateIntervalNumeric.Value = hours
                 End Using
             Catch
                 ' Swallow — form already shows the default value.
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Phase 5m-3 — reflect the actual watchdog logon-task state
+        ''' in the checkbox. If the watchdog isn't co-located next to
+        ''' the Manager, disable the option and say why (a task can't
+        ''' point at a missing exe).
+        ''' </summary>
+        Private Sub ReflectWatchdogState()
+            Try
+                If Not WatchdogTaskInstaller.WatchdogExeExists() Then
+                    _autoStartCheck.Checked = False
+                    _autoStartCheck.Enabled = False
+                    _autoStartCheck.Text = "Start PowerGSM automatically when I sign in  (watchdog not found)"
+                    Return
+                End If
+                _autoStartCheck.Checked = WatchdogTaskInstaller.IsInstalled()
+            Catch
+                ' Best-effort — leave the checkbox at its default.
             End Try
         End Sub
 
@@ -1903,8 +2788,30 @@ Namespace GSM.Manager.UI
                     db.SetSetting(
                         GsmDataExtensions.SettingKeys.ChatRetentionDays,
                         CInt(_retentionDaysNumeric.Value).ToString())
+                    ' Phase 5m-1 tray preferences.
+                    db.SetSettingBool(GsmDataExtensions.SettingKeys.MinimizeToTray, _minimizeToTrayCheck.Checked)
+                    db.SetSettingBool(GsmDataExtensions.SettingKeys.CloseToTray, _closeToTrayCheck.Checked)
+                    db.SetSettingBool(GsmDataExtensions.SettingKeys.StartMinimized, _startMinimizedCheck.Checked)
+                    ' Phase 5l-1 — update settings.
+                    db.SetSettingBool(GsmDataExtensions.SettingKeys.UpdateIncludePrereleases, _includePrereleasesCheck.Checked)
+                    db.SetSetting(GsmDataExtensions.SettingKeys.UpdateCheckIntervalHours, CInt(_updateIntervalNumeric.Value).ToString())
                     db.SaveChanges()
                 End Using
+
+                ' Phase 5m-3 — reconcile the watchdog logon task with
+                ' the checkbox. Independent of the DB settings above;
+                ' a failure is surfaced as a warning (not a hard error)
+                ' since the settings themselves saved fine.
+                If _autoStartCheck.Enabled Then
+                    Dim taskErr = WatchdogTaskInstaller.SetInstalled(_autoStartCheck.Checked)
+                    If taskErr IsNot Nothing Then
+                        MessageBox.Show(
+                            "Your settings were saved, but the startup task couldn't be updated:" & vbCrLf & vbCrLf &
+                            taskErr,
+                            "Startup task", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                    End If
+                End If
+
                 Me.DialogResult = DialogResult.OK
                 Me.Close()
             Catch ex As Exception
@@ -2178,6 +3085,17 @@ Namespace GSM.Manager.UI
         Private _driftWarningLabel As Label
         Private _openInAutomationButton As Button
 
+        ' ---- Collapsible Restart Schedule section state ----
+        ' The header is a clickable disclosure (▼ expanded / ► collapsed).
+        ' Collapsing hides both restart panels and grows _configPanel
+        ' into the freed space; expanding restores both. Save/Cancel
+        ' and the form height never move.
+        Private _restartHeader As Label
+        Private _restartCollapsed As Boolean
+        Private _configExpandedHeight As Integer
+        Private _restartHeaderExpandedTop As Integer
+        Private _saveButtonTop As Integer
+
         ' ---- Restart Schedule state ----
         ' True when the existing rule doesn't match the canonical
         ' simple shape. We load this at form-open time; if true,
@@ -2266,6 +3184,7 @@ Namespace GSM.Manager.UI
                 .BorderStyle = BorderStyle.FixedSingle,
                 .AutoScroll = True}
             Me.Controls.Add(_configPanel)
+            _configExpandedHeight = _configPanel.Height
             y += 230
 
             ' ---- Restart Schedule section ----
@@ -2273,6 +3192,7 @@ Namespace GSM.Manager.UI
             y += 265
 
             ' ---- Save / Cancel ----
+            _saveButtonTop = y
             Dim saveBtn As New Button() With {
                 .Text = "Save", .Size = New Size(100, 32),
                 .Location = New Point(330, y)}
@@ -2297,12 +3217,15 @@ Namespace GSM.Manager.UI
         Private Sub InitializeRestartSection(startY As Integer)
             Dim y = startY
 
-            Dim header As New Label() With {
-                .Text = "Restart Schedule",
+            _restartHeaderExpandedTop = y
+            _restartHeader = New Label() With {
+                .Text = "▼ Restart Schedule",
                 .Font = New Font("Segoe UI", 10, FontStyle.Bold),
                 .AutoSize = True,
+                .Cursor = Cursors.Hand,
                 .Location = New Point(20, y)}
-            Me.Controls.Add(header)
+            AddHandler _restartHeader.Click, AddressOf OnToggleRestartSection
+            Me.Controls.Add(_restartHeader)
             y += 25
 
             ' Both panels occupy the same region below the header.
@@ -2555,9 +3478,53 @@ Namespace GSM.Manager.UI
         ''' "Presets:", etc.).
         ''' </summary>
         Private Sub ApplyDriftState()
-            If Not _isDrifted Then Return
-            _normalPanel.Visible = False
-            _driftPanel.Visible = True
+            ' When the section is collapsed, neither panel shows; the
+            ' expand path re-derives the correct one. When expanded,
+            ' drift decides: the simple cron controls (_normalPanel)
+            ' or the "edited in Automation Rules" warning (_driftPanel).
+            If _restartCollapsed Then
+                _normalPanel.Visible = False
+                _driftPanel.Visible = False
+                Return
+            End If
+            If _isDrifted Then
+                _normalPanel.Visible = False
+                _driftPanel.Visible = True
+            Else
+                _normalPanel.Visible = True
+                _driftPanel.Visible = False
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Toggle the Restart Schedule section between expanded and
+        ''' collapsed. Collapsing hides the cron/preset panels and
+        ''' grows the Instance Configuration panel down into the freed
+        ''' space (the header relocates to just above Save so it stays
+        ''' clickable); expanding restores both. Save/Cancel and the
+        ''' form height never move.
+        ''' </summary>
+        Private Sub OnToggleRestartSection(sender As Object, e As EventArgs)
+            SetRestartCollapsed(Not _restartCollapsed)
+        End Sub
+
+        Private Sub SetRestartCollapsed(collapsed As Boolean)
+            _restartCollapsed = collapsed
+            _restartHeader.Text = If(collapsed, "► Restart Schedule", "▼ Restart Schedule")
+
+            If collapsed Then
+                ' Park the header just above the Save row and give the
+                ' whole gap between the config panel and that row to
+                ' the config panel.
+                Dim collapsedHeaderTop = _saveButtonTop - 30
+                _restartHeader.Top = collapsedHeaderTop
+                _configPanel.Height = collapsedHeaderTop - 10 - _configPanel.Top
+            Else
+                _restartHeader.Top = _restartHeaderExpandedTop
+                _configPanel.Height = _configExpandedHeight
+            End If
+
+            ApplyDriftState()
         End Sub
 
         Private Sub OnCronTextChanged(sender As Object, e As EventArgs)
@@ -2756,6 +3723,12 @@ Namespace GSM.Manager.UI
                 ApplyDriftState()
                 UpdateRestartControlsEnabled()
                 RefreshNextRunPreview()
+
+                ' Start with the Restart Schedule section collapsed so
+                ' the Instance Configuration panel gets the room up
+                ' front; the user expands it via the header when they
+                ' need the cron / preset controls.
+                SetRestartCollapsed(True)
 
                 ' ---- Load config schema ----
                 Dim existingValues As New Dictionary(Of String, String)
@@ -3528,6 +4501,443 @@ Namespace GSM.Manager.UI
                 Return Label
             End Function
         End Class
+
+    End Class
+
+    ' ============================================================
+    '  Phase 5j — Purge & Rebuild History dialog flow
+    '
+    '  Three forms in sequence for the Tools menu "Purge & Rebuild
+    '  History..." action:
+    '
+    '    1. PurgeAndRebuildHistoryForm — confirmation dialog with
+    '       explicit "what survives / what doesn't" disclosure,
+    '       affected-instances preview, and typed-confirm
+    '       ("REBUILD") gate before the destructive button enables.
+    '
+    '    2. PurgeAndRebuildProgressForm — modeless progress dialog
+    '       shown while InstanceManager.PurgeAndRebuildHistoryAsync
+    '       runs. Updates a single status label from the
+    '       IProgress callback; marquee progress bar because we
+    '       don't pre-count rows.
+    '
+    '    3. PurgeAndRebuildResultForm — row counts + warning list
+    '       shown when the operation completes (success or fail).
+    '
+    '  MainForm.OnPurgeAndRebuildHistory wires them together.
+    ' ============================================================
+
+    ''' <summary>
+    ''' Confirmation dialog opened from Tools → Purge & Rebuild
+    ''' History... Renders the explicit "what survives / what's
+    ''' removed" lists from the Phase 5j plan plus an affected-
+    ''' instances preview, and gates the Confirm button behind a
+    ''' typed-confirm field. Returns DialogResult.OK when the
+    ''' operator types REBUILD and clicks Confirm.
+    '''
+    ''' All cosmetic — doesn't actually do any work itself. The
+    ''' caller (MainForm) drives the operation after
+    ''' ShowDialog returns OK.
+    ''' </summary>
+    Public Class PurgeAndRebuildHistoryForm
+        Inherits Form
+
+        Private _affectedListBox As ListBox
+        Private _confirmTextBox As TextBox
+        Private _confirmButton As Button
+        Private _cancelButton As Button
+        Private Const ConfirmWord As String = "REBUILD"
+
+        Public Sub New()
+            FormIconHelper.ApplyTo(Me)
+            InitializeControls()
+            PopulateAffectedInstances()
+        End Sub
+
+        Private Sub InitializeControls()
+            Me.Text = "Purge & Rebuild History"
+            Me.Size = New Size(640, 640)
+            Me.MinimumSize = New Size(560, 560)
+            Me.StartPosition = FormStartPosition.CenterParent
+            Me.FormBorderStyle = FormBorderStyle.Sizable
+            Me.MaximizeBox = False
+            Me.MinimizeBox = False
+
+            Dim y As Integer = 15
+
+            ' ---- Heading ----
+            Dim headingLabel As New Label() With {
+                .Text = "Purge & Rebuild History",
+                .Font = New Font(SystemFonts.MessageBoxFont.FontFamily, 12, FontStyle.Bold),
+                .AutoSize = True,
+                .Location = New Point(20, y)
+            }
+            Me.Controls.Add(headingLabel)
+            y += headingLabel.Height + 8
+
+            ' ---- Subhead ----
+            Dim subheadLabel As New Label() With {
+                .Text = "This will delete all chat, player activity, player sessions, and session hosts from the Manager database and rebuild them from currently-running instances' authoritative state on their Nodes.",
+                .Location = New Point(20, y),
+                .Size = New Size(600, 50),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
+            }
+            Me.Controls.Add(subheadLabel)
+            y += subheadLabel.Height + 12
+
+            ' ---- Preserved group ----
+            Dim preservedBox As New GroupBox() With {
+                .Text = "Preserved",
+                .Location = New Point(20, y),
+                .Size = New Size(600, 100),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
+            }
+            Dim preservedText As New Label() With {
+                .Text = "• Real join timestamps for every currently-connected player (from each Node's in-memory session state)" & vbCrLf &
+                        "• Chat history for currently-connected players, since each player's most recent join" & vbCrLf &
+                        "• Current tile / session metadata for each running instance (one open SessionHost row per instance with a loaded tile)",
+                .Location = New Point(12, 22),
+                .Size = New Size(575, 75),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
+            }
+            preservedBox.Controls.Add(preservedText)
+            Me.Controls.Add(preservedBox)
+            y += preservedBox.Height + 8
+
+            ' ---- Removed group ----
+            Dim removedBox As New GroupBox() With {
+                .Text = "Removed, not recoverable",
+                .Location = New Point(20, y),
+                .Size = New Size(600, 110),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right,
+                .ForeColor = Color.FromArgb(140, 0, 0)
+            }
+            Dim removedText As New Label() With {
+                .Text = "• All historical join/leave events for players no longer connected" & vbCrLf &
+                        "• All chat from players no longer connected" & vbCrLf &
+                        "• All chat from previous sessions of currently-connected players (if they rejoined)" & vbCrLf &
+                        "• All session-host history for previous tiles on running instances" & vbCrLf &
+                        "• All history from instances not currently running on attached nodes",
+                .Location = New Point(12, 22),
+                .Size = New Size(575, 85),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right,
+                .ForeColor = Color.Black
+            }
+            removedBox.Controls.Add(removedText)
+            Me.Controls.Add(removedBox)
+            y += removedBox.Height + 8
+
+            ' ---- Affected instances preview ----
+            Dim affectedLabel As New Label() With {
+                .Text = "Affected instances (currently running on attached nodes):",
+                .Location = New Point(20, y),
+                .AutoSize = True
+            }
+            Me.Controls.Add(affectedLabel)
+            y += affectedLabel.Height + 4
+
+            _affectedListBox = New ListBox() With {
+                .Location = New Point(20, y),
+                .Size = New Size(600, 90),
+                .IntegralHeight = False,
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right Or AnchorStyles.Bottom
+            }
+            Me.Controls.Add(_affectedListBox)
+            y += _affectedListBox.Height + 10
+
+            ' ---- Typed confirmation row ----
+            Dim confirmPromptLabel As New Label() With {
+                .Text = $"Type {ConfirmWord} (uppercase) to confirm:",
+                .Location = New Point(20, y),
+                .AutoSize = True,
+                .Anchor = AnchorStyles.Bottom Or AnchorStyles.Left
+            }
+            Me.Controls.Add(confirmPromptLabel)
+            y += confirmPromptLabel.Height + 4
+
+            _confirmTextBox = New TextBox() With {
+                .Location = New Point(20, y),
+                .Size = New Size(200, 22),
+                .Anchor = AnchorStyles.Bottom Or AnchorStyles.Left
+            }
+            AddHandler _confirmTextBox.TextChanged, AddressOf OnConfirmTextChanged
+            Me.Controls.Add(_confirmTextBox)
+
+            ' ---- Buttons ----
+            _confirmButton = New Button() With {
+                .Text = "Confirm",
+                .Size = New Size(100, 30),
+                .Location = New Point(420, y - 4),
+                .DialogResult = DialogResult.OK,
+                .Enabled = False,
+                .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+            }
+            Me.Controls.Add(_confirmButton)
+
+            _cancelButton = New Button() With {
+                .Text = "Cancel",
+                .Size = New Size(80, 30),
+                .Location = New Point(530, y - 4),
+                .DialogResult = DialogResult.Cancel,
+                .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+            }
+            Me.Controls.Add(_cancelButton)
+
+            Me.AcceptButton = _confirmButton
+            Me.CancelButton = _cancelButton
+        End Sub
+
+        Private Sub OnConfirmTextChanged(sender As Object, e As EventArgs)
+            ' Case-sensitive match. If the operator typed "rebuild"
+            ' or "Rebuild" we leave the button disabled — the
+            ' all-caps gate forces a deliberate keystroke pattern
+            ' rather than a muscle-memory "yes, sure".
+            _confirmButton.Enabled = String.Equals(
+                _confirmTextBox.Text, ConfirmWord, StringComparison.Ordinal)
+        End Sub
+
+        Private Sub PopulateAffectedInstances()
+            _affectedListBox.Items.Clear()
+
+            Dim instMgr = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If instMgr Is Nothing Then
+                _affectedListBox.Items.Add("(InstanceManager service not available)")
+                Return
+            End If
+
+            Dim targets = instMgr.GetRebuildTargetIds()
+            If targets Is Nothing OrElse targets.Count = 0 Then
+                _affectedListBox.Items.Add("(No running instances on attached nodes — the purge will run but nothing will be rebuilt.)")
+                Return
+            End If
+
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    For Each id In targets
+                        Dim label As String
+                        Try
+                            Dim row = (From inst In db.Instances
+                                       Join install In db.Installations
+                                           On inst.InstallationId Equals install.InstallationId
+                                       Join nodeEnt In db.Nodes
+                                           On install.NodeId Equals nodeEnt.NodeId
+                                       Where inst.InstanceId = id
+                                       Select New With {
+                                           .NodeName = nodeEnt.DisplayName,
+                                           .InstallName = install.DisplayName,
+                                           .InstName = inst.DisplayName
+                                       }).FirstOrDefault()
+                            If row IsNot Nothing Then
+                                label = $"{row.NodeName} / {row.InstallName} / {row.InstName}"
+                            Else
+                                label = id
+                            End If
+                        Catch
+                            label = id
+                        End Try
+                        _affectedListBox.Items.Add(label)
+                    Next
+                End Using
+            Catch
+                _affectedListBox.Items.Clear()
+                For Each id In targets
+                    _affectedListBox.Items.Add(id)
+                Next
+            End Try
+        End Sub
+
+    End Class
+
+    ''' <summary>
+    ''' Modeless progress dialog shown by MainForm while
+    ''' PurgeAndRebuildHistoryAsync runs. The operator can't cancel
+    ''' — the operation runs to completion regardless of dialog
+    ''' dismissal (rolling back partway is the failure path, not a
+    ''' cancellation path) — so the form has no Cancel button. The
+    ''' caller closes the dialog programmatically after the
+    ''' awaited task completes.
+    ''' </summary>
+    Public Class PurgeAndRebuildProgressForm
+        Inherits Form
+
+        Private _statusLabel As Label
+        Private _progressBar As ProgressBar
+
+        Public Sub New()
+            FormIconHelper.ApplyTo(Me)
+            InitializeControls()
+        End Sub
+
+        Private Sub InitializeControls()
+            Me.Text = "Purge & Rebuild in progress..."
+            Me.Size = New Size(450, 145)
+            Me.StartPosition = FormStartPosition.CenterParent
+            Me.FormBorderStyle = FormBorderStyle.FixedDialog
+            Me.MaximizeBox = False
+            Me.MinimizeBox = False
+            Me.ControlBox = False
+
+            _statusLabel = New Label() With {
+                .Text = "Starting...",
+                .Location = New Point(20, 20),
+                .Size = New Size(400, 40),
+                .AutoEllipsis = True
+            }
+            Me.Controls.Add(_statusLabel)
+
+            _progressBar = New ProgressBar() With {
+                .Style = ProgressBarStyle.Marquee,
+                .MarqueeAnimationSpeed = 30,
+                .Location = New Point(20, 65),
+                .Size = New Size(400, 22)
+            }
+            Me.Controls.Add(_progressBar)
+        End Sub
+
+        ''' <summary>
+        ''' Updates the status label. Safe to call from any
+        ''' thread — marshals to the UI thread via Invoke if
+        ''' needed. Called from the IProgress(Of String) callback
+        ''' which Progress(Of T) routes back to the capturing
+        ''' SynchronizationContext, but the safety net here
+        ''' tolerates callers that don't use Progress(Of T).
+        ''' </summary>
+        Public Sub UpdateMessage(msg As String)
+            If Me.IsDisposed Then Return
+            If Me.InvokeRequired Then
+                Try
+                    Me.BeginInvoke(Sub() UpdateMessage(msg))
+                Catch
+                End Try
+                Return
+            End If
+            _statusLabel.Text = If(msg, "")
+        End Sub
+
+    End Class
+
+    ''' <summary>
+    ''' Result summary shown after PurgeAndRebuildHistoryAsync
+    ''' completes. Renders the row counts per table, total
+    ''' duration, and any warnings (non-fatal failures the
+    ''' operation collected during its run). Modal — the operator
+    ''' acknowledges the outcome before returning to the main
+    ''' window.
+    ''' </summary>
+    Public Class PurgeAndRebuildResultForm
+        Inherits Form
+
+        Private ReadOnly _result As PurgeAndRebuildResult
+
+        Public Sub New(result As PurgeAndRebuildResult)
+            FormIconHelper.ApplyTo(Me)
+            _result = If(result, New PurgeAndRebuildResult())
+            InitializeControls()
+        End Sub
+
+        Private Sub InitializeControls()
+            Me.Text = "Purge & Rebuild Complete"
+            Me.Size = New Size(560, 460)
+            Me.MinimumSize = New Size(480, 360)
+            Me.StartPosition = FormStartPosition.CenterParent
+            Me.FormBorderStyle = FormBorderStyle.Sizable
+            Me.MaximizeBox = False
+            Me.MinimizeBox = False
+
+            Dim hadFailure = _result.InstancesRebuilt = 0 AndAlso
+                              _result.InstancesSkipped = 0 AndAlso
+                              _result.PlayerActivityRowsCreated = 0 AndAlso
+                              _result.ChatRowsCreated = 0 AndAlso
+                              _result.Warnings.Count > 0
+
+            Dim headingText As String
+            Dim headingColor As Color
+            If hadFailure Then
+                headingText = "Operation failed"
+                headingColor = Color.FromArgb(160, 0, 0)
+            ElseIf _result.Warnings.Count > 0 Then
+                headingText = "Completed with warnings"
+                headingColor = Color.FromArgb(180, 100, 0)
+            Else
+                headingText = "Completed successfully"
+                headingColor = Color.FromArgb(0, 110, 0)
+            End If
+
+            Dim headingLabel As New Label() With {
+                .Text = headingText,
+                .Font = New Font(SystemFonts.MessageBoxFont.FontFamily, 12, FontStyle.Bold),
+                .ForeColor = headingColor,
+                .AutoSize = True,
+                .Location = New Point(20, 15)
+            }
+            Me.Controls.Add(headingLabel)
+
+            ' ---- Counts ----
+            Dim countsBox As New GroupBox() With {
+                .Text = "Summary",
+                .Location = New Point(20, 50),
+                .Size = New Size(515, 160),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
+            }
+
+            Dim seconds As Double = _result.DurationMs / 1000.0
+            Dim countsText As New Label() With {
+                .Text = $"Instances rebuilt: {_result.InstancesRebuilt}" & vbCrLf &
+                        $"Instances skipped: {_result.InstancesSkipped}" & vbCrLf &
+                        $"Player activity rows created: {_result.PlayerActivityRowsCreated}" & vbCrLf &
+                        $"Player session rows created: {_result.PlayerSessionRowsCreated}" & vbCrLf &
+                        $"Session host rows created: {_result.SessionHostRowsCreated}" & vbCrLf &
+                        $"Chat rows created: {_result.ChatRowsCreated} (filtered out: {_result.ChatRowsFilteredOut})" & vbCrLf &
+                        $"Duration: {seconds:F2}s",
+                .Location = New Point(12, 22),
+                .Size = New Size(490, 130),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
+            }
+            countsBox.Controls.Add(countsText)
+            Me.Controls.Add(countsBox)
+
+            ' ---- Warnings ----
+            Dim warningsLabel As New Label() With {
+                .Text = If(_result.Warnings.Count = 0,
+                           "Warnings: none",
+                           $"Warnings ({_result.Warnings.Count}):"),
+                .Location = New Point(20, 220),
+                .AutoSize = True,
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left
+            }
+            Me.Controls.Add(warningsLabel)
+
+            Dim warningsBox As New TextBox() With {
+                .Multiline = True,
+                .ReadOnly = True,
+                .ScrollBars = ScrollBars.Vertical,
+                .Location = New Point(20, 245),
+                .Size = New Size(515, 130),
+                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right Or AnchorStyles.Bottom,
+                .WordWrap = True,
+                .Font = New Font(SystemFonts.MessageBoxFont.FontFamily, 9)
+            }
+            If _result.Warnings.Count > 0 Then
+                warningsBox.Text = String.Join(vbCrLf & vbCrLf, _result.Warnings)
+            Else
+                warningsBox.Text = "(No issues to report.)"
+            End If
+            Me.Controls.Add(warningsBox)
+
+            ' ---- OK button ----
+            Dim okButton As New Button() With {
+                .Text = "OK",
+                .Size = New Size(80, 30),
+                .Location = New Point(455, 385),
+                .DialogResult = DialogResult.OK,
+                .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+            }
+            Me.Controls.Add(okButton)
+
+            Me.AcceptButton = okButton
+            Me.CancelButton = okButton
+        End Sub
 
     End Class
 
