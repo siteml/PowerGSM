@@ -136,7 +136,7 @@ and [`VERSIONING.md`](VERSIONING.md).
 
 ## Version
 
-Current release: **0.4.0**. PowerGSM is pre-1.0; minor releases may
+Current release: **0.4.1**. PowerGSM is pre-1.0; minor releases may
 introduce breaking changes, always called out in
 [`CHANGELOG.md`](CHANGELOG.md). Manager and Node negotiate a **protocol
 version** on connect and degrade gracefully rather than refusing to talk,
