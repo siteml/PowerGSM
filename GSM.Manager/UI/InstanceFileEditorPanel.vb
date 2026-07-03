@@ -72,6 +72,11 @@ Namespace GSM.Manager.UI
         ' corrupt state.
         Private _opInFlight As Boolean
 
+        ' True once the file is confirmed absent AND the editor is
+        ' RequiresExistingFile: the form renders but is disabled and
+        ' Save is locked until the server generates the file.
+        Private _locked As Boolean
+
         ' Tripped on Dispose so async resumptions see cancellation
         ' and bail out before touching disposed controls.
         Private _disposeCts As CancellationTokenSource
@@ -276,16 +281,22 @@ Namespace GSM.Manager.UI
                     _formHost.Controls.Clear()
                 End If
 
+                _locked = (Not fileExisted) AndAlso _editor.RequiresExistingFile
+
                 _schemaResult = SchemaFormBuilder.Build(_editor.Schema, values, picker)
                 If _schemaResult.Panel IsNot Nothing Then
                     _schemaResult.Panel.Dock = DockStyle.Fill
+                    _schemaResult.Panel.Enabled = Not _locked
                     _formHost.Controls.Add(_schemaResult.Panel)
                 End If
 
-                If fileExisted Then
+                If _locked Then
+                    SetStatus($"{_editor.RelativePath} hasn't been generated yet. Start the server once to create it, then Reload to edit.",
+                              Color.DarkOrange)
+                ElseIf fileExisted Then
                     SetStatus($"Loaded {_editor.RelativePath} ({fileText.Length} bytes).", Color.DarkGreen)
                 Else
-                    SetStatus($"{_editor.RelativePath} doesn't exist yet \u2014 schema defaults shown. Save will create the file.",
+                    SetStatus($"{_editor.RelativePath} doesn't exist yet — schema defaults shown. Save will create the file.",
                               Color.DarkOrange)
                 End If
             Finally
@@ -341,7 +352,7 @@ Namespace GSM.Manager.UI
                 Return
             End Try
             If String.IsNullOrEmpty(newText) Then
-                SetStatus("Plugin produced empty file content \u2014 not saved.", Color.Firebrick)
+                SetStatus("Plugin produced empty file content — not saved.", Color.Firebrick)
                 Return
             End If
 
@@ -379,7 +390,7 @@ Namespace GSM.Manager.UI
         Private Sub UpdateButtons()
             If Me.IsDisposed Then Return
             Dim ready = (Not _opInFlight) AndAlso (_schemaResult IsNot Nothing)
-            _saveButton.Enabled = ready
+            _saveButton.Enabled = ready AndAlso Not _locked
             _reloadButton.Enabled = ready
         End Sub
 

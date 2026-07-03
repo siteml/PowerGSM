@@ -4066,8 +4066,12 @@ Namespace GSM.Manager.Core
             End Try
             If paths Is Nothing Then Return
 
+            Dim anyPath As Boolean = False
+            Dim allPresent As Boolean = True
+
             For Each relPath In paths
                 If String.IsNullOrWhiteSpace(relPath) Then Continue For
+                anyPath = True
                 Try
                     Dim roots = StartupFileAllowedRoots(relPath)
                     Dim exts = StartupFileAllowedExtensions(relPath)
@@ -4085,6 +4089,10 @@ Namespace GSM.Manager.Core
                                                       ex.StatusCode.Value = HttpStatusCode.NotFound
                         existing = ""
                     End Try
+
+                    ' Slice 5 readiness tracking: a still-absent file
+                    ' means the game hasn't generated it yet.
+                    If String.IsNullOrEmpty(existing) Then allPresent = False
 
                     Dim rendered As String = Nothing
                     Try
@@ -4114,11 +4122,35 @@ Namespace GSM.Manager.Core
                 Catch ex As Exception
                     ' O1 best-effort: warn and proceed; the file keeps its
                     ' last value and the launch goes ahead.
+                    allPresent = False
                     _logger.LogWarning(ex,
                         "Startup-file render: failed for {Path} on {Id}; launch proceeds with last value",
                         relPath, instanceId)
                 End Try
             Next
+
+            ' Slice 5: once every declared startup file exists on the node
+            ' (the game has generated them — true from the 2nd launch on
+            ' for games like Windrose), flip a per-instance readiness flag.
+            ' The EditInstanceForm "applies from the 2nd launch" notice
+            ' shows until this is set. Stored in AppSettings (not instance
+            ' ConfigJson) so a config-edit save can't clobber it and it
+            ' never rides along in CustomFields. Best-effort.
+            If anyPath AndAlso allPresent Then
+                Try
+                    Using scope = ManagerProgram.Services.CreateScope()
+                        Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                        Dim key = GsmDataExtensions.StartupFilesReadyKey(instanceId)
+                        If Not db.GetSettingBool(key, False) Then
+                            db.SetSettingBool(key, True)
+                            db.SaveChanges()
+                        End If
+                    End Using
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Startup-file readiness flag write failed for {Id}", instanceId)
+                End Try
+            End If
         End Function
 
         ''' <summary>

@@ -1,10 +1,11 @@
-' <plugin id="windrose" name="Windrose Dedicated Server" version="0.1.0" author="siteml" requiresContracts="2">
+' <plugin id="windrose" name="Windrose Dedicated Server" version="0.1.1" author="siteml" requiresContracts="2">
 ' <RequiresContracts: 2>
 Imports System
 Imports System.Collections.Generic
 Imports System.Text.Json
 Imports System.Text.Json.Nodes
 Imports System.Text.RegularExpressions
+Imports System.Reflection
 Imports GSM.Plugin
 
 ' ============================================================
@@ -426,23 +427,83 @@ Public Class WindrosePlugin
     ' ============================================================
 
     Public Function GetPreInstallNotices() As IReadOnlyList(Of InstallationNotice) Implements IInstallationNoticeProvider.GetPreInstallNotices
-        Return New InstallationNotice() {
-            New InstallationNotice With {
+        Dim notices As New List(Of InstallationNotice)
+
+        ' Best-effort version warning, NO contract dependency. The same-IP
+        ' session-collision fix is node-side in 0.4.1; from inside a plugin
+        ' we can only read the MANAGER's version (reflection on the entry
+        ' assembly — this plugin is Roslyn-loaded into the Manager's ALC, so
+        ' the entry assembly IS the Manager), not the node's. So this is a
+        ' weaker hint: a 0.4.1 Manager can still drive a not-yet-updated
+        ' 0.4.0 node. Fires only when the Manager itself predates 0.4.1;
+        ' skipped silently when the version can't be read (never warn on
+        ' uncertainty).
+        If ManagerVersionBelow("0.4.1") Then
+            notices.Add(New InstallationNotice With {
                 .Severity = NoticeSeverity.Warning,
-                .Title = "Windows nodes only",
-                .Body = "Windrose ships no native Linux dedicated-server binary. Install on a Linux node will fail at launch. If you need Linux hosting, run a Windows VM."
-            },
-            New InstallationNotice With {
-                .Severity = NoticeSeverity.Warning,
-                .Title = "Networking defaults to UPnP NAT punch-through until config editing lands",
-                .Body = "Out of the box Windrose uses ICE/P2P with UPnP NAT punch-through — the server opens ports on your router by itself, and players join with an invite code. Operator-controlled networking (one fixed port, no UPnP) requires editing ServerDescription.json, which arrives in the next slice of this plugin. Until then, don't expose this server to the internet if you can't allow UPnP auto-port-opening."
-            },
-            New InstallationNotice With {
-                .Severity = NoticeSeverity.Information,
-                .Title = "Config lives in JSON files — edit while stopped",
-                .Body = "Windrose has no launch-argument settings. The server reads ServerDescription.json (server-wide) and per-world WorldDescription.json files, both auto-created on first launch. Always edit them with the server fully stopped — the server may overwrite fields on startup. Structured editors for these arrive in later slices; for now, start once, stop, then edit the generated files directly."
-            }
-        }
+                .Title = "Update to 0.4.1+ for same-IP multiplayer",
+                .Body = "This PowerGSM build predates 0.4.1. Two players from the same public IP (same household / one router, no port to tell them apart) get merged into a single session — the second overwrites the first in the player list and History. Fixed node-side in 0.4.1: update BOTH the node and the manager to 0.4.1 or later. (This checks the Manager version only; if your node is older than the manager, update the node too.)"
+            })
+        End If
+
+        notices.Add(New InstallationNotice With {
+            .Severity = NoticeSeverity.Warning,
+            .Title = "Windows nodes only",
+            .Body = "Windrose ships no native Linux dedicated-server binary. Install on a Linux node will fail at launch. If you need Linux hosting, run a Windows VM."
+        })
+        notices.Add(New InstallationNotice With {
+            .Severity = NoticeSeverity.Warning,
+            .Title = "Networking defaults to UPnP NAT punch-through",
+            .Body = "Out of the box Windrose uses ICE/P2P with UPnP NAT punch-through — the server opens ports on your router by itself, and players join with an invite code. Operator-controlled networking (one fixed port, no UPnP) means editing ServerDescription.json by hand — PowerGSM has no structured editor for it. Unless you do that, don't expose this server to the internet if you can't allow UPnP auto-port-opening."
+        })
+        notices.Add(New InstallationNotice With {
+            .Severity = NoticeSeverity.Information,
+            .Title = "Config lives in JSON files — edit while stopped",
+            .Body = "Windrose has no launch-argument settings. The server reads ServerDescription.json (server-wide) and per-world WorldDescription.json files, both auto-created on first launch. Always edit them with the server fully stopped — the server may overwrite fields on startup. PowerGSM has no structured editor for these: start once, stop, then edit the generated files directly."
+        })
+
+        Return notices
+    End Function
+
+    ' Read the Manager's own version. Uses InformationalVersion (derived
+    ' from <Version> = the real 0.MINOR.PATCH); NOT AssemblyVersion, which
+    ' is pinned at 0.MINOR.0.0 across patch releases and so can't tell
+    ' 0.4.0 from 0.4.1. Compares MAJOR.MINOR.PATCH only, ignoring any
+    ' +sha / -rc suffix. Best-effort: any failure returns False (no warn).
+    Private Shared Function ManagerVersionBelow(minVersion As String) As Boolean
+        Try
+            Dim asm = Assembly.GetEntryAssembly()
+            If asm Is Nothing Then Return False
+            Dim attr = asm.GetCustomAttribute(Of AssemblyInformationalVersionAttribute)()
+            If attr Is Nothing OrElse String.IsNullOrEmpty(attr.InformationalVersion) Then Return False
+            Return CompareVersionCore(attr.InformationalVersion, minVersion) < 0
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Shared Function CompareVersionCore(a As String, b As String) As Integer
+        Dim pa = VersionParts(a)
+        Dim pb = VersionParts(b)
+        For i = 0 To 2
+            Dim c = pa(i).CompareTo(pb(i))
+            If c <> 0 Then Return c
+        Next
+        Return 0
+    End Function
+
+    Private Shared Function VersionParts(v As String) As Integer()
+        If v Is Nothing Then v = ""
+        Dim cut = v.IndexOfAny(New Char() {"+"c, "-"c})
+        If cut >= 0 Then v = v.Substring(0, cut)
+        Dim parts = v.Split("."c)
+        Dim out(2) As Integer
+        For i = 0 To 2
+            Dim n As Integer = 0
+            If i < parts.Length Then Integer.TryParse(parts(i), n)
+            out(i) = n
+        Next
+        Return out
     End Function
 
     ' ============================================================
@@ -524,7 +585,8 @@ Public Class WindrosePlugin
                 .Key = ServerDescEditorKey,
                 .TabTitle = "Server Settings",
                 .RelativePath = ServerDescRelativePath,
-                .Schema = BuildServerDescriptionSchema()
+                .Schema = BuildServerDescriptionSchema(),
+                .RequiresExistingFile = True
             }
         }
     End Function

@@ -9,6 +9,62 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-02
+
+### Added
+
+- **User & developer documentation suite.** New root `README.md` (project
+  overview, quick system requirements, doc index) plus `docs/user/`
+  (`prerequisites.md`, `node.md`, `manager.md`, `plugins.md`) and
+  `docs/developer/` (`plugin-authoring.md`, `api-protocol.md`) — covering
+  install/setup of Node (Windows + Linux) and Manager, every Manager feature,
+  per-plugin setup for all four shipped games and lo-myrealm, plugin authoring
+  against `IGamePlugin`/`IUtilityPlugin`, and the Manager↔Node REST protocol
+  including guidance for building alternative (e.g. web-based) Managers.
+
+- **Windrose — best-effort install-pane warning on pre-0.4.1 builds.** Plugin
+  reads the Manager's own `InformationalVersion` by reflection (entry assembly;
+  no contract dependency) and, when it's below 0.4.1, prepends a Warning notice
+  to `GetPreInstallNotices` about the same-IP session collision. Manager-only
+  signal (can't see the node's version from a plugin), so the body says to
+  update the node too; self-suppresses at 0.4.1+.
+
+- **Config-file-presence UX (Slice 5).** Surfaces the "config not generated
+  yet" state for plugins whose settings are written into the game's own file
+  at launch (`IStartupFileProvider`), so a defaults-only partial write can't
+  crash the server. Additive `InstanceFileEditor.RequiresExistingFile`
+  (default False, no `ContractsVersion` bump): when True and the target file
+  is absent, the structured editor (e.g. Windrose Server Settings) locks —
+  fields + Save disabled, "start the server once to generate it, then Reload"
+  hint — instead of rendering a saveable defaults form. Edit Instance shows a
+  Notice banner that these settings apply from the SECOND launch (the game
+  generates the file on the first), gated by a per-instance readiness flag in
+  `AppSettings` (`instance.{id}.startupFilesReady`) that flips once every
+  declared startup file exists on the node; kept out of instance ConfigJson so
+  a config-edit save can't clobber it and it never rides in `CustomFields`.
+  Windrose sets `RequiresExistingFile = True` on its Server Settings editor;
+  other plugins default off and are unchanged. Motivated by a live crash: a
+  partial ServerDescription.json (missing server-owned Version / DeploymentId /
+  PersistentServerId / P2p*) made the server fail vendor registration fatally.
+
+### Fixed
+
+- **Node `EventStore` — two players from one IP no longer collapse into a
+  single session.** `FindExistingSession`'s RemoteAddress fallback claimed an
+  existing same-IP session even when the incoming event carried a *different*
+  strong id (CharacterId / PlatformUserId), so a second player joining from the
+  same public IP (no port to tell them apart) overwrote the first player's
+  identity in `/players` and the persisted `players` row. The addr fallback now
+  declines a match whose cid/pid conflicts with the incoming one, keeping
+  same-IP players distinct while preserving addr-first identity enrichment (an
+  addr-only session with no strong id still matches, so LO's
+  NotifyAcceptedConnection→identity sequence is untouched). Node-side only; no
+  contract change (`ContractsVersion` stays 2). Surfaced by Windrose (bare-IP
+  `NetAddress`); Last Oasis (IP:Port, unique per connection) and Conan (name in
+  the disconnect line) were never exposed. Disconnect correlation is unchanged
+  for all three — the guard only fires on a cid/pid conflict, and leave lines
+  that carry only an address have no strong id to conflict.
+
 ## [0.4.0] - 2026-07-01
 
 ### Added

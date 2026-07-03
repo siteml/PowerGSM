@@ -440,7 +440,7 @@ Namespace GSM.Manager.UI
             If Not String.IsNullOrEmpty(output) AndAlso message.Length < 80 Then
                 Dim tail = output.TrimEnd()
                 If tail.Length > 200 Then tail = tail.Substring(tail.Length - 200)
-                SetStatus($"{message} \u2014 {tail}", Color.Firebrick)
+                SetStatus($"{message} — {tail}", Color.Firebrick)
             Else
                 SetStatus(message, Color.Firebrick)
             End If

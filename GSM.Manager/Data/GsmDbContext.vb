@@ -1705,6 +1705,21 @@ Namespace GSM.Manager.Data
         Public Const DefaultUpdateSource As String = "siteml/PowerGSM"
         Public Const DefaultUpdateCheckIntervalHours As Integer = 4
 
+        ''' <summary>
+        ''' Per-instance AppSettings key: set to "1" once the game has
+        ''' generated its IStartupFileProvider config file(s) on the
+        ''' node (true from the 2nd launch on for games like Windrose).
+        ''' Gates the EditInstanceForm "settings apply from the 2nd
+        ''' launch" notice — shown until this flips. Lives in AppSettings
+        ''' rather than the instance ConfigJson so an EditInstanceForm
+        ''' save (which rewrites ConfigJson from schema fields only)
+        ''' can't clobber it, and so it never rides along in
+        ''' InstanceConfig.CustomFields.
+        ''' </summary>
+        Public Function StartupFilesReadyKey(instanceId As String) As String
+            Return $"instance.{instanceId}.startupFilesReady"
+        End Function
+
         ' ============================================================
         '  SortOrder helpers
         '

@@ -1288,7 +1288,24 @@ Namespace GSM.Node
             End If
             If Not String.IsNullOrEmpty(addr) Then
                 Dim m = state.Players.Values.FirstOrDefault(Function(p) p.RemoteAddress = addr)
-                If m IsNot Nothing Then Return m
+                ' Shared-IP guard: two players behind one NAT/router share a
+                ' RemoteAddress with no port to tell them apart. Only claim an
+                ' addr-matched session when it has NO strong id that conflicts
+                ' with the incoming one. An addr-only session (cid/pid not set
+                ' yet — e.g. LO's NotifyAcceptedConnection before its identity
+                ' line) still matches, preserving addr-first enrichment; a
+                ' session already owning a DIFFERENT cid/pid does not, so the
+                ' second player stays a distinct session instead of overwriting
+                ' the first.
+                If m IsNot Nothing Then
+                    Dim cidConflict = Not String.IsNullOrEmpty(cid) AndAlso
+                                      Not String.IsNullOrEmpty(m.CharacterId) AndAlso
+                                      Not String.Equals(cid, m.CharacterId, StringComparison.OrdinalIgnoreCase)
+                    Dim pidConflict = Not String.IsNullOrEmpty(pid) AndAlso
+                                      Not String.IsNullOrEmpty(m.PlatformUserId) AndAlso
+                                      Not String.Equals(pid, m.PlatformUserId, StringComparison.OrdinalIgnoreCase)
+                    If Not cidConflict AndAlso Not pidConflict Then Return m
+                End If
             End If
             If Not String.IsNullOrEmpty(display) Then
                 Dim m = state.Players.Values.FirstOrDefault(

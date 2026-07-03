@@ -314,6 +314,23 @@ IP:Port lives in a different place in each:
    `PlayerSession.RemoteAddress` is populated here and IS the value
    shown in the Overview "IP Address" column.
 
+   **Shared-IP guard (0.4.1).** The `RemoteAddress` step in
+   `FindExistingSession` will NOT claim a same-IP session whose
+   CharacterId/PlatformUserId *conflicts* with the incoming event's.
+   Two players behind one public IP with no port to tell them apart
+   would otherwise collapse into one session — the second join
+   matched the first by address and overwrote its identity (observed
+   2026-07-02: Windrose, `blingity` + `Archester` both from
+   38.148.81.58). An addr-only session (no strong id yet — e.g. LO's
+   `NotifyAcceptedConnection` before its identity line) still matches,
+   so addr-first enrichment is unaffected, and the guard only ever
+   fires on a cid/pid conflict so leave lines carrying only an address
+   are unchanged. Games whose address carries a port (LO `IP:Port`,
+   unique per connection) or whose leave line carries a name (Conan)
+   never hit this; a bare-IP game (Windrose `NetAddress`) does, which
+   is why it must supply a strong id (Windrose maps AccountId →
+   CharacterId).
+
 2. **Manager `LastOasisLogParser`** — re-parses the same log lines the
    Node streams up and keeps its own `RemoteAddr → name` table
    (`_connectionsByAddr`), bound at `Join succeeded`. **This is the

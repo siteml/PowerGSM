@@ -1775,6 +1775,26 @@ Namespace GSM.Plugin
         ''' and IFileGenerationProvider.GetGenerationSchema.
         ''' </summary>
         Public Property Schema As IReadOnlyList(Of ConfigFieldDescriptor)
+
+        ''' <summary>
+        ''' Opt-in (default False). When True, the Manager treats the
+        ''' editor as a read-only LOCKOUT until the target file exists
+        ''' on the node: fields and Save are disabled and a hint tells
+        ''' the user to start the server once to generate the file,
+        ''' then edit. Leave False (the historical behaviour) for any
+        ''' file the plugin or user legitimately creates from empty —
+        ''' the Manager then renders schema DefaultValues and lets
+        ''' WriteValuesToFile build a fresh file.
+        '''
+        ''' Set True only when writing a partial file before the game
+        ''' has authored its own copy would BREAK the server. Windrose
+        ''' is the motivating case: ServerDescription.json carries
+        ''' server-owned fields (Version / DeploymentId /
+        ''' PersistentServerId / P2p*) the plugin can't synthesise;
+        ''' a defaults-only partial write makes the server reject the
+        ''' file and fatally fail vendor registration on next launch.
+        ''' </summary>
+        Public Property RequiresExistingFile As Boolean = False
     End Class
 
     ''' <summary>

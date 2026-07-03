@@ -2502,7 +2502,8 @@ Namespace GSM.Manager.UI
                         .Key = rawEditor.Key,
                         .TabTitle = rawEditor.TabTitle,
                         .RelativePath = resolvedRel,
-                        .Schema = rawEditor.Schema
+                        .Schema = rawEditor.Schema,
+                        .RequiresExistingFile = rawEditor.RequiresExistingFile
                     }
 
                     Dim tab As New TabPage(If(rawEditor.TabTitle, resolvedRel))

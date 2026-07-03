@@ -268,3 +268,63 @@ Interfaces used: `IGamePlugin`, `IInstallationNoticeProvider`,
 `IInstanceFileEditorProvider`, `ILaunchOptionsProvider`,
 `IFileGenerationProvider`. Header magic comment:
 `' <RequiresContracts: 1>` (same as Conan).
+
+---
+
+## 8. Slice 5 — config-file-presence UX (cross-cutting: Contracts + Manager + Windrose)
+
+**Problem.** Windrose's whole config surface is inert until the server's
+first launch generates `ServerDescription.json`:
+- **Server Settings editor** — editing before the file exists writes a
+  partial (schema defaults only, missing the server-owned `Version` /
+  `DeploymentId` / `PersistentServerId` / `P2p*`). Server rejects it
+  (`R5LogCoopProxy: Server description json is broken. Cannot find or parse
+  'Version'`) → vendor Connection-Manager registration fails
+  (`R5NetCmClient_GsStream::SetBrokenState … CmResult_ResultType_Failed`) →
+  **appError fatal crash**. Observed live 2026-07-02.
+- **Configuration tab** (`UseDirectConnection`, port) — stored Manager-side,
+  but `RenderStartupFile` refuses to fabricate a partial file, so on the
+  FIRST launch nothing is written and the server uses its own defaults
+  (UPnP, no fixed port). Settings apply only from the 2nd launch on.
+- **Setup-time auto-gen rejected** — `RunProcessStep` is run-to-exit/timeout
+  + force-kill, no wait-for-file, no graceful stop; force-killing mid-write
+  risks JSON/RocksDB corruption and triggers vendor Cm registration at
+  install. Also confirmed: the server overwrites any pre-written file on
+  launch. So we do NOT pre-generate; we surface the not-yet-generated state.
+
+**Fix — three parts:**
+
+1. **Contracts — `InstanceFileEditor.RequiresExistingFile As Boolean = False`.**
+   Additive, default-safe, sole consumer (Windrose) ships with it → **no
+   `ContractsVersion` bump**. When `True` AND the target file is absent/empty,
+   the editor is a read-only lockout instead of an empty-defaults form (which
+   is what currently produces the crash-inducing partial write).
+
+2. **Manager UI:**
+   - *File-editor tab*: `RequiresExistingFile` AndAlso fetched file text
+     empty/absent → disable fields + Save, show "Start the server once to
+     generate this file, then edit."
+   - *Edit Instance / Configuration*: plugin implements `IStartupFileProvider`
+     AndAlso any declared startup file absent → info notice "These settings
+     apply after the first launch generates the config file — start once, then
+     they take effect." Auto-conditioned off `GetStartupFiles` + file
+     existence; no per-plugin hack.
+
+3. **Windrose:** set `RequiresExistingFile = True` on the Server Settings
+   editor. No other plugin changes — default `False` leaves LO / Conan /
+   Factorio (whose configs are legitimately hand- or self-generated from
+   empty) untouched.
+
+**Why opt-in.** A blanket "lock editor when file missing" would break every
+plugin that creates its config from empty. The gate MUST be per-editor.
+
+**Open items (locate before coding):**
+- Where the Manager fetches editor file text (InstancePanel file-editor tab)
+  and where Edit Instance renders notices — find the gate points.
+- Edit-Instance notice needs a cheap file-existence probe via node `/files`
+  per `GetStartupFiles` entry — confirm the endpoint + a HEAD-style check.
+
+**Scope / version.** Cross-cutting (Contracts + Manager benefit all plugins,
+Windrose is the first consumer). Its own patch/minor after 0.4.1; confirm-
+gated slices: (a) Contracts prop, (b) Manager file-editor lock, (c) Manager
+Edit-Instance notice, (d) Windrose flag. Each compiles independently.

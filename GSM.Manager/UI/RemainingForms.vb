@@ -3764,6 +3764,30 @@ Namespace GSM.Manager.UI
                 ' takes effect on the next dropdown open without form
                 ' rebuild. Returns Nothing on any failure path so the
                 ' combo silently degrades to free-text-only.
+                ' First-launch caveat for IStartupFileProvider plugins:
+                ' the plugin writes these values into the game's OWN
+                ' config file at start, but won't fabricate that file
+                ' before the game has created it, so on a brand-new
+                ' server they apply from the SECOND launch. Surfaced as
+                ' a Notice banner (no live probe: shown whenever the
+                ' plugin declares startup files) so operators aren't
+                ' surprised the first run uses game defaults.
+                Dim sfp = TryCast(gamePlugin, IStartupFileProvider)
+                If sfp IsNot Nothing Then
+                    Dim minCfg As New InstanceConfig With {.GameId = instanceEntity.GameId}
+                    Dim startupFiles = sfp.GetStartupFiles(minCfg)
+                    Dim startupReady = db.GetSettingBool(GsmDataExtensions.StartupFilesReadyKey(instanceEntity.InstanceId), False)
+                    If startupFiles IsNot Nothing AndAlso startupFiles.Count > 0 AndAlso Not startupReady Then
+                        schema = (New ConfigFieldDescriptor() {
+                            New ConfigFieldDescriptor With {
+                                .FieldType = ConfigFieldType.Notice,
+                                .Label = "Applied at launch via the server config file",
+                                .Description = "These settings are written into the server's own config file when the instance starts. A brand-new server generates that file on its first launch, so your values take effect from the SECOND start; the first run uses the game's own defaults."
+                            }
+                        }).Concat(schema).ToList()
+                    End If
+                End If
+
                 Dim fileListProvider As Func(Of String, Task(Of IReadOnlyList(Of String))) =
                     AddressOf BuildSavesProviderForCurrentInstance
 
