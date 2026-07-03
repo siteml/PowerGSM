@@ -3894,6 +3894,7 @@ Namespace GSM.Manager.UI
                 .ValueExtractor = Function()
                                       Dim values As New Dictionary(Of String, String)
                                       For Each field In localSchema
+                                          If field.FieldType = ConfigFieldType.Notice OrElse String.IsNullOrEmpty(field.Key) Then Continue For
                                           If localControls.ContainsKey(field.Key) Then
                                               Dim ctrl = localControls(field.Key)
                                               If TypeOf ctrl Is TextBox Then

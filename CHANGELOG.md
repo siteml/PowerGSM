@@ -9,6 +9,37 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-03
+
+### Fixed
+
+- **Self-update dropped non-core files.** `UpdateOrchestrator`'s apply.cmd
+  copied only GSM.Manager.exe + GSM.Contracts.dll, so any other file in the
+  release (WebView2Loader.dll, the `runtimes\` tree, newly added
+  dependencies) never reached an updated install — e.g. lo-myrealm's web
+  login window failing on a missing WebView2Loader.dll. Now robocopies the
+  whole extracted payload, with `/XF gsm.db gsm.db-wal gsm.db-shm
+  nodesettings.json /XD .updates WebView2Data logs` so stateful files (esp.
+  the live DB) can't be clobbered even if one slips into the zip. (Takes
+  effect from updates run by a build containing this; the current install's
+  old applier still needs WebView2Loader.dll copied in by hand once.)
+- **WebSessionCaptureForm silent close.** The generic init failure set an
+  error but showed no dialog, so a missing WebView2Loader.dll just flashed
+  the window shut. Now surfaces the exception type + message like the
+  runtime-missing path.
+- **Slice-5 editor never locked (Windrose Server Settings).** The editor-tab
+  reconstruction in `InstancePanel.BuildEditorTabs` rebuilt each
+  `InstanceFileEditor` without copying the new `RequiresExistingFile` flag, so
+  it always arrived False and the file-absent lockout never fired — the editor
+  rendered a saveable defaults form for a not-yet-generated config. Now
+  propagated in the reconstruction. (Shipped un-locked in the deployed 0.4.1.)
+- **Edit Instance → Save crash "Value cannot be null. (Parameter 'key')".** The
+  Slice-5 startup-files Notice descriptor carried no `.Key`, so once the
+  instance's ConfigJson held values `SchemaFormBuilder`'s ValueExtractor hit
+  `Dictionary.ContainsKey(Nothing)` on save. Gave the Notice a key
+  (`_startupFilesNotice`) and hardened the extractor to skip Notice / keyless
+  fields outright, so no plugin-supplied descriptor can null-crash the save.
+
 ## [0.4.1] - 2026-07-02
 
 ### Added

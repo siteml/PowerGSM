@@ -169,7 +169,9 @@ Namespace GSM.Manager.UI
             Catch ex As Exception
                 Result = New WebSessionCaptureResult With {
                     .Ok = False,
-                    .ErrorMessage = $"Embedded browser failed to start: {ex.Message}"}
+                    .ErrorMessage = $"Embedded browser failed to start: {ex.GetType().Name}: {ex.Message}"}
+                MessageBox.Show(Me, Result.ErrorMessage, "Embedded Browser Unavailable",
+                                MessageBoxButtons.OK, MessageBoxIcon.Warning)
                 _completed = True
                 Me.Close()
             End Try

@@ -28,7 +28,7 @@
       /api/version response strip the "+sha" suffix for clean
       display while keeping the raw string available in logs.
     -->
-    <Version>0.4.1</Version>
+    <Version>0.4.2</Version>
 
     <!--
       AssemblyVersion is what Assembly.GetName().Version
@@ -53,7 +53,7 @@
       because Windows requires four; the trailing .0 is just
       padding for the public 3-part version.
     -->
-    <FileVersion>0.4.1.0</FileVersion>
+    <FileVersion>0.4.2.0</FileVersion>
 
   </PropertyGroup>
 

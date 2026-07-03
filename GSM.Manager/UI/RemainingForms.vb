@@ -3780,6 +3780,7 @@ Namespace GSM.Manager.UI
                     If startupFiles IsNot Nothing AndAlso startupFiles.Count > 0 AndAlso Not startupReady Then
                         schema = (New ConfigFieldDescriptor() {
                             New ConfigFieldDescriptor With {
+                                .Key = "_startupFilesNotice",
                                 .FieldType = ConfigFieldType.Notice,
                                 .Label = "Applied at launch via the server config file",
                                 .Description = "These settings are written into the server's own config file when the instance starts. A brand-new server generates that file on its first launch, so your values take effect from the SECOND start; the first run uses the game's own defaults."
