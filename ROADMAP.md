@@ -301,6 +301,64 @@ live session can read the page". Scope is loose and idea-rich; a
 dedicated `Phase10_Plan.md` pins it down last, after the Phase
 8/9 plan docs are written.
 
+### Container spawn strategy (Linux nodes) `[future]`
+
+Discussed + scoped 2026-07-05. A `SpawnStrategy.Container` alternative
+to native/shim spawn, Node-side driver translating instance start into
+`podman run` (rootless / daemonless — fits the unprivileged `powergsm`
+service user; CLI-compatible with Docker). Two motivations:
+
+- **Isolation for hardcoded ports/paths.** Per-container network
+  namespace lets a game bind its fixed internal port while each
+  instance maps to a unique host port; bind-mounts give each instance
+  a private view of a hardcoded filesystem path. Multi-instance for
+  games that otherwise refuse it.
+- **Wine/Proton-on-Linux nearly free.** Community images already wrap
+  Windows-only servers in Wine/Proton — a container driver unblocks
+  the ~5 PlannedPlugins entries flagged "Linux needs a Wine layer"
+  (Enshrouded, Aloft, Sunkenland, Space Engineers, Assetto Corsa)
+  without PowerGSM building its own Wine capability.
+
+Shape: plugin/installation declares image ref (or a generic
+wrap-native-install mode — TBD), internal ports to map, paths to
+mount, env vars. Logs via `podman logs -f` feeding the existing
+stdout-capture path — EventStore / parse rules unchanged. Stop via
+configured stop signal (`--stop-signal`, SIGINT analog per game).
+Shim is redundant in container mode; Node supervises container state.
+
+Scope decisions (2026-07-05): Linux-only initially (Windows
+containers rejected for games); **GPU passthrough out of scope** —
+complexity not worth it now; **general services (LLMs etc.) set
+aside** — this is for games + Phase-9-style utilities, not generic
+orchestration. Ordered after Phase 9.
+
+### Per-node installation lock `[future]`
+
+Discussed 2026-07-05. Some games can't coexist on one host even as
+separate installs — flagged consumer: **Stardew Valley** (SMAPI
+headless shape; profile-relative saves under %APPDATA% shared per
+user). Compromise design keeping instance machinery untouched: plugin
+declares **`MaxInstallationsPerNode`** (e.g. 1), combined with the
+existing `MaxInstancesPerInstallation = 1` → net one instance per
+node. Manager pre-checks at installation creation. Open design
+question for the plan doc: Node-side enforcement (the authority under
+multi-Manager) requires the node to know per-game installation counts
+— decide whether Manager-side-only is an acceptable v1.
+
+### Update gate — third-party dependency pinning `[future]`
+
+Discussed 2026-07-05. Games whose serverability rides on 3rd-party
+code (Stardew/SMAPI: a game update breaks the mod loader until the
+fork catches up) shouldn't auto-encourage updating past what the
+dependency supports. **Per-plugin opt-in** (an `IUpdateGate`
+side-interface, or an extension of `IVersionAwarePlugin`): the plugin
+decides whether upstream updates are gated on its dependency's
+compatibility, with a per-installation "update anyway" override.
+**Default (no gate) stays prompt-update** — critical for
+exact-version-coupled games (Dragonwilds, Rust) where holding back
+breaks client joins. v1 = warn-and-confirm at manual update time;
+automatic hold deferred until an auto-update scheduler exists.
+
 ### Phase 5g-3 — LO actor-id bridging `[blocked: log samples]`
 
 Richer LO player identity resolution to close the residual gap

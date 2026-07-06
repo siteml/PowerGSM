@@ -34,6 +34,7 @@ Do NOT skip ahead. Each slice ends with a STOP — wait for Site to confirm befo
 - Plugin owns canonical config (FarmName, StartingCabins, etc.) and writes the selected mod's config.json at instance start. This is what makes mod-swapping between runs safe.
 - Linux: run under `xvfb-run -a`. Graceful stop = SIGINT (matches existing LO/Linux pattern, exit 130 = clean).
 - Windows: game shows a window; runs under GSM.Shim like everything else.
+- **Concurrency constraints (v1):** vanilla SDV hardcodes UDP port 24642 (no config) → only ONE running instance per node in v1. Set `MaxInstancesPerInstallation = 1`. Saves dir is shared per OS user but each farm = own subfolder (`FarmName_UniqueID`) — collision risk is same-FarmName only, plus minor shared-file contention (`startup_preferences`). v1 mitigation: FarmName collision check. True multi-instance = Tier 4 fork Harmony patches (port + save path).
 
 ---
 
@@ -67,14 +68,14 @@ Organizing principle: PowerGSM absorbs *responsibilities* (restart, scheduling, 
 ### Tier 4 — Most optional / highest effort (backlog, not in slices)
 - alwayson mod parse rules (blocked on real log captures — 5g-3 pattern)
 - Richer bot control via pseudo-RCON: pause/resume, force-sleep, festival skip toggles
-- Multi-farm on one install (multiple instances, distinct FarmName + save dirs — needs port isolation research)
+- **Multi-instance unlock via fork Harmony patches:** (a) patch Lidgren server init → port from mod config (vanilla hardcodes 24642), (b) patch save-path resolution → per-instance save dir. Both required for >1 concurrent instance per node. Until then `MaxInstancesPerInstallation = 1` stands.
 - SMAPI/mod auto-update check (compare fork release tag vs installed)
 
 ---
 
 ## Slice 1 — Fork + structured logging (outside PowerGSM repo)
 
-Goal: working fork with parseable output. This is manual/GitHub work, mostly Site-driven; model assists with C# changes if asked.
+EXPANDED into its own document: see `SMAPI_Fork_Plan.md` (slices F1–F6). Summary of what must be done before plugin Slice 2:
 
 1. Fork `ObjectManagerManager/SMAPIDedicatedServerMod` → `siteml/SMAPIDedicatedServerMod`.
 2. Verify it builds against current SMAPI (4.5.x) + SDV (1.6.14+). Fix compile breaks if any.
@@ -107,11 +108,11 @@ Install config schema:
 - `ModDownloadUrl` — string, default = fork release zip URL (overridable)
 
 Instance config schema:
-- `FarmName` — string, required
+- `FarmName` — string, required. Manager-side validation: reject/flag if another instance on the same node already uses this FarmName (check how existing plugins do config validation; if no validation hook exists, report to Site — do NOT invent one)
 - `StartingCabins` — int 0-3, default 3
 - `CabinLayout` — string, default per mod
 - `InviteCodeMode` — bool, default false (direct IP)
-- Port field if applicable (SDV default 24642 UDP)
+- NO Port field in v1 — vanilla hardcodes 24642 UDP. Document this. Port field arrives with Tier 4 fork patch.
 
 Install steps (branch not needed here — same for both mods):
 1. SteamCMD install appid 413150 (credentialed)
@@ -160,3 +161,4 @@ STOP.
 - Q3 (Slice 4): xvfb wrapping — plugin vs node responsibility.
 - Q4 (Slice 4/5): invite-code retrieval — fork emits `[PGSM] INVITECODE`; surface where in UI?
 - Q5 (Tier 3): does existing `RconProtocol`/RCON abstraction accommodate stdin-based command channel, or is that a contract gap?
+- Q6 (Slice 3): is there an existing plugin/Manager hook for cross-instance config validation (FarmName collision)? If not, where should the check live?

@@ -1,0 +1,19 @@
+PowerGSM
+Copyright 2026 siteml
+
+This product is licensed under the Apache License, Version 2.0
+(see the LICENSE file in the project root).
+
+Trademark / naming policy (informal):
+"PowerGSM" identifies the official project maintained by the original
+author. This license does not grant permission to use the PowerGSM name
+or branding (Apache License 2.0, Section 6). Forks and derivative works
+are welcome, but please use a clearly distinct name or prominently mark
+your distribution as an unofficial fork so users can tell it apart from
+official releases.
+
+Contributions:
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project shall be licensed under the
+Apache License 2.0, without any additional terms or conditions
+(Apache License 2.0, Section 5).

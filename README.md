@@ -136,7 +136,7 @@ and [`VERSIONING.md`](VERSIONING.md).
 
 ## Version
 
-Current release: **0.4.1**. PowerGSM is pre-1.0; minor releases may
+Current release: **0.4.2**. PowerGSM is pre-1.0; minor releases may
 introduce breaking changes, always called out in
 [`CHANGELOG.md`](CHANGELOG.md). Manager and Node negotiate a **protocol
 version** on connect and degrade gracefully rather than refusing to talk,
@@ -145,4 +145,10 @@ so you don't have to update both sides in lockstep. See
 
 ## License
 
-*Not yet specified.* <!-- TODO: add a LICENSE file and name it here. -->
+PowerGSM is licensed under the [Apache License 2.0](LICENSE).
+
+Free to use, modify, and redistribute — including commercially. The
+license does not grant rights to the **PowerGSM** name (see
+[`NOTICE`](NOTICE)); forks should use a distinct name or clearly mark
+themselves as unofficial. Contributions are accepted under the same
+license (Apache-2.0 §5).

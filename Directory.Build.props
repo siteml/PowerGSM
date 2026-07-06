@@ -55,6 +55,15 @@
     -->
     <FileVersion>0.4.2.0</FileVersion>
 
+    <!--
+      License metadata. PackageLicenseExpression flows into
+      assembly/package metadata; Copyright lands in the Win32
+      version resource (EXE → Details). LICENSE + NOTICE files
+      at the repo root are the authoritative texts.
+    -->
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <Copyright>Copyright 2026 siteml</Copyright>
+
   </PropertyGroup>
 
 </Project>
