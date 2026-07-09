@@ -61,27 +61,27 @@ Supporting components (you rarely interact with these directly):
 <table>
   <tr>
     <td align="center">
-      <a href="docs/screenshots/main-window.png?raw=true"><img src="docs/screenshots/main-window.png" width="130" alt="Main window"/></a><br/>
+      <a href="https://raw.githubusercontent.com/siteml/PowerGSM/master/docs/screenshots/main-window.png"><img src="docs/screenshots/main-window.png" width="130" alt="Main window"/></a><br/>
       <sub>Main window</sub>
     </td>
     <td align="center">
-      <a href="docs/screenshots/automation-rules.png?raw=true"><img src="docs/screenshots/automation-rules.png" width="130" alt="Automation rules"/></a><br/>
+      <a href="https://raw.githubusercontent.com/siteml/PowerGSM/master/docs/screenshots/automation-rules.png"><img src="docs/screenshots/automation-rules.png" width="130" alt="Automation rules"/></a><br/>
       <sub>Automation rules</sub>
     </td>
     <td align="center">
-      <a href="docs/screenshots/manage-plugins.png?raw=true"><img src="docs/screenshots/manage-plugins.png" width="130" alt="Manage plugins"/></a><br/>
+      <a href="https://raw.githubusercontent.com/siteml/PowerGSM/master/docs/screenshots/manage-plugins.png"><img src="docs/screenshots/manage-plugins.png" width="130" alt="Manage plugins"/></a><br/>
       <sub>Manage plugins</sub>
     </td>
     <td align="center">
-      <a href="docs/screenshots/update-history.png?raw=true"><img src="docs/screenshots/update-history.png" width="130" alt="Update history"/></a><br/>
+      <a href="https://raw.githubusercontent.com/siteml/PowerGSM/master/docs/screenshots/update-history.png"><img src="docs/screenshots/update-history.png" width="130" alt="Update history"/></a><br/>
       <sub>Update history</sub>
     </td>
     <td align="center">
-      <a href="docs/screenshots/notifications.png?raw=true"><img src="docs/screenshots/notifications.png" width="130" alt="Notifications"/></a><br/>
+      <a href="https://raw.githubusercontent.com/siteml/PowerGSM/master/docs/screenshots/notifications.png"><img src="docs/screenshots/notifications.png" width="130" alt="Notifications"/></a><br/>
       <sub>Notifications</sub>
     </td>
     <td align="center">
-      <a href="docs/screenshots/discord-edit-panel.png?raw=true"><img src="docs/screenshots/discord-edit-panel.png" width="130" alt="Discord panel editor"/></a><br/>
+      <a href="https://raw.githubusercontent.com/siteml/PowerGSM/master/docs/screenshots/discord-edit-panel.png"><img src="docs/screenshots/discord-edit-panel.png" width="130" alt="Discord panel editor"/></a><br/>
       <sub>Discord panel editor</sub>
     </td>
   </tr>
