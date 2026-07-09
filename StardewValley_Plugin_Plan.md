@@ -113,6 +113,8 @@ Instance config schema:
 - `CabinLayout` — string, default per mod
 - `InviteCodeMode` — bool, default false (direct IP)
 - NO Port field in v1 — vanilla hardcodes 24642 UDP. Document this. Port field arrives with Tier 4 fork patch.
+- **GPU-less Windows nodes (verified on Site's ProLiant, Win10):** MonoGame fails w/ NoSuitableGraphicsDeviceException — no OpenGL framebuffer support (rack GPU/RDP). Fix (VERIFIED working combo): (a) drop x64 `opengl32.dll` + `libgallium_wgl.dll` from mesa-dist-win (github.com/pal1000/mesa-dist-win) next to `Stardew Valley.exe`, AND (b) set env var `GALLIUM_DRIVER=llvmpipe` on the game process — without it mesa auto-picks d3d12/WARP backend which silently exits after title screen. VC++ x64 redist also required (mesa + game). Plugin implications: install step places mesa dlls (Windows only); launch must set `GALLIUM_DRIVER=llvmpipe` env var — CHECK whether plugin contract/StartInstanceRequest supports per-instance env vars; if not, contract gap to report. Decide at Slice 3 install-step vs documented manual.
+- **Steam detection:** server exe is DRM-free; if Steam client running on node box, game attaches to it. Renaming/deleting `steam_appid.txt` in install dir forces steamless mode (verified). Direct-IP connect unaffected. Candidate post-install step: remove `steam_appid.txt` for determinism.
 
 Install steps (branch not needed here — same for both mods):
 1. SteamCMD install appid 413150 (credentialed)
