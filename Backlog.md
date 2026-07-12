@@ -11,6 +11,44 @@ doc (or open a new mini-plan), then delete from here.
 
 ## Hardening & QoL
 
+### Extract per-game Discord panel context into a plugin interface
+
+**Surfaced:** Stardew Valley plugin work, July 2026.
+**Priority:** Medium. Third hardwired game case landed in the
+Manager; the pattern should move behind the plugin boundary
+before a fourth appears.
+
+**Current state:** `DiscordBotPlugin.BuildContextLine` contains
+a `Select Case` on GameId with per-game knowledge baked into
+the Manager: LO reads `ServerStateResponse.TileName`, Factorio
+reads server-settings.json + SaveFile from merged config (with
+a 5-minute per-instance cache), Stardew Valley reads FarmName
+from merged config + parses the season/day/year composite out
+of `MatchState`. Violates Manager-interprets/plugin-owns-game-
+knowledge.
+
+**Target shape:** Opt-in side-interface (consistent with
+`ILogParser`/`IModManager`/`ILaunchOptionsProvider` precedent),
+e.g. `IPanelContextProvider` with a single method taking a
+small context object the Manager assembles — merged
+install+instance config dict + `ServerStateResponse` (+ maybe
+a file-fetch delegate for Factorio's server-settings.json
+read, with caching staying Manager-side) — returning the
+display string. Manager falls back to no context line when the
+plugin doesn't implement it. Migrate all three existing cases
+into their plugins; delete the Select Case.
+
+**Payoff beyond cleanliness:** plugins can expose
+configurability (which fields to show, format strings) via
+their own config schemas — impossible while the rendering
+lives in the Manager.
+
+**Pickup notes:** Additive interface in Contracts (no
+ContractsVersion bump — consumers ship with it). Factorio's
+cached server-name fetch is the fiddly part; keep the cache in
+the Manager and pass the resolved value into the context
+object rather than teaching plugins to fetch files.
+
 ### Conan world-stable identity
 
 **Surfaced:** Phase 5g-2d planning, May 2026.

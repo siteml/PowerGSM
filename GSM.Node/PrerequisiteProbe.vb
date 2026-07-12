@@ -76,6 +76,23 @@ Namespace GSM.Node
                                  "retry the installation. Without the runtime the game crashes " &
                                  "silently at startup (typically exit code -1073741515 / " &
                                  "STATUS_DLL_NOT_FOUND, with no log produced)."
+            }},
+            {"linux-xvfb", New CatalogEntry With {
+                .DisplayName = "Xvfb virtual framebuffer (Linux)",
+                .DownloadUrl = "",
+                .Instructions = "This game needs a display to initialise its graphics device, " &
+                                 "and headless servers have none — Xvfb provides a virtual one. " &
+                                 "Install it on the node with: sudo apt install xvfb " &
+                                 "(Debian/Ubuntu) or the equivalent for your distribution, then " &
+                                 "start the instance again. Without it the game exits at launch " &
+                                 "with a 'no suitable graphics device' error."
+            }},
+            {"linux-unzip", New CatalogEntry With {
+                .DisplayName = "unzip (Linux)",
+                .DownloadUrl = "",
+                .Instructions = "Some plugin operations extract .zip archives with the system " &
+                                 "unzip tool (python3 is used as a fallback when present). " &
+                                 "Install it on the node with: sudo apt install unzip."
             }}
         }
 
@@ -127,6 +144,18 @@ Namespace GSM.Node
             Select Case name.ToLowerInvariant()
                 Case "vcredist-2015-2022-x64"
                     Dim probe = ProbeVcRedistX64()
+                    result.Installed = probe.Installed
+                    result.Version = probe.Version
+                Case "linux-xvfb"
+                    Dim probe = ProbeLinuxBinary("xvfb-run")
+                    result.Installed = probe.Installed
+                    result.Version = probe.Version
+                Case "linux-unzip"
+                    ' python3's zipfile module is an accepted fallback
+                    ' for zip extraction, so either binary satisfies
+                    ' the prereq.
+                    Dim probe = ProbeLinuxBinary("unzip")
+                    If Not probe.Installed Then probe = ProbeLinuxBinary("python3")
                     result.Installed = probe.Installed
                     result.Version = probe.Version
             End Select
@@ -205,6 +234,46 @@ Namespace GSM.Node
                 ' Registry permission / missing-hive / corrupt-key
                 ' failures fall through to (false, "") — see method
                 ' header for rationale.
+            End Try
+
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Probe for a Linux command-line binary by walking PATH —
+        ''' the managed equivalent of `command -v`, without spawning
+        ''' a shell. On NON-Linux nodes returns Installed=True
+        ''' ("satisfied / not applicable") — the plugin contract's
+        ''' GetRequiredPrerequisites takes no platform parameter, so
+        ''' plugins declare Linux prereqs unconditionally and the
+        ''' probe must not fire false missing-notices on Windows.
+        ''' Version detection is skipped — presence is the only
+        ''' question the notices ask.
+        ''' </summary>
+        Private Function ProbeLinuxBinary(binaryName As String) As ProbeResult
+            Dim result As ProbeResult
+            result.Installed = False
+            result.Version = ""
+
+            If Not OperatingSystem.IsLinux() Then
+                result.Installed = True
+                Return result
+            End If
+
+            Try
+                Dim pathVar = Environment.GetEnvironmentVariable("PATH")
+                If String.IsNullOrEmpty(pathVar) Then Return result
+                For Each dirPath In pathVar.Split(":"c)
+                    If String.IsNullOrWhiteSpace(dirPath) Then Continue For
+                    If IO.File.Exists(IO.Path.Combine(dirPath, binaryName)) Then
+                        result.Installed = True
+                        Exit For
+                    End If
+                Next
+            Catch
+                ' PATH parse / IO failures fall through to "not
+                ' installed" — same missing-side bias as the registry
+                ' probe above.
             End Try
 
             Return result

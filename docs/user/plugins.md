@@ -24,11 +24,13 @@ Games at a glance:
 | [Factorio](#factorio) | `factorio` | 427520 | SteamCMD (account owning Factorio) or direct download (anonymous) | Windows / Linux | — |
 | [Conan Exiles](#conan-exiles) | `conanexiles` | 443030 | SteamCMD (anonymous) | Windows | VC++ 2015–2022 x64 |
 | [Windrose](#windrose) | `windrose` | 4129620 | SteamCMD (anonymous) | Windows | VC++ 2015–2022 x64 |
+| [Stardew Valley](#stardew-valley) | `stardewvalley` | 413150 | SteamCMD (account owning Stardew Valley) | Windows / Linux | Mesa (auto, Windows) · xvfb (Linux) |
 | [lo-myrealm](#lo-myrealm-last-oasis-name-enrichment) | `lo-myrealm` | — (utility) | — | — | — |
 
-Most of these install anonymously (choose *Anonymous*). The exception is
-**Factorio via SteamCMD**, which needs a Steam account that **owns Factorio** —
-use Factorio's **direct download** method for an anonymous install instead.
+Most of these install anonymously (choose *Anonymous*). The exceptions are
+**Factorio via SteamCMD**, which needs a Steam account that **owns Factorio**
+(use Factorio's **direct download** method for an anonymous install instead),
+and **Stardew Valley**, which always needs an account that **owns the game**.
 
 ---
 
@@ -189,6 +191,79 @@ edit it while the instance is stopped.
 
 For a PowerGSM-managed host, leave **UseDirectConnection** on and forward the
 one port — it's predictable and doesn't depend on UPnP being available.
+
+---
+
+## Stardew Valley
+
+`stardewvalley` · Steam AppID **413150** · **Windows or Linux** · plugin
+version 0.1.0 (early — core hosting works; see the tier roadmap in the plan
+docs for what's still ahead).
+
+Runs the full game headless under [SMAPI](https://smapi.io) with the
+`siteml/SMAPIDedicatedServerMod` fork providing the automated host. Because
+there is no dedicated-server depot, installing needs a **Steam account that
+owns Stardew Valley** (same credential flow as Last Oasis; Steam Guard
+prompts are relayed to you).
+
+### Prerequisites
+
+- **Windows, no GPU (rack servers / VMs):** nothing to install — the plugin
+  downloads Mesa and forces llvmpipe software rendering automatically
+  (**Software rendering** install field, default on; turn it off only on a
+  node with a working GPU).
+- **Linux:** `sudo apt install xvfb` — the game needs a display, and the
+  plugin boots a shared virtual one (Xvfb on display `:97`, started on first
+  instance start and reused afterwards). `unzip` is also recommended for
+  restoring Windows-made farm archives (`python3` works as a fallback).
+  Both are checked and surfaced as pre-install notices.
+
+### Install-level config
+
+| Field | Default | Notes |
+|---|---|---|
+| **Server mod** | headless | Which dedicated-server mod variant to install. |
+| **Server mod download URL** | (pinned release) | Zip of the SMAPI server mod. Bump + *Update* to roll the mod forward. |
+| **SMAPI installer URL** | (pinned release) | Pin to a SMAPI version known to work with the installed game version. |
+| **Software rendering** | on | Windows only: install Mesa llvmpipe and force it at launch. Required on GPU-less Windows nodes; ignored on Linux. |
+| **Mesa download URL** | (pinned release) | mesa-dist-win archive used when software rendering is on. |
+
+### Instance-level config
+
+| Field | Default | Notes |
+|---|---|---|
+| **Farm name** | — (required) | The save to host. If no save with this name exists, a **new farm is created** using the "(new farms only)" fields below; for an existing save those fields are ignored. |
+| **Game port (fixed)** | 24642 | Vanilla hardcodes UDP 24642 and it cannot be changed — the field exists so the port allocator knows it's taken. **Forward UDP 24642.** One Stardew server per node. |
+| *(new farms only)* | — | Starting cabins, cabin layout, profit margin, money style, farm type, community-center bundles, mine rewards, random seed, pet, mushrooms/bats — mirror the game's new-game options. |
+| **Crop saver** | on | Prevents crops dying while nobody plays. |
+| **Chat command password** | empty | Protects the mod's in-game chat commands. |
+| …plus Joja membership, night monsters, build permissions, invite-code and farmhouse-upgrade toggles. | | |
+
+All of these are rendered into the mod's `config.json` on **every start** —
+edit them in PowerGSM, not the file (hand edits to plugin-owned fields are
+overwritten; unknown fields you add by hand are preserved).
+
+### Farm saves & migration
+
+Stardew keeps saves under the **OS user profile**, not the install folder:
+
+- Windows (Node running as a service): `C:\Windows\System32\config\systemprofile\AppData\Roaming\StardewValley\Saves`
+- Linux: `~/.config/StardewValley/Saves` of the node user
+
+The **Farm Backups** tab bridges that: *Archive / Restore Saves…* packs one
+farm folder (or all farms) into an archive under Farm Backups — download it,
+upload it to another node's Farm Backups, and Restore it there. Archives
+made on either platform restore on both. **Stop the instance first** for
+both operations.
+
+### Operational notes
+
+- Servers run **steamless** — players join by direct IP (the client's
+  co-op join accepts `ip` or `ip:port`). Invite codes only work if the game
+  can reach Steam/GOG networking, which it usually can't in this setup.
+- Achievements and some host-bound events follow the automated host player.
+- Stopping the server on **day 1 of a season** advances the save to day 2
+  (the mod sleeps to save before exiting).
 
 ---
 

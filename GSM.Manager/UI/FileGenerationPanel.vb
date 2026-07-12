@@ -267,12 +267,20 @@ Namespace GSM.Manager.UI
                     Return
                 End If
 
-                ' Seed values from defaults \u2014 SchemaFormBuilder
+                ' Seed values from defaults — SchemaFormBuilder
                 ' falls back to DefaultValue when currentValues
                 ' has no entry for a key, but giving it an empty
                 ' dict is the cleanest way to express "fresh form,
                 ' use whatever the schema declares as defaults".
-                _schemaResult = SchemaFormBuilder.Build(schema, New Dictionary(Of String, String))
+                '
+                ' fileListProvider wires ManagedFilePicker fields to
+                ' the node's file-list endpoint so their dropdowns
+                ' populate (e.g. Stardew's restore-source picker over
+                ' the backups dir). Without it the combo renders as
+                ' free text with an empty dropdown.
+                _schemaResult = SchemaFormBuilder.Build(
+                    schema, New Dictionary(Of String, String),
+                    fileListProvider:=AddressOf ListManagedDirFilesAsync)
                 If _schemaResult.Panel IsNot Nothing Then
                     _schemaResult.Panel.Dock = DockStyle.Fill
                     _formHost.Controls.Clear()
@@ -409,7 +417,7 @@ Namespace GSM.Manager.UI
                                $" ({FormatSize(response.OutputSizeBytes)})",
                                "")
             Dim displayName = If(String.IsNullOrEmpty(outputName), "file", outputName)
-            SetStatus($"\u2713 Generated {displayName}{sizeNote}.", Color.DarkGreen)
+            SetStatus($"✓ Generated {displayName}{sizeNote}.", Color.DarkGreen)
         End Sub
 
         Private Sub ApplyFailureState(message As String, output As String)
@@ -599,6 +607,48 @@ Namespace GSM.Manager.UI
                 End Using
             Catch
                 Return Nothing
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' fileListProvider implementation for ManagedFilePicker
+        ''' fields in the generation schema: lists the given managed
+        ''' directory on the node and returns bare file names (the
+        ''' same value shape EditInstanceForm's picker produces, so
+        ''' plugins see identical strings from either form). Errors
+        ''' and unresolved nodes degrade to an empty dropdown — the
+        ''' combo stays free-text, matching the builder's no-provider
+        ''' behaviour.
+        ''' </summary>
+        Private Function ListManagedDirFilesAsync(dirRef As String) As Task(Of IReadOnlyList(Of String))
+            Return ListManagedDirFilesCoreAsync(dirRef)
+        End Function
+
+        Private Async Function ListManagedDirFilesCoreAsync(dirRef As String) As Task(Of IReadOnlyList(Of String))
+            Try
+                Dim resolved = ResolveNodeAndConfig()
+                If resolved Is Nothing OrElse String.IsNullOrEmpty(dirRef) Then
+                    Return New List(Of String)
+                End If
+                Dim entries = Await resolved.Client.ListFilesAsync(
+                    _instanceId,
+                    resolved.InstallPath,
+                    dirRef,
+                    New List(Of String) From {dirRef},
+                    Nothing,
+                    CancellationToken.None)
+                Dim names As New List(Of String)
+                If entries IsNot Nothing Then
+                    For Each entry In entries
+                        Dim rel = entry.RelativePath
+                        If String.IsNullOrEmpty(rel) Then Continue For
+                        Dim slash = rel.LastIndexOf("/"c)
+                        names.Add(If(slash >= 0, rel.Substring(slash + 1), rel))
+                    Next
+                End If
+                Return names
+            Catch
+                Return New List(Of String)
             End Try
         End Function
 

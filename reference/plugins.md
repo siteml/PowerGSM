@@ -687,3 +687,62 @@ Key architectural facts worth keeping:
   session→realm access map remains deferred — realm ADMINISTRATION
   (writes) is Phase 10, and persisting the map is what those writes
   justify.
+
+### Stardew Valley plugin (0.5.0, plugin v0.1.0)
+
+`stardewvalley` — headless dedicated Stardew via SMAPI + the
+`siteml/SMAPIDedicatedServerMod` fork (separate repo; consumed as a
+GitHub release zip because the game DLLs can't live in the PowerGSM
+solution). `MaxInstancesPerInstallation = 1`; game port hardcoded
+UDP 24642, declared via a locked `IsPort` field so the allocator
+counts it (Tier-4 fork Harmony patch is the future unlock for both).
+
+Interfaces implemented: `ILaunchOptionsProvider` (StdoutIsLog;
+env vars — Windows `GALLIUM_DRIVER=llvmpipe`, Linux
+`LIBGL_ALWAYS_SOFTWARE=1` + `DISPLAY=:97`), `IStartupFileProvider`
+(round-trip render of `Mods/DedicatedServer/config.json` from the
+merged instance config on every start; unknown/hand-added fields
+survive; `PasswordProtected` gates set-if-absent),
+`IManagedDirectoriesProvider` + `IFileGenerationProvider` (Farm
+Backups dir + Archive/Restore Saves operation — saves live under the
+OS user profile outside the install root, so archives via
+tar/unzip bridge them into a managed dir for cross-node migration;
+single-farm scope via tar's trailing member arg),
+`IPrerequisiteProvider` (`linux-xvfb`, `linux-unzip`).
+
+Platform launch shapes:
+
+- **Windows**: exe candidate `StardewModdingAPI.exe`; GPU-less nodes
+  get Mesa llvmpipe DLLs from the install step (ExtractOnlyPaths
+  pulls just the two DLLs from the ~1 GB mesa 7z).
+- **Linux**: exe `/bin/sh`, args
+  `-c "[ -e /tmp/.X97-lock ] || Xvfb :97 ... & sleep 1; exec ./StardewModdingAPI"`.
+  xvfb-run was rejected: it's a wrapper script, so the spawned pid
+  was the script and graceful SIGINT never reached SMAPI (observed:
+  stop didn't stop). The sh bootstrap `exec`s SMAPI so the spawned
+  pid IS SMAPI; the Xvfb daemon is shared per node on display :97
+  and deliberately outlives the game (X lock file = idempotence).
+
+Install chain: credentialed SteamCMD (appid 413150; no dedicated
+depot, account must own the game) → SMAPI installer zip
+(`ExtractToRelativePath="gsm-smapi-installer"`,
+`StripTopLevelDirectory`, run with `RequiresRealConsole=True`
+because the installer calls Console.Clear/ReadKey; Linux adds a
+chmod +x step — zip extraction drops the exec bit — and builds all
+paths with forward slashes by hand, since Path.Combine runs on the
+Windows Manager) → server-mod zip into `Mods\` → (Windows +
+SoftwareRendering) mesa DLLs.
+
+Parse rules ride the fork's structured `[PGSM]` lines
+(READY/JOIN/LEAVE/CHAT/DAY/INVITECODE); the ServerBot
+"(ip) has joined" line is an addr-only PlayerJoin (RemoteAddress
+capture only) so EventStore's PendingRemoteAddress stash hands the
+IP to the immediately-following real JOIN. Day rollover feeds
+MatchState with the raw season/day/year triple, which the Manager's
+Discord panel context case parses into "Farm — spring 2, year 1".
+
+Saves location (why Farm Backups exists): Windows service =
+`C:\Windows\System32\config\systemprofile\AppData\Roaming\StardewValley\Saves`;
+Linux = `~/.config/StardewValley/Saves` of the node user. Restore
+dispatches by extension on Linux (`unzip -o` or python3 zipfile for
+.zip, `tar -xf` otherwise); Windows' bundled bsdtar reads both.

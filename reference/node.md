@@ -65,8 +65,9 @@ events.
 
 Supported capture group names (match = populates the named field on
 PlayerSession/ServerStateResponse/etc.):
-`Name`, `Platform`, `PlatformUserId`, `CharacterId`, `RemoteAddress`,
-`Message`, `MatchState`, `TileId`, `TileName`, `MapPath`, `Registered`.
+`DisplayName`, `PlatformPersona`, `PlatformUserId`, `CharacterId`,
+`RemoteAddress`, `Message`, `MatchState`, plus `Custom_*` groups
+(passed through into event metadata).
 
 `ParsedEventKind` values: `PlayerJoin`, `PlayerLeave`, `PlayerIdentity`,
 `ChatMessage`, `ServerStateChange`, `TileLoaded`, `Custom`.
@@ -191,6 +192,31 @@ volume `Directory.Move` / `File.Move`. Multi-top-level archives
 (the flag was set but the archive doesn't actually have a
 single wrapper dir) extract everything to the install root
 as-is — the flag is a request, not a guarantee.
+
+Two sibling fields (0.5.0):
+
+- `ExtractToRelativePath` — extract into an install-root
+  subdirectory instead of the root (SDV's mod zip → `Mods\`),
+  with a `GetFullPath`+`StartsWith` traversal guard; composes
+  with StripTopLevelDirectory (the hoist target becomes the
+  subdir). Older nodes deserialize-and-drop the field and
+  extract to the root — diagnosed live when a stale node
+  binary scattered the SMAPI installer across the install
+  root.
+- `ExtractOnlyPaths` — allowlist of entry paths (forward
+  slashes, case-insensitive) to extract; every branch (zip
+  entry loop, tar.xz stream, ArchiveFactory) filters through
+  `NormalizeEntryKey` and STOPS as soon as every listed entry
+  is on disk. Motivating case: mesa-dist-win's ~1 GB 7z where
+  SDV needs exactly two DLLs — minutes down to seconds.
+
+The download loop also reports byte progress
+(`op.BytesDownloaded/BytesTotal`, 500ms-throttled
+"Downloading f: X / Y MB" message; 0–80% of the step when an
+extraction follows, 0–99% otherwise) and extraction reports
+per-entry progress ("Extracting: N / M files", 80→99% span;
+count-only for the streaming tar reader where the total is
+unknown).
 
 Update flow lands in `MergeDirectoryRecursive`, which overlays
 the new files onto the existing install directory tree. Files
@@ -938,6 +964,14 @@ boundary — adding a new prereq is a node-side change that
 requires no plugin-contracts version bump (older nodes
 return `Recognized=False` for unknown names and the
 Manager silently skips them).
+
+Catalog as of 0.5.0: `vcredist-2015-2022-x64` (registry
+probe), `linux-xvfb` and `linux-unzip` (PATH-walk probes via
+`ProbeLinuxBinary`; `python3` also satisfies linux-unzip; on
+non-Linux nodes both report Installed=True — "satisfied /
+not applicable" — because `GetRequiredPrerequisites` takes no
+platform parameter, so plugins declare Linux prereqs
+unconditionally).
 
 **Plugin contract (`GSM.Contracts/IGamePlugin.vb`).**
 New optional interface alongside `IInstallationNoticeProvider`:

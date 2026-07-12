@@ -264,6 +264,38 @@ Namespace GSM.Plugin
         Public Property DestinationRelativePath As String
         Public Property ExtractArchive As Boolean = False
         Public Property StripTopLevelDirectory As Boolean = False
+
+        ''' <summary>
+        ''' Install-root-relative directory to extract the archive
+        ''' into. Nothing/empty (the default) preserves the legacy
+        ''' behaviour of extracting to the install root. Set it when
+        ''' the archive's contents belong in a subdirectory — e.g.
+        ''' Stardew Valley's dedicated-server mod zip (root folder
+        ''' "DedicatedServer/") extracting into "Mods". The directory
+        ''' is created if missing. StripTopLevelDirectory composes
+        ''' with this: the hoist target becomes the subdirectory
+        ''' instead of the install root. Ignored when ExtractArchive
+        ''' is False. Only meaningful for nodes new enough to carry
+        ''' this field — older nodes deserialize-and-drop it and
+        ''' extract to the root as before.
+        ''' </summary>
+        Public Property ExtractToRelativePath As String
+
+        ''' <summary>
+        ''' Optional allowlist of archive entry paths (relative,
+        ''' forward slashes, case-insensitive) to extract; every
+        ''' other entry is skipped. Empty/Nothing extracts
+        ''' everything (legacy behaviour). Motivating case: the
+        ''' mesa-dist-win 7z is ~1 GB unpacked but Stardew needs
+        ''' exactly two DLLs — filtering skips writing the rest
+        ''' and lets the extractor STOP as soon as all listed
+        ''' entries have been produced, which on large archives
+        ''' cuts minutes down to seconds. Relative directory
+        ''' structure of matched entries is preserved under the
+        ''' extraction target. Older nodes deserialize-and-drop
+        ''' the field and extract everything as before.
+        ''' </summary>
+        Public Property ExtractOnlyPaths As List(Of String)
     End Class
 
     ''' <summary>
@@ -299,6 +331,20 @@ Namespace GSM.Plugin
         Public Property WorkingDirectory As String
         Public Property TimeoutMs As Integer = 120000
         Public Property ExpectedExitCode As Integer = 0
+
+        ''' <summary>
+        ''' Spawn with a real (invisible) console and NO stream
+        ''' redirection. Console-UI installers that call
+        ''' Console.Clear()/ReadKey — SMAPI's does — crash with
+        ''' "handle is invalid" when stdout is a redirected pipe,
+        ''' because those APIs need a screen buffer. With this set the
+        ''' child gets its own console (CreateNoWindow keeps it
+        ''' invisible), all console APIs work, and stdout is not
+        ''' captured. Pair with the tool's non-interactive flags
+        ''' (e.g. SMAPI's --no-prompt) since nothing can answer
+        ''' prompts; the TimeoutMs guard remains the backstop.
+        ''' </summary>
+        Public Property RequiresRealConsole As Boolean = False
     End Class
 
     ' ============================================================
@@ -1421,6 +1467,19 @@ Namespace GSM.Plugin
         ''' values are honoured verbatim.
         ''' </summary>
         Public Property GracefulShutdownTimeoutMs As Integer = -1
+
+        ''' <summary>
+        ''' Environment variables to set on the spawned game process,
+        ''' merged over the node process's inherited environment.
+        ''' StartInstanceRequest.EnvironmentVars has carried this on
+        ''' the wire since the original contract; this property gives
+        ''' plugins a way to populate it (the Manager previously always
+        ''' sent an empty dictionary). First consumer: Stardew Valley
+        ''' on GPU-less Windows nodes, which needs
+        ''' GALLIUM_DRIVER=llvmpipe for Mesa software rendering.
+        ''' Nothing or empty means no additions.
+        ''' </summary>
+        Public Property EnvironmentVars As Dictionary(Of String, String)
     End Class
 
     ''' <summary>

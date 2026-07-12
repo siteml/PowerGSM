@@ -105,7 +105,7 @@ New file: `GSM.PluginsSource\StardewValleyPlugin.vb`. GameId `stardewvalley`.
 
 Install config schema:
 - `ServerMod` — string, `headless` | `alwayson`, default `headless`
-- `ModDownloadUrl` — string, default = fork release zip URL (overridable)
+- `ModDownloadUrl` — string, default = `https://github.com/siteml/SMAPIDedicatedServerMod/releases/download/pgsm-v1.0.0/DedicatedServer.1.2.3.zip` (fork release pgsm-v1.0.0; overridable)
 
 Instance config schema:
 - `FarmName` — string, required. Manager-side validation: reject/flag if another instance on the same node already uses this FarmName (check how existing plugins do config validation; if no validation hook exists, report to Site — do NOT invent one)

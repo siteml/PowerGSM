@@ -2756,6 +2756,40 @@ Namespace GSM.Manager.Core
                         End If
                         Return ""
 
+                    Case "stardewvalley"
+                        Dim parts As New List(Of String)
+
+                        ' Farm name from the merged install+instance
+                        ' config — the plugin requires it, so it's the
+                        ' authoritative "which save is this".
+                        Dim sdvMerged = LoadMergedConfig(e)
+                        Dim farm As String = Nothing
+                        If sdvMerged IsNot Nothing Then
+                            sdvMerged.TryGetValue("FarmName", farm)
+                        End If
+                        If Not String.IsNullOrEmpty(farm) Then
+                            parts.Add(farm)
+                        End If
+
+                        ' Calendar from the node's server state. The
+                        ' plugin's DAY rule stores the raw composite
+                        ' (season="spring" day="2" year="1") in
+                        ' MatchState; reformat to something humane.
+                        Dim sdvSrv = _instanceManager.GetServerStateAsync(e.InstanceId).
+                            GetAwaiter().GetResult()
+                        If sdvSrv IsNot Nothing AndAlso
+                           Not String.IsNullOrEmpty(sdvSrv.MatchState) Then
+                            Dim cal = Text.RegularExpressions.Regex.Match(
+                                sdvSrv.MatchState,
+                                "season=""(?<" & "S" & ">[^""]+)"" day=""(?<" & "D" & ">\d+)"" year=""(?<" & "Y" & ">\d+)""")
+                            If cal.Success Then
+                                parts.Add(
+                                    $"{cal.Groups("S").Value} {cal.Groups("D").Value}, year {cal.Groups("Y").Value}")
+                            End If
+                        End If
+
+                        Return String.Join(" — ", parts)
+
                     Case "factorio"
                         Dim merged = LoadMergedConfig(e)
                         If merged Is Nothing Then merged = New Dictionary(Of String, String)

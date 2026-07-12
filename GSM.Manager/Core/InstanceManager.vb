@@ -388,6 +388,16 @@ Namespace GSM.Manager.Core
                         If pluginCandidates IsNot Nothing Then
                             For Each relPath In pluginCandidates
                                 If Not String.IsNullOrEmpty(relPath) Then
+                                    ' Rooted candidates (e.g. Stardew's
+                                    ' /usr/bin/xvfb-run wrapper on Linux)
+                                    ' pass through untouched — joining a
+                                    ' rooted path onto the install root
+                                    ' produces garbage like
+                                    ' /opt/.../stardewvalley/usr/bin/xvfb-run.
+                                    If IsRootedOnEitherPlatform(relPath) Then
+                                        candidates.Add(relPath)
+                                        Continue For
+                                    End If
                                     ' JoinNodePath instead of
                                     ' Path.Combine: the manager's
                                     ' Path.DirectorySeparatorChar is
@@ -497,6 +507,7 @@ Namespace GSM.Manager.Core
                 Dim resolvedStdoutIsLog As Boolean = False
                 Dim resolvedRequiresConsoleIsolation As Boolean = False
                 Dim resolvedTailerDelayMs As Integer = -1
+                Dim resolvedEnvVars As Dictionary(Of String, String) = Nothing
                 If plugin IsNot Nothing Then
                     Dim launchOptsProvider = TryCast(plugin, ILaunchOptionsProvider)
                     If launchOptsProvider IsNot Nothing Then
@@ -506,6 +517,7 @@ Namespace GSM.Manager.Core
                                 resolvedStdoutIsLog = opts.StdoutIsLog
                                 resolvedRequiresConsoleIsolation = opts.RequiresConsoleIsolation
                                 resolvedTailerDelayMs = opts.LogTailerStartDelayMs
+                                resolvedEnvVars = opts.EnvironmentVars
                             End If
                         Catch ex As Exception
                             _logger.LogWarning(ex,
@@ -552,7 +564,7 @@ Namespace GSM.Manager.Core
                         .ExePath = candidate,
                         .Arguments = launchArgs,
                         .WorkingDirectory = installEntity.InstallPath,
-                        .EnvironmentVars = New Dictionary(Of String, String),
+                        .EnvironmentVars = If(resolvedEnvVars, New Dictionary(Of String, String)),
                         .CrashPolicy = CrashRestartPolicy.RestartWithBackoff,
                         .MaxCrashCount = GetIntField(customFields, "MaxCrashCount",
                             If(instanceConfig.MaxCrashCount > 0, instanceConfig.MaxCrashCount, 5)),
@@ -589,7 +601,8 @@ Namespace GSM.Manager.Core
                             resultErr.Contains("not found") OrElse
                             resultErr.Contains("cannot find") OrElse
                             resultErr.Contains("no such file") OrElse
-                            resultErr.Contains("does not exist")
+                            resultErr.Contains("does not exist") OrElse
+                            resultErr.Contains("(error=2)")  ' shim posix_spawn ENOENT
 
                         If responseFailed Then
                             If isNotFound AndAlso i < candidates.Count - 1 Then
@@ -616,12 +629,14 @@ Namespace GSM.Manager.Core
 
                         If _emitter IsNot Nothing Then _emitter.InstanceStarted(instanceId, result.Pid)
 
-                        If Not String.Equals(instanceEntity.ExeOverride, candidate, StringComparison.OrdinalIgnoreCase) Then
-                            instanceEntity.ExeOverride = candidate
-                            instanceEntity.UpdatedUtc = DateTime.UtcNow
-                            db.SaveChanges()
-                            _logger.LogInformation("Saved ExeOverride={Exe} for {Id}", candidate, instanceId)
-                        End If
+                        ' Persist the winning candidate as ExeOverride only
+                        ' after the instance SURVIVES its first 30 seconds.
+                        ' Persisting immediately was a footgun: a spawn that
+                        ' "succeeds" but dies moments later (Stardew's GL
+                        ' init crash under a bad exe choice) locked in the
+                        ' bad candidate, and every later start reused it
+                        ' without ever consulting the plugin's updated list.
+                        SchedulePersistExeOverride(instanceId, candidate)
 
                         StartLogStream(instanceId, client)
                         Return True
@@ -632,7 +647,8 @@ Namespace GSM.Manager.Core
                             msg.Contains("not found") OrElse
                             msg.Contains("cannot find") OrElse
                             msg.Contains("no such file") OrElse
-                            msg.Contains("does not exist")
+                            msg.Contains("does not exist") OrElse
+                            msg.Contains("(error=2)")  ' shim posix_spawn ENOENT
 
                         If isNotFoundEx AndAlso i < candidates.Count - 1 Then
                             _logger.LogInformation("Candidate {Exe} not found (exception), trying next", candidate)
@@ -652,6 +668,51 @@ Namespace GSM.Manager.Core
                 _logger.LogError("All executable candidates failed for instance {Id}", instanceId)
                 Return False
             End Using
+        End Function
+
+        ''' <summary>
+        ''' Fire-and-forget: persist ExeOverride=candidate for the
+        ''' instance only if it is still Running 30 seconds after the
+        ''' start succeeded. Guards against locking in an executable
+        ''' choice whose process "started" but crashed during init —
+        ''' the candidate loop never gets re-consulted once an
+        ''' override exists, so a bad early save is sticky. If the
+        ''' instance stopped/crashed within the window, nothing is
+        ''' saved and the next start resolves candidates fresh.
+        ''' </summary>
+        Private Sub SchedulePersistExeOverride(instanceId As String, candidate As String)
+            Dim _unused = PersistExeOverrideAfterSurvivalAsync(instanceId, candidate)
+        End Sub
+
+        Private Async Function PersistExeOverrideAfterSurvivalAsync(instanceId As String,
+                                                                    candidate As String) As Task
+            Try
+                Await Task.Delay(TimeSpan.FromSeconds(30))
+
+                Dim live As InstanceStatusResponse = Nothing
+                If Not _liveStates.TryGetValue(instanceId, live) OrElse live Is Nothing Then Return
+                If live.CurrentState <> GSM.Plugin.InstanceState.Running AndAlso
+                   live.CurrentState <> GSM.Plugin.InstanceState.Starting Then
+                    _logger.LogInformation(
+                        "Not persisting ExeOverride={Exe} for {Id}: instance did not survive startup (state={State})",
+                        candidate, instanceId, live.CurrentState)
+                    Return
+                End If
+
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim entity = db.Instances.Find(instanceId)
+                    If entity Is Nothing Then Return
+                    If Not String.Equals(entity.ExeOverride, candidate, StringComparison.OrdinalIgnoreCase) Then
+                        entity.ExeOverride = candidate
+                        entity.UpdatedUtc = DateTime.UtcNow
+                        db.SaveChanges()
+                        _logger.LogInformation("Saved ExeOverride={Exe} for {Id} (survived 30s)", candidate, instanceId)
+                    End If
+                End Using
+            Catch ex As Exception
+                _logger.LogWarning(ex, "ExeOverride persistence check failed for {Id}", instanceId)
+            End Try
         End Function
 
         ''' <summary>

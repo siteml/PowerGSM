@@ -213,8 +213,14 @@ Namespace GSM.Node
 
             ' Build process start info. Note: the redirection flags
             ' are only honored by the stdout-captured path below;
-            ' the hidden-console path bypasses ProcessStartInfo
-            ' entirely and feeds these fields to native CreateProcess.
+            ' the hidden-console path bypasses ProcessStartInfo's
+            ' spawn but still reads FileName/Arguments/WorkingDirectory
+            ' AND EnvironmentVariables off it (via BuildEnvironmentBlock
+            ' → CreateProcessW's lpEnvironment), and the shim path
+            ' forwards psi.Environment in the spawn spec — so
+            ' EnvironmentVars set below reach the game on ALL three
+            ' strategies. Only the Redirect*/CreateNoWindow flags are
+            ' captured-path-specific.
             Dim psi As New ProcessStartInfo()
             psi.FileName = request.ExePath
             psi.Arguments = If(request.Arguments, "")
@@ -301,11 +307,18 @@ Namespace GSM.Node
                 Dim useShim As Boolean = Not _nodeConfig.DisableShim
 
                 If useShim Then
-                    Dim shimOk As Boolean = Await StartViaShimAsync(managed).ConfigureAwait(False)
-                    If Not shimOk Then
+                    ' StartViaShimAsync returns Nothing on success, or the
+                    ' failure detail string (e.g. the shim's "posix_spawn
+                    ' failed for /path (error=2)"). Including the detail in
+                    ' the response matters: the Manager's exe-candidate
+                    ' fallback keys off not-found-shaped substrings, so a
+                    ' bare "Shim spawn failed" would abort the candidate
+                    ' loop on the first wrong-platform executable.
+                    Dim shimErr As String = Await StartViaShimAsync(managed).ConfigureAwait(False)
+                    If shimErr IsNot Nothing Then
                         Return BuildErrorResponse(request.InstanceId,
                                                   NodeErrorCodes.ProcessStartFailed,
-                                                  "Shim spawn failed")
+                                                  "Shim spawn failed: " & shimErr)
                     End If
                     _instances(request.InstanceId) = managed
                     FinalizeStart(managed, Nothing)
@@ -1337,11 +1350,13 @@ Namespace GSM.Node
         ''' file as in direct mode.) Sets the managed instance's shim fields,
         ''' Pid (= game pid),
         ''' MetricsProcess (by-pid handle for WorkingSet64), and
-        ''' ExecutionMode = Shim. Returns False on any launch/handshake/spawn
-        ''' failure (the session is torn down). The caller runs
-        ''' FinalizeStart(managed, Nothing) after a True return.
+        ''' ExecutionMode = Shim. Returns Nothing on success (GamePid is then
+        ''' valid and the read loop is running); on any launch/handshake/spawn
+        ''' failure returns the failure detail string (the session is torn
+        ''' down). The caller runs FinalizeStart(managed, Nothing) after a
+        ''' Nothing return.
         ''' </summary>
-        Private Async Function StartViaShimAsync(managed As ManagedInstance) As Task(Of Boolean)
+        Private Async Function StartViaShimAsync(managed As ManagedInstance) As Task(Of String)
             Dim psi = managed.StartInfo
 
             ' Environment carries the FULL resolved env (node env + request
@@ -1369,12 +1384,14 @@ Namespace GSM.Node
             Dim session As ShimSession = CreateShimSession(managed)
             Dim ok As Boolean = Await session.StartAsync(spec, 15000, CancellationToken.None).ConfigureAwait(False)
             If Not ok Then
+                Dim detail = If(String.IsNullOrEmpty(session.LastError),
+                                "no detail from shim session", session.LastError)
                 session.Dispose()
-                Return False
+                Return detail
             End If
 
             ApplyShimSession(managed, session)
-            Return True
+            Return Nothing
         End Function
 
         ''' <summary>
@@ -1412,13 +1429,15 @@ Namespace GSM.Node
                 Sub(ts, text, isError)
                     If isError Then Return
                     If Not managed.CaptureStdout Then Return
+                    Dim clean = SanitizeCapturedLine(text)
+                    If clean.Length = 0 Then Return
                     _logStore.Append(managed.InstanceId,
                         New BufferedLogLine With {
                             .Timestamp = ts,
-                            .Text = text,
+                            .Text = clean,
                             .IsError = False
                         })
-                    _eventStore.ProcessLine(managed.InstanceId, ts, text)
+                    _eventStore.ProcessLine(managed.InstanceId, ts, clean)
                 End Sub
 
             ' onExited mirrors the Process.Exited handler: record the code and
@@ -1927,6 +1946,51 @@ Namespace GSM.Node
         Private Function SendCtrlCToProcess(pid As Integer) As Boolean
             If TrySendConsoleCtrlC(pid) Then Return True
             Return TrySendTaskkill(pid)
+        End Function
+
+        ''' <summary>
+        ''' Cleans a captured stdout line before it enters the ring
+        ''' buffer / EventStore. Two classes of junk observed in the
+        ''' wild (Stardew/SMAPI was the first offender):
+        '''  - NUL characters: a child that switches its console
+        '''    output encoding to UTF-16 while our reader decodes
+        '''    UTF-8 yields interleaved NULs; WinForms text controls
+        '''    truncate at the first NUL, so lines render as a lone
+        '''    "[". For ASCII content, stripping NULs reconstructs
+        '''    the text exactly.
+        '''  - ANSI/VT escape sequences (colors, cursor moves) from
+        '''    terminal-aware processes that don't notice the pipe.
+        ''' Regex parse rules and the UI both want plain text, so
+        ''' sanitize once at ingestion for every capture path.
+        ''' </summary>
+        Private Shared Function SanitizeCapturedLine(text As String) As String
+            If String.IsNullOrEmpty(text) Then Return ""
+            Dim sb As New StringBuilder(text.Length)
+            Dim i = 0
+            While i < text.Length
+                Dim c = text(i)
+                If c = Convert.ToChar(27) Then
+                    ' ESC — skip the sequence. CSI form: ESC [ params,
+                    ' terminated by a final byte in 0x40-0x7E. Non-CSI
+                    ' two-char forms: skip the following char.
+                    If i + 1 < text.Length AndAlso text(i + 1) = "["c Then
+                        i += 2
+                        While i < text.Length AndAlso
+                              (AscW(text(i)) < &H40 OrElse AscW(text(i)) > &H7E)
+                            i += 1
+                        End While
+                        i += 1 ' consume the final byte
+                    Else
+                        i += 2
+                    End If
+                    Continue While
+                End If
+                If AscW(c) <> 0 Then
+                    sb.Append(c)
+                End If
+                i += 1
+            End While
+            Return sb.ToString().TrimEnd()
         End Function
 
         ''' <summary>
@@ -2898,13 +2962,15 @@ Namespace GSM.Node
                                                     If e.Data Is Nothing Then Return
                                                     Dim ts = DateTime.UtcNow
                                                     If managed.CaptureStdout Then
+                                                        Dim clean = SanitizeCapturedLine(e.Data)
+                                                        If clean.Length = 0 Then Return
                                                         _logStore.Append(managed.InstanceId,
                                                             New BufferedLogLine With {
                                                                 .Timestamp = ts,
-                                                                .Text = e.Data,
+                                                                .Text = clean,
                                                                 .IsError = False
                                                             })
-                                                        _eventStore.ProcessLine(managed.InstanceId, ts, e.Data)
+                                                        _eventStore.ProcessLine(managed.InstanceId, ts, clean)
                                                     End If
                                                 End Sub
 

@@ -9,6 +9,81 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-11
+
+### Added
+
+- **Stardew Valley plugin (`stardewvalley`, plugin v0.1.0).** Headless
+  dedicated Stardew server via SMAPI + the `siteml/SMAPIDedicatedServerMod`
+  fork (consumed as a GitHub release zip). Install chain: credentialed
+  SteamCMD (appid 413150) → SMAPI installer → server-mod zip → (Windows)
+  Mesa llvmpipe DLLs for GPU-less nodes. Linux launches through a small
+  `/bin/sh` bootstrap that starts a shared Xvfb on display :97 and `exec`s
+  SMAPI, so the spawned pid is SMAPI itself and graceful SIGINT stops work.
+  Features: full mod-config instance schema (farm creation options, crop
+  saver, permissions, chat-command password, …) rendered into the mod's
+  `config.json` on every start via `IStartupFileProvider` (round-trip —
+  hand-added/unknown fields survive); structured `[PGSM]` log parse rules
+  (join/leave/chat/day rollover/remote address); **Farm Save Archive /
+  Restore** — saves live under the OS user profile outside the install
+  root, so the plugin exposes a Farm Backups managed directory plus
+  archive/restore operations (single farm or all farms; Windows `.zip` ↔
+  Linux `.tar.gz` both restore on either platform), enabling farm
+  migration between nodes; fixed-port (UDP 24642) declaration so the port
+  allocator blocks collisions; Discord panel context line (farm name +
+  in-game date); Linux prerequisite declarations (xvfb, unzip).
+- **`DownloadFileStep.ExtractOnlyPaths` (contracts + node).** Optional
+  allowlist of archive entries to extract, with early-stop once all
+  matches are on disk — cuts the SDV Mesa step (2 DLLs out of a ~1 GB 7z)
+  from minutes to seconds. Older nodes ignore the field.
+- **Install download + extraction progress (node).** DownloadFileStep now
+  reports live byte progress ("Downloading file: X / Y MB (Z%)") and
+  per-entry extraction progress ("Extracting: N / M files") into the
+  Progress tab instead of a frozen "Unknown: 0 MB" during large
+  downloads/extractions.
+- **`RunProcessStep.RequiresRealConsole` (contracts + node).** Spawns
+  console-UI installers (SMAPI's calls `Console.Clear()`/`ReadKey`) with a
+  real invisible console and no stream redirection, which they need to
+  avoid "handle is invalid" crashes.
+- **`DownloadFileStep.ExtractToRelativePath` (contracts + node).** Extract
+  an archive into an install-root subdirectory (e.g. SDV's mod zip into
+  `Mods\`) with a path-traversal guard; composes with
+  `StripTopLevelDirectory`.
+- **`LaunchOptions.EnvironmentVars` (contracts + manager + node).** Plugins
+  can set environment variables on the game process across all three spawn
+  strategies (SDV uses it for `GALLIUM_DRIVER=llvmpipe` /
+  `LIBGL_ALWAYS_SOFTWARE=1` + `DISPLAY`).
+- **Linux prerequisite probes (node).** PrerequisiteProbe catalog gains
+  `linux-xvfb` and `linux-unzip` (PATH-walk detection; `python3` satisfies
+  the unzip prereq; non-Linux nodes report satisfied), surfaced as
+  pre-install notices with `apt install` instructions.
+
+### Fixed
+
+- **Log viewer garbled/truncated lines (node).** Captured stdout lines are
+  now sanitised (NUL bytes from UTF-16 console output decoded as UTF-8,
+  ANSI/VT escapes) at both the shim and direct ingestion sites.
+- **`RunProcessStep` execution (node).** Added stdin redirection and
+  stdout/stderr draining, and replaced `WaitForExitAsync` with `HasExited`
+  polling (the former deadlocks with redirected streams on .NET 8).
+- **Shim spawn failures now carry detail.** "Shim spawn failed" responses
+  include the underlying error (e.g. `posix_spawn failed … (error=2)`),
+  and the Manager's executable-candidate fallback recognises the
+  ENOENT-shaped shim error — so a wrong-platform first candidate falls
+  through to the next instead of aborting the start.
+- **Rooted executable candidates.** Plugin-supplied absolute candidate
+  paths (e.g. `/bin/sh`) are no longer joined onto the install root.
+- **ExeOverride persisted too eagerly (manager).** The winning executable
+  candidate is now saved only after the instance survives its first 30
+  seconds, so a spawn that crashes during init can't lock in a bad
+  candidate that skips the plugin's list on every later start.
+- **File-generation ManagedFilePicker dropdowns were always empty
+  (manager).** `FileGenerationPanel` never passed a file-list provider to
+  `SchemaFormBuilder`; it now lists the managed directory via the node's
+  file endpoints (SDV's restore-source picker was the first casualty).
+- **File-generation success message showed a literal `\u2713`.** Replaced
+  with an actual ✓ (VB has no `\u` string escapes).
+
 ## [0.4.2] - 2026-07-03
 
 ### Fixed

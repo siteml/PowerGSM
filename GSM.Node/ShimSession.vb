@@ -128,6 +128,20 @@ Namespace GSM.Node
         End Property
 
         ''' <summary>
+        ''' Human-readable detail for the most recent StartAsync/AdoptAsync
+        ''' failure (e.g. the shim's "posix_spawn failed for /path (error=2)").
+        ''' Nothing when the last operation succeeded. Surfaced into the
+        ''' start-instance error response so the Manager's exe-candidate
+        ''' fallback can recognise not-found spawn failures.
+        ''' </summary>
+        Private _lastError As String
+        Public ReadOnly Property LastError As String
+            Get
+                Return _lastError
+            End Get
+        End Property
+
+        ''' <summary>
         ''' Launch the shim, connect + handshake, send Spawn(spec), read
         ''' SpawnAck. Returns True on success (GamePid is then valid and the
         ''' read loop is running). On any failure returns False and the shim
@@ -140,6 +154,7 @@ Namespace GSM.Node
 
                 Dim shimExe As String = ResolveShimExePath(_shimVersion)
                 If Not File.Exists(shimExe) Then
+                    _lastError = $"Shim executable not found at {shimExe}"
                     _logger.LogError("Shim exe not found at {Path} for {Id}", shimExe, _instanceId)
                     Return False
                 End If
@@ -160,6 +175,7 @@ Namespace GSM.Node
                 AddHandler _shimProc.OutputDataReceived, AddressOf OnShimStdout
                 AddHandler _shimProc.ErrorDataReceived, AddressOf OnShimStderr
                 If Not _shimProc.Start() Then
+                    _lastError = "Shim process failed to start"
                     _logger.LogError("Shim process failed to start for {Id}", _instanceId)
                     Return False
                 End If
@@ -176,6 +192,7 @@ Namespace GSM.Node
 
                 Dim ackFrame As Frame = Await _conn.ReadFrameAsync(ct).ConfigureAwait(False)
                 If ackFrame.Kind <> FrameType.SpawnAck Then
+                    _lastError = $"Shim protocol error: expected SpawnAck, got {ackFrame.Kind}"
                     _logger.LogError("Shim {Id}: expected SpawnAck, got {Kind}", _instanceId, ackFrame.Kind)
                     TryKillShim()
                     Return False
@@ -183,6 +200,8 @@ Namespace GSM.Node
 
                 Dim sack As SpawnAckMessage = ProtocolCodec.Decode(Of SpawnAckMessage)(ackFrame.Payload)
                 If sack Is Nothing OrElse Not sack.Success OrElse sack.GamePid <= 0 Then
+                    _lastError = If(sack IsNot Nothing AndAlso Not String.IsNullOrEmpty(sack.ErrorMessage),
+                                    sack.ErrorMessage, "shim returned no spawn ack detail")
                     _logger.LogError("Shim {Id}: spawn failed: {Err}",
                                      _instanceId, If(sack IsNot Nothing, sack.ErrorMessage, "no ack"))
                     TryKillShim()
@@ -191,9 +210,11 @@ Namespace GSM.Node
 
                 _gamePid = sack.GamePid
                 _readLoop = ReadLoopAsync()
+                _lastError = Nothing
                 Return True
 
             Catch ex As Exception
+                _lastError = ex.Message
                 _logger.LogError(ex, "Shim {Id}: StartAsync failed", _instanceId)
                 TryKillShim()
                 Return False

@@ -1,8 +1,10 @@
 Imports System
 Imports System.Collections.Concurrent
+Imports System.Collections.Generic
 Imports System.Diagnostics
 Imports System.IO
 Imports System.IO.Compression
+Imports System.Linq
 Imports System.Net.Http
 Imports System.Text
 Imports System.Text.RegularExpressions
@@ -139,6 +141,39 @@ Namespace GSM.Node
             End If
             Return False
         End Function
+
+        ''' <summary>
+        ''' Normalise an archive entry key for allowlist matching:
+        ''' backslashes → forward slashes, leading "./" and "/"
+        ''' stripped. Comparison is case-insensitive at the HashSet.
+        ''' </summary>
+        Private Shared Function NormalizeEntryKey(entryKey As String) As String
+            If String.IsNullOrEmpty(entryKey) Then Return ""
+            Dim k = entryKey.Replace("\"c, "/"c)
+            While k.StartsWith("./", StringComparison.Ordinal)
+                k = k.Substring(2)
+            End While
+            Return k.TrimStart("/"c)
+        End Function
+
+        ''' <summary>
+        ''' Surface per-entry extraction progress onto the operation
+        ''' record. total=0 means unknown (streaming readers) — count-
+        ''' only message, bar stays where the download left it. With a
+        ''' known total, extraction occupies the 80→99% span of the
+        ''' step (download took 0→80).
+        ''' </summary>
+        Private Shared Sub ReportExtractProgress(op As ActiveOperation,
+                                                 done As Integer,
+                                                 total As Integer)
+            If total > 0 Then
+                Dim frac = Math.Min(1.0, done / CDbl(total))
+                op.ProgressPercent = ComputeWeightedProgress(op, 80.0 + frac * 19.0)
+                op.Message = $"Extracting: {done} / {total} files"
+            Else
+                op.Message = $"Extracting: {done} files"
+            End If
+        End Sub
 
         ' ============================================================
         '  Step execution
@@ -1708,9 +1743,52 @@ Namespace GSM.Node
                 _logger.LogInformation("Download response: {Status} ({Url})",
                     response.StatusCode, response.RequestMessage?.RequestUri)
                 response.EnsureSuccessStatusCode()
+
+                ' Manual copy loop instead of CopyToAsync so byte-level
+                ' progress reaches the operation record. The manager's
+                ' 2s progress poll then renders "Downloading: X / Y MB"
+                ' with a moving bar instead of a silent multi-minute
+                ' stall on large artifacts (mesa's ~500 MB 7z was the
+                ' motivating complaint). Content-Length may be absent
+                ' (chunked responses) — fall back to MB-only messages.
+                Dim contentLength = response.Content.Headers.ContentLength
+                op.BytesTotal = contentLength
+                op.BytesDownloaded = 0
+                Dim fileLabel = Path.GetFileName(destPath)
+                ' Download occupies the first 80% of the step when an
+                ' extraction pass follows, the whole step otherwise.
+                Dim dlSpanPct As Double = If(dlStep.ExtractArchive, 80.0, 99.0)
+
                 Using fileStream As New FileStream(destPath, FileMode.Create,
                                                     FileAccess.Write, FileShare.None)
-                    Await response.Content.CopyToAsync(fileStream, cancellation)
+                    Using netStream = Await response.Content.ReadAsStreamAsync(cancellation)
+                        Dim buffer(81919) As Byte
+                        Dim totalRead As Long = 0
+                        Dim lastUiUpdate As DateTime = DateTime.MinValue
+                        While True
+                            Dim read = Await netStream.ReadAsync(
+                                buffer.AsMemory(0, buffer.Length), cancellation)
+                            If read <= 0 Then Exit While
+                            Await fileStream.WriteAsync(buffer.AsMemory(0, read), cancellation)
+                            totalRead += read
+
+                            If (DateTime.UtcNow - lastUiUpdate).TotalMilliseconds >= 500 Then
+                                lastUiUpdate = DateTime.UtcNow
+                                op.BytesDownloaded = totalRead
+                                Dim doneMb = totalRead / 1048576.0
+                                If contentLength.HasValue AndAlso contentLength.Value > 0 Then
+                                    Dim frac = totalRead / CDbl(contentLength.Value)
+                                    If frac > 1.0 Then frac = 1.0
+                                    op.ProgressPercent = ComputeWeightedProgress(op, frac * dlSpanPct)
+                                    Dim totalMb = contentLength.Value / 1048576.0
+                                    op.Message = $"Downloading {fileLabel}: {doneMb:F0} / {totalMb:F0} MB ({frac * 100.0:F1}%)"
+                                Else
+                                    op.Message = $"Downloading {fileLabel}: {doneMb:F0} MB"
+                                End If
+                            End If
+                        End While
+                        op.BytesDownloaded = totalRead
+                    End Using
                 End Using
             End Using
 
@@ -1727,6 +1805,41 @@ Namespace GSM.Node
                 End If
 
                 _logger.LogInformation("Extracting archive: {File}", destPath)
+
+                ' Optional entry allowlist — see DownloadFileStep.
+                ' ExtractOnlyPaths. Normalised to forward slashes,
+                ' case-insensitive. Nothing = extract everything.
+                Dim extractOnly As HashSet(Of String) = Nothing
+                If dlStep.ExtractOnlyPaths IsNot Nothing AndAlso
+                   dlStep.ExtractOnlyPaths.Count > 0 Then
+                    extractOnly = New HashSet(Of String)(
+                        dlStep.ExtractOnlyPaths.
+                            Where(Function(p) Not String.IsNullOrWhiteSpace(p)).
+                            Select(AddressOf NormalizeEntryKey),
+                        StringComparer.OrdinalIgnoreCase)
+                    If extractOnly.Count = 0 Then extractOnly = Nothing
+                End If
+                Dim matchedCount As Integer = 0
+
+                ' Resolve the extraction target. Default is the install
+                ' root (legacy behaviour); ExtractToRelativePath moves
+                ' it to a subdirectory (e.g. Stardew's mod zip → Mods\).
+                ' Path.GetFullPath + StartsWith guard rejects ".."-style
+                ' escapes from the install root — plugin-supplied but
+                ' users can override URLs/paths via install config, so
+                ' treat as untrusted.
+                Dim finalDest As String = op.InstallPath
+                If Not String.IsNullOrWhiteSpace(dlStep.ExtractToRelativePath) Then
+                    Dim candidate = Path.GetFullPath(
+                        Path.Combine(op.InstallPath, dlStep.ExtractToRelativePath))
+                    Dim rootFull = Path.GetFullPath(op.InstallPath)
+                    If Not candidate.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase) Then
+                        Throw New Exception(
+                            $"ExtractToRelativePath escapes the install root: {dlStep.ExtractToRelativePath}")
+                    End If
+                    Directory.CreateDirectory(candidate)
+                    finalDest = candidate
+                End If
 
                 Dim isTarXz = destPath.EndsWith(".tar.xz", StringComparison.OrdinalIgnoreCase) OrElse
                               destPath.EndsWith(".txz", StringComparison.OrdinalIgnoreCase)
@@ -1762,7 +1875,7 @@ Namespace GSM.Node
                 ' for .tar.xz since Windows 10 1803).
                 If isTarXz AndAlso (OperatingSystem.IsLinux() OrElse OperatingSystem.IsMacOS()) Then
                     Await ExtractWithNativeTarAsync(
-                        destPath, op.InstallPath,
+                        destPath, finalDest,
                         dlStep.StripTopLevelDirectory, cancellation)
                     _logger.LogInformation("Extraction complete")
                     File.Delete(destPath)
@@ -1794,7 +1907,7 @@ Namespace GSM.Node
                 ' on the same volume — a cross-volume Move would
                 ' silently degrade to copy + delete and the cost
                 ' becomes O(archive size) instead of O(entries).
-                Dim extractDest = op.InstallPath
+                Dim extractDest = finalDest
                 Dim staging As String = Nothing
                 If dlStep.StripTopLevelDirectory Then
                     staging = Path.Combine(op.InstallPath, ".gsm-staging")
@@ -1813,10 +1926,40 @@ Namespace GSM.Node
 
                 Try
                     If destPath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) Then
-                        ' Zip uses System.IO.Compression. Pax headers
-                        ' don't exist in the zip format, so no entry
-                        ' filtering needed here.
-                        IO.Compression.ZipFile.ExtractToDirectory(destPath, extractDest, True)
+                        ' Zip uses System.IO.Compression. Entry loop
+                        ' (rather than ExtractToDirectory) so the
+                        ' allowlist filter and per-entry progress both
+                        ' work. Pax headers don't exist in zip.
+                        Using zip = IO.Compression.ZipFile.OpenRead(destPath)
+                            Dim fileEntries = zip.Entries.
+                                Where(Function(e) Not String.IsNullOrEmpty(e.Name)).ToList()
+                            Dim done As Integer = 0
+                            Dim lastUi As DateTime = DateTime.MinValue
+                            Dim destRootFull = Path.GetFullPath(extractDest)
+                            For Each entry In fileEntries
+                                cancellation.ThrowIfCancellationRequested()
+                                Dim keyNorm = NormalizeEntryKey(entry.FullName)
+                                If extractOnly IsNot Nothing AndAlso
+                                   Not extractOnly.Contains(keyNorm) Then Continue For
+
+                                Dim target = Path.GetFullPath(Path.Combine(extractDest, entry.FullName))
+                                If Not target.StartsWith(destRootFull, StringComparison.OrdinalIgnoreCase) Then
+                                    Continue For ' zip-slip guard
+                                End If
+                                Directory.CreateDirectory(Path.GetDirectoryName(target))
+                                entry.ExtractToFile(target, overwrite:=True)
+
+                                done += 1
+                                If extractOnly IsNot Nothing Then
+                                    matchedCount += 1
+                                    If matchedCount >= extractOnly.Count Then Exit For
+                                End If
+                                If (DateTime.UtcNow - lastUi).TotalMilliseconds >= 500 Then
+                                    lastUi = DateTime.UtcNow
+                                    ReportExtractProgress(op, done, fileEntries.Count)
+                                End If
+                            Next
+                        End Using
                     ElseIf destPath.EndsWith(".tar.xz", StringComparison.OrdinalIgnoreCase) OrElse
                            destPath.EndsWith(".txz", StringComparison.OrdinalIgnoreCase) Then
                         ' SharpCompress's ArchiveFactory.Open doesn't
@@ -1841,6 +1984,8 @@ Namespace GSM.Node
                         Using fs As FileStream = File.OpenRead(destPath)
                             Using xz As New XZStream(fs)
                                 Using reader = TarReader.Open(xz)
+                                    Dim streamDone As Integer = 0
+                                    Dim streamLastUi As DateTime = DateTime.MinValue
                                     While reader.MoveToNextEntry()
                                         If reader.Entry.IsDirectory Then Continue While
                                         ' Filter Pax extended-header
@@ -1854,6 +1999,11 @@ Namespace GSM.Node
                                         ' on disk as a junk file.
                                         If IsPaxHeaderEntryKey(reader.Entry.Key) Then Continue While
 
+                                        If extractOnly IsNot Nothing AndAlso
+                                           Not extractOnly.Contains(NormalizeEntryKey(reader.Entry.Key)) Then
+                                            Continue While
+                                        End If
+
                                         ' Snapshot the entry's path and
                                         ' mode BEFORE WriteEntryToDirectory
                                         ' — once the reader advances past
@@ -1865,6 +2015,17 @@ Namespace GSM.Node
                                         reader.WriteEntryToDirectory(extractDest, opts)
 
                                         ApplyUnixModeIfNeeded(extractDest, entryKey, entryMode)
+
+                                        streamDone += 1
+                                        If extractOnly IsNot Nothing Then
+                                            matchedCount += 1
+                                            If matchedCount >= extractOnly.Count Then Exit While
+                                        End If
+                                        If (DateTime.UtcNow - streamLastUi).TotalMilliseconds >= 500 Then
+                                            streamLastUi = DateTime.UtcNow
+                                            ' Streaming reader: total unknown.
+                                            ReportExtractProgress(op, streamDone, 0)
+                                        End If
                                     End While
                                 End Using
                             End Using
@@ -1879,18 +2040,42 @@ Namespace GSM.Node
                                 .ExtractFullPath = True,
                                 .Overwrite = True
                             }
-                            For Each entry In archive.Entries
-                                If entry.IsDirectory Then Continue For
+                            Dim fileEntries = archive.Entries.
+                                Where(Function(e) Not e.IsDirectory).ToList()
+                            Dim done As Integer = 0
+                            Dim lastUi As DateTime = DateTime.MinValue
+                            For Each entry In fileEntries
+                                cancellation.ThrowIfCancellationRequested()
                                 If IsPaxHeaderEntryKey(entry.Key) Then Continue For
+                                If extractOnly IsNot Nothing AndAlso
+                                   Not extractOnly.Contains(NormalizeEntryKey(entry.Key)) Then
+                                    Continue For
+                                End If
+
                                 entry.WriteToDirectory(extractDest, opts)
+
+                                done += 1
+                                If extractOnly IsNot Nothing Then
+                                    matchedCount += 1
+                                    ' Early stop once every requested entry
+                                    ' is on disk — the big win for huge
+                                    ' archives like mesa-dist-win where we
+                                    ' want 2 files out of thousands.
+                                    If matchedCount >= extractOnly.Count Then Exit For
+                                End If
+                                If (DateTime.UtcNow - lastUi).TotalMilliseconds >= 500 Then
+                                    lastUi = DateTime.UtcNow
+                                    ReportExtractProgress(op, done,
+                                        If(extractOnly IsNot Nothing, extractOnly.Count, fileEntries.Count))
+                                End If
                             Next
                         End Using
                     End If
 
-                    ' Hoist staged contents into op.InstallPath if
+                    ' Hoist staged contents into the final target if
                     ' the strip-top-level path was requested.
                     If staging IsNot Nothing Then
-                        HoistStagedContents(staging, op.InstallPath)
+                        HoistStagedContents(staging, finalDest)
                     End If
                 Finally
                     ' Best-effort staging cleanup. HoistStagedContents
@@ -2274,27 +2459,61 @@ Namespace GSM.Node
             psi.Arguments = If(rpStep.Arguments, "")
             psi.WorkingDirectory = If(rpStep.WorkingDirectory, op.InstallPath)
             psi.UseShellExecute = False
-            psi.RedirectStandardOutput = True
             psi.CreateNoWindow = True
+            If Not rpStep.RequiresRealConsole Then
+                ' Normal path: capture-and-discard stdio. Redirected
+                ' stdin is closed after start so "press any key"
+                ' endings get EOF instead of blocking.
+                psi.RedirectStandardOutput = True
+                psi.RedirectStandardError = True
+                psi.RedirectStandardInput = True
+            End If
+            ' RequiresRealConsole: no redirection at all — the child
+            ' gets its own invisible console with valid screen-buffer
+            ' handles, for tools that call Console.Clear()/ReadKey.
 
             Using proc As New Process()
                 proc.StartInfo = psi
+                If Not rpStep.RequiresRealConsole Then
+                    ' Drain redirected pipes or a chatty process
+                    ' deadlocks at ~4KB of unread output. Output is
+                    ' discarded — the step contract is exit-code-based.
+                    AddHandler proc.OutputDataReceived, Sub(s, e)
+                                                        End Sub
+                    AddHandler proc.ErrorDataReceived, Sub(s, e)
+                                                       End Sub
+                End If
                 proc.Start()
-
-                Using cts = CancellationTokenSource.CreateLinkedTokenSource(cancellation)
-                    cts.CancelAfter(rpStep.TimeoutMs)
+                If Not rpStep.RequiresRealConsole Then
+                    proc.BeginOutputReadLine()
+                    proc.BeginErrorReadLine()
                     Try
-                        Await proc.WaitForExitAsync(cts.Token)
-                    Catch ex As OperationCanceledException
+                        proc.StandardInput.Close()
+                    Catch
+                        ' Process may have exited instantly; EOF
+                        ' signalling is best-effort.
+                    End Try
+                End If
+
+                ' Poll HasExited rather than WaitForExitAsync — the
+                ' latter deadlocks with redirected streams in .NET 8
+                ' (same pattern as RunSteamCmdProcessAsync).
+                Dim deadline = DateTime.UtcNow.AddMilliseconds(rpStep.TimeoutMs)
+                While Not proc.HasExited
+                    If cancellation.IsCancellationRequested OrElse DateTime.UtcNow > deadline Then
                         Try
                             proc.Kill(entireProcessTree:=True)
                         Catch
                             proc.Kill()
                         End Try
+                        If cancellation.IsCancellationRequested Then
+                            Throw New OperationCanceledException(cancellation)
+                        End If
                         Throw New TimeoutException(
                             $"Process step '{rpStep.StepName}' timed out after {rpStep.TimeoutMs}ms")
-                    End Try
-                End Using
+                    End If
+                    Await Task.Delay(250).ConfigureAwait(False)
+                End While
 
                 If proc.ExitCode <> rpStep.ExpectedExitCode Then
                     Throw New Exception(

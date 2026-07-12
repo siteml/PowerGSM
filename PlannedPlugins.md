@@ -11,7 +11,7 @@ Companion docs:
 - **`reference/plugins.md`** — how the Roslyn-compiled plugin model works.
 - **`Windrose_Plugin_Plan.md`** — the worked example of a plugin plan doc.
 - Shipped plugins as references: **Last Oasis**, **Factorio**, **Conan
-  Exiles**, **Windrose** (in `GSM.PluginsSource\`).
+  Exiles**, **Windrose**, **Stardew Valley** (in `GSM.PluginsSource\`).
 
 > **All "first-look" notes below are unverified starting points** — best
 > recollection of how each game's server *probably* works, not confirmed
@@ -99,7 +99,7 @@ For each game, the facts a plan doc needs:
 | Space Engineers | `[ready]` |
 | Team Fortress Classic | `[ready]` |
 | TERA | `[blocked: binaries?]` |
-| Stardew Valley (SMAPI mod) | `[research]` |
+| Stardew Valley (SMAPI mod) | `[shipped]` (0.5.0, plugin v0.1.0, Tier 0) |
 
 ---
 
@@ -1307,9 +1307,14 @@ above. Per the request: *only viable if usable binaries can be found.*
 Research notes: _TBD_
 
 ### Stardew Valley (SMAPI headless server mod)
-**Status:** `[research]` — feasible but the most bespoke of the lot, and a
-genuinely different plugin *shape*: there is no official server, so the "server"
-is the full game + a mod loader + a headless mod, not a dedicated-server binary.
+**Status:** `[shipped]` — shipped in PowerGSM 0.5.0 as plugin v0.1.0 (Tier 0:
+install / launch / stop / farm archive-restore, Windows + Linux). Tiers 1–4
+(stdin pseudo-RCON, multi-instance via Harmony port patch, …) remain future
+work — see `StardewValley_Plugin_Plan.md` and the fork repo
+`siteml/SMAPIDedicatedServerMod` (fork slices F1–F4 done). The research notes
+below are retained for history; the shipped design diverged in places (fork
+consumed as a release zip, `/bin/sh` + shared Xvfb `:97` bootstrap on Linux
+instead of xvfb-run, Mesa llvmpipe for GPU-less Windows).
 
 **There is no official dedicated server.** Stardew multiplayer normally needs the
 host running the full game client. The community workaround is a **headless
