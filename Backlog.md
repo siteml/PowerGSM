@@ -11,6 +11,21 @@ doc (or open a new mini-plan), then delete from here.
 
 ## Hardening & QoL
 
+### CopyFileStep reports success without producing the file
+
+**Surfaced:** Palworld plugin Slice 1, July 2026.
+**Priority:** Medium — silent success on a failed step is a trust bug.
+
+**Observed:** an install-time `CopyFileStep` targeting
+`Pal/Saved/Config/WindowsServer/PalWorldSettings.ini` (parent dirs did not
+exist yet — Palworld creates them on first run) completed the install with
+no step failure, but the destination file was never created. Either the
+node's copy runner swallows the exception, or it treats a missing SOURCE
+or destination-dir as a skip. Expected: step fails loudly (or documented
+skip semantics + parent-dir creation like WriteFileStep presumably has).
+Check InstallRunner's CopyFileStep handling; add parent-dir creation +
+real error propagation; unit-check the missing-source case too.
+
 ### Extract per-game Discord panel context into a plugin interface
 
 **Surfaced:** Stardew Valley plugin work, July 2026.

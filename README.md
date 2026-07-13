@@ -99,6 +99,8 @@ Official plugins ship for:
 - **Factorio**
 - **Conan Exiles**
 - **Windrose**
+- **Stardew Valley** (headless via SMAPI + dedicated-server mod)
+- **Palworld**
 
 More can be added as plugins — see [writing plugins](docs/developer/plugin-authoring.md).
 

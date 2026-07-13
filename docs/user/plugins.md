@@ -267,6 +267,62 @@ both operations.
 
 ---
 
+## Palworld
+
+`palworld` · Steam AppID **2394010** (anonymous — no Steam account needed) ·
+**Windows or Linux** (native server on both) · plugin version 0.1.0. On
+Windows the **Visual C++ 2015–2022 x64** runtime is required (the Node
+installs it from the game's bundled redist — run the Node as Administrator).
+
+One running instance per installation — Palworld's config and world save are
+shared per install. To host several Palworld servers on one node, create
+several installations.
+
+No install-level config.
+
+### Instance-level config
+
+| Field | Default | Notes |
+|---|---|---|
+| **Game port (UDP)** | 8211 | The port the server actually listens on (passed as `-port=`). **Forward this UDP port.** Allocated and clash-checked by the Manager. Not to be confused with the *Public port* on the Server Settings tab, which is advertise-only. |
+| **List in community server browser** | off | Adds `-publiclobby` so the server appears in Palworld's in-game community list (also how console players find it). Set *Public IP* / *Public port* on the Server Settings tab when enabling this. |
+
+### Server Settings tab
+
+Palworld keeps all of its settings on a single `OptionSettings=(...)` line in
+`PalWorldSettings.ini`. The **Server Settings** tab edits it structurally:
+server name and description, join and admin passwords, max players, the
+ESC-menu player list, join/leave messages, world-save backups, the
+community-browser advertise IP/port, and the REST API toggle + port. Any
+keys you've hand-edited that PowerGSM doesn't manage are preserved exactly.
+
+Two things worth knowing:
+
+- **A fresh install has an empty settings file** (Palworld only creates it on
+  first run, and even then it's blank). The editor handles this: it shows the
+  game's defaults and the first Save writes a complete, valid file — no need
+  to copy `DefaultPalWorldSettings.ini` around by hand.
+- **Settings apply on restart only.** Palworld reads the file once at boot;
+  there is no live reload.
+
+### Operational notes
+
+- **Update after every game patch** — Pocketpair patches frequently and
+  clients can't join a version-mismatched server.
+- **Graceful stop is clean**: Palworld saves the world on shutdown (plus
+  autosaves every 30 seconds by default), and PowerGSM allows up to 60
+  seconds for the save flush before force-killing.
+- **No log feed on Windows** — the server writes no log file and prints via
+  the Windows console API, so the manager's Logs tab stays empty there. On
+  Linux the server's console output is captured. Richer status via the
+  game's REST API is planned.
+- **RCON is deliberately unsupported** — Pocketpair has deprecated it and
+  scheduled its removal. Enable the **REST API** (with a strong admin
+  password, firewalled from the internet) if you want remote admin; PowerGSM
+  integration with it is planned.
+
+---
+
 ## lo-myrealm (Last Oasis name enrichment)
 
 `lo-myrealm` is a **utility plugin**, not a game. It doesn't host anything; it

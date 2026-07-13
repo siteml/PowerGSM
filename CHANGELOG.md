@@ -9,6 +9,27 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
+### Added
+
+- **Palworld plugin (`palworld`, plugin v0.1.0).** Windows + native Linux
+  dedicated server via anonymous SteamCMD (appid 2394010, per-platform
+  depot). Launches the UE5 Shipping-Cmd binary directly (root wrapper as
+  fallback); allocator-managed listening port via `-port=` (the tuple's
+  PublicPort is advertise-only); optional `-publiclobby` community-browser
+  toggle. **Server Settings editor** for the single-line
+  `OptionSettings=(...)` UE struct tuple in `PalWorldSettings.ini` —
+  bespoke depth/quote-aware parser, unknown keys round-trip verbatim, and
+  a blank fresh-install file (Palworld only creates it on first run) is
+  seeded from an embedded full default tuple, so the editor works before
+  the first launch. Initial field set: name, description, join/admin
+  passwords, max players, player list, join/leave messages, world-save
+  backups, community-browser advertise IP/port, REST API enable + port.
+  Clean graceful stop (CtrlC/SIGINT — Palworld saves on console close);
+  60s shutdown timeout for save flush. Log feed: stdout capture on Linux;
+  none on Windows (the server writes no file log and logs via the console
+  API — REST-based observability planned). RCON deliberately unsupported
+  (deprecated upstream); REST API remote control planned.
+
 ## [0.5.0] - 2026-07-11
 
 ### Added

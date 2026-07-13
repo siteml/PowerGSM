@@ -83,7 +83,7 @@ For each game, the facts a plan doc needs:
 | Dune: Awakening | `[blocked: architecture mismatch]` |
 | RuneScape: Dragonwilds | `[ready]` |
 | Valheim | `[ready]` |
-| Palworld | `[ready]` |
+| Palworld | `[shipped]` (unreleased/master, plugin v0.1.0, slices 1–2) |
 | Enshrouded | `[ready]` |
 | Nightingale | `[ready]` |
 | Towers of Aghasba | `[blocked: no dedicated server]` |
@@ -323,9 +323,17 @@ permit list editors; (4) crossplay toggle + connectivity model; (5) [later] log
 parse rules (blocked on samples).
 
 ### Palworld
-**Status:** `[ready]` — researched; strong fit. Two standout notes: a quirky
-single-line config format, and control should target the REST API (RCON is being
-removed).
+**Status:** `[shipped]` — in master (post-0.5.0), plugin v0.1.0, slices 1–2 of
+`Palworld_Plugin_Plan.md` (install / launch / allocator-managed `-port=` /
+graceful stop / OptionSettings tuple editor with embedded-default blank-file
+seeding). Windows-verified; Linux run + REST control (slice 4) + saves managed
+dir (slice 5) remain. Key divergences from the research below, from live
+testing + official docs: listening port is the `-port=` launch arg (tuple
+PublicPort is advertise-only); config dirs exist only after first run, so the
+fresh-file fix is an embedded default tuple, not a copy step; no file log
+exists at all and Windows stdout capture yields nothing (UE console-API
+logging) — Linux stdout capture only; perf flags deprecated in v1.0+. Research
+notes retained below for history.
 
 **Install:** SteamCMD **AppID 2394010** ("Palworld Dedicated Server"),
 anonymous, free (don't need to own the game). **Windows and Linux** (official
