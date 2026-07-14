@@ -164,20 +164,45 @@ is whether RESTAPIPort wants allocator tracking (would need a small
 IStartupFileProvider render) — decide when Slice 4's REST client makes the
 port matter.
 
-**Slice 4 — REST control (D3) + log strategy flip.**
-New opt-in interfaces (graceful-stop hook, remote player list) + Manager
-wiring + Palworld REST client (Basic auth `admin`/AdminPassword). Announced
-shutdown (`/announce` + `/save` + `/shutdown {sec}`), structured player
-list. Gated on REST bind verification (Q4). Once REST stop works, flip
-GetLogSources/LaunchOptions to StdoutIsLog=True + `-logformat=Json` so the
-manager gets a live structured log feed (stdout is Palworld's only log —
-verified; the console graceful path being lost no longer matters).
-**Goal: Stop = announced graceful REST stop; Players tab live from REST;
-live logs in the manager.**
+**Slice 4 — REST control (D3) + player list.**
+[shipped to source 13 Jul 2026; live-tested: stop PASS ("Remote-control
+stop: plugin initiated in-game shutdown" + 1.8s exit), player list PASS
+with a real player (name/persona/steam-id/IP all populated)]
+As built: contract gained `RemoteControlContext` (NodeHost + merged
+config + FetchInstanceFile delegate) and `IRemoteControlProvider`
+(RequestStopAsync → Boolean handled; GetPlayersAsync →
+`GSM.Node.Api.PlayerSession` list — the plugin owns ALL field mapping,
+the Manager passes the list through untouched; decline-fast semantics,
+exceptions = decline). Manager: `BuildRemoteControlContextAsync` shared
+helper; stop hook at the top of StopInstanceAsync (10s cap, node stop
+path runs unconditionally after — stop-intent + kill ladder preserved);
+player-list override in Manager GetPlayersAsync (8s cap, node list
+fallback). Plugin: REST client reading RESTAPIEnabled/RESTAPIPort/
+AdminPassword live from the settings file (30s per-instance cache, no
+DB credential copy); stop = /announce → /save → /shutdown waittime=1;
+/players field semantics verified live (name=character,
+accountName=Steam persona, userId="steam_<id64>", playerId=character
+hex id, **iP** — erratic casing, harvest is case-insensitive).
+Manager→node-host:RESTAPIPort direct; localhost-relay hardening is a
+Backlog item. Log-strategy flip (StdoutIsLog on Windows) NOT taken —
+Windows stdout carries no UE log at all, so there's nothing to gain;
+Linux already captures stdout.
+Follow-up idea (post-slice): automation-rule integration — player-count
+triggers get REST-fed data for free once polling feeds the standard
+pipeline; a generic "remote announce" IAction via the same provider is a
+natural add. Design when wanted.
 
-**Slice 5 — saves.**
-`IManagedDirectoriesProvider`: `Pal/Saved/SaveGames` (R/W/D) + Logs (R).
-Backup story per existing patterns.
+**Slice 5 — saves (REVISED; config-dir half shipped, archive half future).**
+Shipped: read-only "Config files" managed dir (platform config dir — flat,
+works). NOT shipped: raw `Pal/Saved/SaveGames` managed dir — tried and
+reverted 13 Jul 2026: the save is a nested tree (`0/<worldid>/{Level.sav,
+Players/, backup/}`) and the node's managed-files listing is FLAT
+(`Directory.EnumerateFiles`, top level only) → tab permanently blank.
+Proper saves support = SDV-style **world archive/restore** (pack
+`0/<worldid>` into a zip/tar.gz in a flat backups dir, restore on either
+platform; IFileGenerationProvider pattern) — better for whole-world
+download/migration than a recursive file listing anyway. Future slice,
+after Slice 4. (Node flat-listing limitation also noted in Backlog.md.)
 
 **[later] Log parse rules** — only if REST player data leaves gaps
 (join/leave history timestamps?); needs live log captures.
@@ -208,8 +233,9 @@ Backup story per existing patterns.
 3. ~~**Log file**~~ — **RESOLVED**: NONE. No file log even with `-log`
    (mod required for one). Console/stdout is the only feed — stdout capture
    flips on in Slice 4 alongside REST stop.
-4. **REST bind address** — OPEN. Localhost-only or all interfaces? Gate for
-   D3/Slice 4.
+4. ~~**REST bind address**~~ — **RESOLVED**: binds all interfaces
+   (verified: Manager-machine curl to node-host:port → 200). Slice 4
+   shipped Manager-direct; localhost-relay hardening in Backlog.
 5. ~~**Config dir at install time**~~ — **RESOLVED**: does NOT exist;
    official docs confirm dirs are created only by the first run. Seed copy
    removed; embedded default tuple instead. (Side-find: node CopyFileStep
@@ -223,12 +249,20 @@ Backup story per existing patterns.
 
 ---
 
+**Chat: documented gap (no vanilla feed).** The REST API has no chat-read
+endpoint (announce is send-only) and vanilla RCON exposes the same
+command set — the "chat via RCON" guides refer to server mods
+(PalDefender/PalGuard) bolting custom commands onto deprecated RCON.
+Nothing to build on. If ever wanted: a chat mod that logs to a FILE
+feeds the normal tail+parse pipeline with zero contract work — opt-in
+mod territory, not plugin baseline.
+
 ## 7. Contract notes
 
-Slices 1–3: existing contract only (`IGamePlugin`,
-`IPrerequisiteProvider`, `IInstallationNoticeProvider`,
-`ILaunchOptionsProvider`, `IInstanceFileEditorProvider`,
-`IStartupFileProvider`, `IManagedDirectoriesProvider`). Header magic
-comment `' <RequiresContracts: 1>`.
-Slice 4 adds two opt-in interfaces (D3) — additive, sole consumer ships
-with them → no ContractsVersion bump.
+Slices 1–3 ship on contracts v2 (plugin v0.1.x). Slice 4 adds the
+remote-control surface and bumps **ContractsVersion 2 → 3** — revised
+from the original "no bump" call: plugins distribute independently via
+plugin sources, so a v3-consuming plugin can land on a v2 (0.5.0)
+Manager, and the gate turns a raw Roslyn compile failure into a clean
+ContractsVersionTooNew refusal. Plugin is therefore **v0.2.0 with
+`' <RequiresContracts: 3>`** from Slice 4 on.

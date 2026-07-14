@@ -72,8 +72,14 @@ Namespace GSM.Node.Api
         ''' e.g. the 7-5 shared web-session methods on IUtilityContext
         ''' — are routine and do NOT bump: their only consumer ships
         ''' with them, so there's no version skew to gate.)
+        ''' v3 = remote-control surface (IRemoteControlProvider +
+        ''' RemoteControlContext). Bumped although additive: plugins
+        ''' distribute independently via plugin sources, so a plugin
+        ''' consuming the new surface CAN land on an older (v2 = 0.5.0)
+        ''' Manager — the version gate turns that from a raw Roslyn
+        ''' compile failure into a clean ContractsVersionTooNew refusal.
         ''' </summary>
-        Public Const ContractsVersion As Integer = 2
+        Public Const ContractsVersion As Integer = 3
 
     End Module
 

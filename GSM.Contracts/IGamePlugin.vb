@@ -2183,4 +2183,96 @@ Namespace GSM.Plugin
         Public Property SharedConfigFields As IReadOnlyDictionary(Of String, String)
     End Class
 
+    ' ============================================================
+    '  Remote control (REST/HTTP-administered games) — opt-in
+    ' ============================================================
+
+    ''' <summary>
+    ''' Context handed to IRemoteControlProvider calls. Carries what
+    ''' the plugin needs to reach a game's own admin surface (HTTP
+    ''' REST API or similar) on the node machine — InstanceConfig
+    ''' deliberately does not know the node's address, and admin
+    ''' credentials often live in the game's own config file rather
+    ''' than in PowerGSM's database.
+    ''' </summary>
+    Public Class RemoteControlContext
+        ''' <summary>
+        ''' Host (name or IP, no scheme/port) the Manager uses to
+        ''' reach the node this instance runs on. A game admin API
+        ''' listening on the node is reachable at this host + the
+        ''' game-configured port — provided it binds non-localhost
+        ''' and any firewall allows the Manager through.
+        ''' </summary>
+        Public Property NodeHost As String
+
+        ''' <summary>
+        ''' Merged install+instance config for the instance (same
+        ''' shape the lifecycle methods receive).
+        ''' </summary>
+        Public Property Config As InstanceConfig
+
+        ''' <summary>
+        ''' Fetch a file's text content from the instance's install
+        ''' directory on the node (relative path, forward slashes).
+        ''' Returns Nothing when the file doesn't exist or the fetch
+        ''' fails. This is how a plugin reads admin credentials or
+        ''' ports out of the game's own config file (e.g. Palworld's
+        ''' AdminPassword / RESTAPIPort in PalWorldSettings.ini)
+        ''' without duplicating them into PowerGSM's database.
+        ''' </summary>
+        Public Property FetchInstanceFile As Func(Of String, Task(Of String))
+    End Class
+
+    ''' <summary>
+    ''' Opt-in interface (additive, post-0.5.0) for games whose
+    ''' remote administration goes through their own out-of-band
+    ''' admin channel (HTTP REST API etc.) rather than RCON or
+    ''' stdin. The plugin owns the protocol entirely; the Manager
+    ''' only supplies context and decides when to call.
+    '''
+    ''' Motivating case: Palworld — RCON deprecated upstream, REST
+    ''' API (HTTP Basic, admin password from the game's own config
+    ''' file) is the sanctioned channel for announce / save /
+    ''' graceful shutdown / player list.
+    '''
+    ''' Both methods must be cheap to DECLINE: a provider whose
+    ''' admin channel is disabled or unreachable returns the
+    ''' decline value quickly (False / Nothing) rather than
+    ''' throwing, so the Manager's fallback paths stay fast.
+    ''' Exceptions are treated as declines by the Manager.
+    ''' </summary>
+    Public Interface IRemoteControlProvider
+        ''' <summary>
+        ''' Called by the Manager at the START of StopInstanceAsync,
+        ''' before the node's stop endpoint. A True return means the
+        ''' plugin has asked the game to shut itself down cleanly
+        ''' (e.g. REST announce + save + shutdown); the Manager then
+        ''' proceeds with the normal node stop call REGARDLESS of
+        ''' the return value — the node must still set its stop-
+        ''' intent flag so the self-initiated exit isn't classified
+        ''' as a crash, and its CtrlC/SIGINT + force-kill ladder
+        ''' remains the safety net if the game ignores the request.
+        ''' Return False to decline (admin channel off/unreachable)
+        ''' — the node path then does all the work, as today.
+        ''' Keep it fast: this sits on the user's Stop click.
+        ''' </summary>
+        Function RequestStopAsync(context As RemoteControlContext,
+                                   ct As CancellationToken) As Task(Of Boolean)
+
+        ''' <summary>
+        ''' Current online players from the game's admin channel, or
+        ''' Nothing when unavailable (channel disabled, unreachable,
+        ''' instance not up yet). The Manager may poll this for
+        ''' running instances and use it as the player-list source
+        ''' for games with no log-based player tracking. Returns the
+        ''' node/UI PlayerSession shape directly — the plugin owns
+        ''' the entire mapping from its game's API fields (which
+        ''' name is the character vs the platform persona, id
+        ''' formats, etc.); the Manager passes the list through
+        ''' untouched.
+        ''' </summary>
+        Function GetPlayersAsync(context As RemoteControlContext,
+                                  ct As CancellationToken) As Task(Of IReadOnlyList(Of GSM.Node.Api.PlayerSession))
+    End Interface
+
 End Namespace

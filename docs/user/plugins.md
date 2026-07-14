@@ -270,7 +270,7 @@ both operations.
 ## Palworld
 
 `palworld` · Steam AppID **2394010** (anonymous — no Steam account needed) ·
-**Windows or Linux** (native server on both) · plugin version 0.1.0. On
+**Windows or Linux** (native server on both) · plugin version 0.2.0. On
 Windows the **Visual C++ 2015–2022 x64** runtime is required (the Node
 installs it from the game's bundled redist — run the Node as Administrator).
 
@@ -309,17 +309,23 @@ Two things worth knowing:
 
 - **Update after every game patch** — Pocketpair patches frequently and
   clients can't join a version-mismatched server.
-- **Graceful stop is clean**: Palworld saves the world on shutdown (plus
-  autosaves every 30 seconds by default), and PowerGSM allows up to 60
-  seconds for the save flush before force-killing.
-- **No log feed on Windows** — the server writes no log file and prints via
-  the Windows console API, so the manager's Logs tab stays empty there. On
-  Linux the server's console output is captured. Richer status via the
-  game's REST API is planned.
+- **Enable the REST API for the best experience.** With **Enable REST
+  API** on and a strong **Admin password** set (Server Settings tab, then
+  restart): *Stop* performs an announced in-game graceful shutdown
+  (players get a heads-up, the world saves), and the **Players** list
+  shows who's online live — character name, Steam name, SteamID and IP.
+  With it off, stop still works (Palworld saves on shutdown, plus
+  autosaves every 30 seconds) but there's no player list — Palworld
+  exposes no log-based player tracking. Keep the REST port firewalled
+  from the internet; only the PowerGSM manager needs to reach it.
+- **No log feed on Windows** — the server writes no log file and prints
+  via the Windows console API, so the manager's Logs tab stays empty
+  there. On Linux the server's console output is captured.
+- **No chat feed** — Palworld exposes no chat in its REST API, logs, or
+  vanilla RCON, so the Chat tab stays empty. (Guides describing "chat
+  via RCON" rely on third-party server mods and deprecated RCON.)
 - **RCON is deliberately unsupported** — Pocketpair has deprecated it and
-  scheduled its removal. Enable the **REST API** (with a strong admin
-  password, firewalled from the internet) if you want remote admin; PowerGSM
-  integration with it is planned.
+  scheduled its removal; the REST API above is the sanctioned channel.
 
 ---
 

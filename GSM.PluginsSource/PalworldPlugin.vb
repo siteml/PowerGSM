@@ -1,7 +1,14 @@
-' <plugin id="palworld" name="Palworld Dedicated Server" version="0.1.0" author="siteml" requiresContracts="2">
-' <RequiresContracts: 2>
+' <plugin id="palworld" name="Palworld Dedicated Server" version="0.2.0" author="siteml" requiresContracts="3">
+' <RequiresContracts: 3>
 Imports System
+Imports System.Collections.Concurrent
 Imports System.Collections.Generic
+Imports System.Net.Http
+Imports System.Net.Http.Headers
+Imports System.Text
+Imports System.Text.Json.Nodes
+Imports System.Threading
+Imports System.Threading.Tasks
 Imports GSM.Plugin
 
 ' ============================================================
@@ -63,6 +70,8 @@ Public Class PalworldPlugin
     Implements IPrerequisiteProvider
     Implements ILaunchOptionsProvider
     Implements IInstanceFileEditorProvider
+    Implements IManagedDirectoriesProvider
+    Implements IRemoteControlProvider
 
     Public ReadOnly Property GameId As String = "palworld" Implements IGamePlugin.GameId
     Public ReadOnly Property DisplayName As String = "Palworld" Implements IGamePlugin.DisplayName
@@ -763,6 +772,257 @@ Public Class PalworldPlugin
             Return s.Substring(1, s.Length - 2)
         End If
         Return s
+    End Function
+
+    ' ============================================================
+    '  IManagedDirectoriesProvider (SLICE 5, revised)
+    '
+    '  World saves are NOT surfaced. Pal/Saved/SaveGames is a
+    '  nested tree (0/<worldid>/{Level.sav, LevelMeta.sav,
+    '  Players/, backup/}) and the node's managed-files listing is
+    '  flat (Directory.EnumerateFiles, top level only) — the tab
+    '  showed permanently blank against the tree (verified 13 Jul
+    '  2026). Proper saves support is a future slice: SDV-style
+    '  archive/restore packing a whole world into a flat backups
+    '  dir (IFileGenerationProvider pattern) — better for whole-
+    '  world download/migration than a recursive file list anyway.
+    '  See Palworld_Plugin_Plan.md.
+    '
+    '  Config dir surfaced read-only for debugging convenience
+    '  (grab PalWorldSettings.ini without shell access); edits go
+    '  through the Server Settings tab.
+    ' ============================================================
+
+    Public Function GetManagedDirectories(config As InstanceConfig) As IReadOnlyList(Of ManagedDirectory) Implements IManagedDirectoriesProvider.GetManagedDirectories
+        Dim isLinux = config IsNot Nothing AndAlso config.Platform = NodePlatform.Linux
+        Dim cfgDir = If(isLinux, "Pal/Saved/Config/LinuxServer", "Pal/Saved/Config/WindowsServer")
+        Return New ManagedDirectory() {
+            New ManagedDirectory With {
+                .RelativePath = cfgDir,
+                .DisplayName = "Config files",
+                .Permissions = DirPermissions.Read
+            }
+        }
+    End Function
+
+    ' ============================================================
+    '  IRemoteControlProvider — REST API client (SLICE 4)
+    '
+    '  Palworld's sanctioned admin channel (RCON deprecated). HTTP
+    '  Basic auth, user 'admin', password = AdminPassword from the
+    '  game's own settings file — fetched live via
+    '  ctx.FetchInstanceFile so nothing is duplicated into
+    '  PowerGSM's database and a password change applies on the
+    '  next call. Both methods decline fast (False / Nothing) when
+    '  the REST API is disabled, unconfigured, or unreachable —
+    '  the Manager's normal paths then take over.
+    '
+    '  Stop flow: /announce (heads-up to players) → /save (belt +
+    '  braces; /shutdown saves too) → /shutdown waittime=1. The
+    '  Manager then runs its normal node stop path regardless —
+    '  the node sets stop-intent (no crash misclassification) and
+    '  its CtrlC/force-kill ladder covers a hung game. CTRL_C
+    '  against a REST-initiated exiting process is harmless.
+    ' ============================================================
+
+    ' One client for all instances of this plugin; generous
+    ' HttpClient timeout — real deadlines come from the caller's
+    ' CancellationToken (Manager caps the whole stop hook at 10s).
+    Private Shared ReadOnly _http As New HttpClient() With {
+        .Timeout = TimeSpan.FromSeconds(30)
+    }
+
+    Private Class RestSettings
+        Public Enabled As Boolean
+        Public Port As Integer
+        Public AdminPassword As String
+    End Class
+
+    ' Per-instance settings cache (30s TTL). GetPlayersAsync gets
+    ' polled every few seconds by the UI; without this every tick
+    ' would round-trip the settings file through the node before
+    ' even reaching the REST call. 30s keeps an operator's REST
+    ' toggle / password change near-immediate (and those need a
+    ' server restart to take effect anyway).
+    Private Shared ReadOnly _restSettingsCache As New ConcurrentDictionary(Of String, Tuple(Of DateTime, RestSettings))
+
+    ''' <summary>
+    ''' Read RESTAPIEnabled / RESTAPIPort / AdminPassword out of the
+    ''' live settings file on the node (30s cache). Nothing = can't
+    ''' determine (file unreadable/absent) — treat as REST
+    ''' unavailable. Negative results are cached too, so a game
+    ''' with REST off doesn't re-fetch the file every poll tick.
+    ''' </summary>
+    Private Shared Async Function ReadRestSettingsAsync(ctx As RemoteControlContext) As Task(Of RestSettings)
+        If ctx Is Nothing OrElse ctx.FetchInstanceFile Is Nothing Then Return Nothing
+
+        Dim cacheKey = If(ctx.Config?.InstanceId, "")
+        Dim cached As Tuple(Of DateTime, RestSettings) = Nothing
+        If cacheKey.Length > 0 AndAlso _restSettingsCache.TryGetValue(cacheKey, cached) AndAlso
+           (DateTime.UtcNow - cached.Item1) < TimeSpan.FromSeconds(30) Then
+            Return cached.Item2
+        End If
+
+        Dim isLinux = ctx.Config IsNot Nothing AndAlso ctx.Config.Platform = NodePlatform.Linux
+        Dim relPath = If(isLinux,
+            "Pal/Saved/Config/LinuxServer/PalWorldSettings.ini",
+            "Pal/Saved/Config/WindowsServer/PalWorldSettings.ini")
+
+        Dim text = Await ctx.FetchInstanceFile(relPath)
+        Dim payload = ExtractTuplePayload(text)
+
+        Dim result As RestSettings = Nothing
+        If payload IsNot Nothing Then
+            result = New RestSettings With {.Port = 8212, .AdminPassword = ""}
+            For Each entry In SplitTupleEntries(payload)
+                Dim eq = entry.IndexOf("="c)
+                If eq <= 0 Then Continue For
+                Dim key = entry.Substring(0, eq).Trim()
+                Dim raw = entry.Substring(eq + 1).Trim()
+                If key.Equals("RESTAPIEnabled", StringComparison.OrdinalIgnoreCase) Then
+                    Boolean.TryParse(raw, result.Enabled)
+                ElseIf key.Equals("RESTAPIPort", StringComparison.OrdinalIgnoreCase) Then
+                    Integer.TryParse(raw, result.Port)
+                ElseIf key.Equals("AdminPassword", StringComparison.OrdinalIgnoreCase) Then
+                    result.AdminPassword = Unquote(raw)
+                End If
+            Next
+        End If
+
+        If cacheKey.Length > 0 Then
+            _restSettingsCache(cacheKey) = Tuple.Create(DateTime.UtcNow, result)
+        End If
+        Return result
+    End Function
+
+    Private Shared Function BuildRestRequest(method As HttpMethod,
+                                              ctx As RemoteControlContext,
+                                              settings As RestSettings,
+                                              endpoint As String,
+                                              Optional jsonBody As String = Nothing) As HttpRequestMessage
+        Dim req As New HttpRequestMessage(method,
+            $"http://{ctx.NodeHost}:{settings.Port}/v1/api/{endpoint}")
+        Dim cred = Convert.ToBase64String(Encoding.UTF8.GetBytes("admin:" & settings.AdminPassword))
+        req.Headers.Authorization = New AuthenticationHeaderValue("Basic", cred)
+        If jsonBody IsNot Nothing Then
+            req.Content = New StringContent(jsonBody, Encoding.UTF8, "application/json")
+        End If
+        Return req
+    End Function
+
+    Public Async Function RequestStopAsync(context As RemoteControlContext,
+                                            ct As CancellationToken) As Task(Of Boolean) _
+            Implements IRemoteControlProvider.RequestStopAsync
+
+        Dim settings = Await ReadRestSettingsAsync(context)
+        If settings Is Nothing OrElse Not settings.Enabled OrElse
+           String.IsNullOrEmpty(settings.AdminPassword) Then
+            Return False ' REST off/unconfigured — node CtrlC path handles it
+        End If
+
+        ' Announce + save are best-effort niceties; only /shutdown
+        ' decides handled/not. Failures on them don't abort.
+        Try
+            Using resp = Await _http.SendAsync(BuildRestRequest(HttpMethod.Post, context, settings,
+                "announce", "{""message"":""Server is shutting down""}"), ct)
+            End Using
+        Catch
+        End Try
+        Try
+            Using resp = Await _http.SendAsync(BuildRestRequest(HttpMethod.Post, context, settings,
+                "save"), ct)
+            End Using
+        Catch
+        End Try
+
+        Try
+            Using resp = Await _http.SendAsync(BuildRestRequest(HttpMethod.Post, context, settings,
+                "shutdown", "{""waittime"":1,""message"":""Server is shutting down""}"), ct)
+                Return resp.IsSuccessStatusCode
+            End Using
+        Catch
+            Return False ' unreachable — fall through to node stop path
+        End Try
+    End Function
+
+    Public Async Function GetPlayersAsync(context As RemoteControlContext,
+                                           ct As CancellationToken) As Task(Of IReadOnlyList(Of GSM.Node.Api.PlayerSession)) _
+            Implements IRemoteControlProvider.GetPlayersAsync
+
+        Dim settings = Await ReadRestSettingsAsync(context)
+        If settings Is Nothing OrElse Not settings.Enabled OrElse
+           String.IsNullOrEmpty(settings.AdminPassword) Then
+            Return Nothing
+        End If
+
+        Try
+            Using resp = Await _http.SendAsync(BuildRestRequest(HttpMethod.Get, context, settings,
+                "players"), ct)
+                If Not resp.IsSuccessStatusCode Then Return Nothing
+                Dim body = Await resp.Content.ReadAsStringAsync(ct)
+
+                Dim root = TryCast(JsonNode.Parse(body), JsonObject)
+                If root Is Nothing Then Return Nothing
+                Dim arr = TryCast(root("players"), JsonArray)
+                If arr Is Nothing Then Return Nothing
+
+                Dim players As New List(Of GSM.Node.Api.PlayerSession)
+                For Each node In arr
+                    Dim obj = TryCast(node, JsonObject)
+                    If obj Is Nothing Then Continue For
+                    ' Copy properties into a case-insensitive dict
+                    ' first — Palworld's key casing is erratic (the
+                    ' live 1.0 API returns "iP", not "ip") and
+                    ' JsonObject lookups are case-sensitive.
+                    Dim props As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+                    For Each kvp In obj
+                        Dim v = If(kvp.Value?.ToString(), "").Trim(""""c)
+                        If v.Length > 0 Then props(kvp.Key) = v
+                    Next
+
+                    ' Field semantics (verified live, 13 Jul 2026):
+                    '   name        = in-world CHARACTER name
+                    '   accountName = platform persona (Steam name)
+                    '   playerId    = in-world character id (hex)
+                    '   userId      = "steam_<SteamID64>" — stable
+                    '   iP          = remote address
+                    Dim userId As String = Nothing
+                    props.TryGetValue("userId", userId)
+                    Dim platform As String = Nothing
+                    Dim platformUserId = If(userId, "")
+                    Dim sep = platformUserId.IndexOf("_"c)
+                    If sep > 0 AndAlso sep < platformUserId.Length - 1 Then
+                        platform = platformUserId.Substring(0, sep)
+                        platformUserId = platformUserId.Substring(sep + 1)
+                    End If
+
+                    Dim characterName As String = Nothing
+                    props.TryGetValue("name", characterName)
+                    Dim persona As String = Nothing
+                    If Not props.TryGetValue("accountName", persona) OrElse String.IsNullOrEmpty(persona) Then
+                        persona = characterName
+                    End If
+                    Dim characterId As String = Nothing
+                    props.TryGetValue("playerId", characterId)
+                    Dim remoteAddr As String = Nothing
+                    props.TryGetValue("ip", remoteAddr)
+
+                    ' JoinedUtc unknown to a point-in-time poll —
+                    ' stays default.
+                    players.Add(New GSM.Node.Api.PlayerSession With {
+                        .DisplayName = characterName,
+                        .PlatformPersona = persona,
+                        .Platform = platform,
+                        .PlatformUserId = platformUserId,
+                        .CharacterId = characterId,
+                        .RemoteAddress = remoteAddr
+                    })
+                Next
+                Return players
+            End Using
+        Catch
+            Return Nothing
+        End Try
     End Function
 
     ' ============================================================

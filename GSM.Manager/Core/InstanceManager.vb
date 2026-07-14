@@ -749,6 +749,15 @@ Namespace GSM.Manager.Core
                 Return False
             End If
 
+            ' Remote-control pre-stop (IRemoteControlProvider opt-in):
+            ' let the plugin ask the game to shut itself down via its
+            ' own admin channel (e.g. Palworld REST announce + save +
+            ' shutdown) BEFORE the node stop call. Best-effort with a
+            ' hard cap — the node path below runs regardless and
+            ' remains the source of truth for stop-intent flagging,
+            ' CtrlC/SIGINT, and the force-kill ladder.
+            Await TryRemoteControlStopAsync(instanceId, client)
+
             Dim effectiveTimeoutMs = gracefulTimeoutMs
             If effectiveTimeoutMs < 0 Then
                 ' Look up the per-instance custom override first.
@@ -1029,11 +1038,33 @@ Namespace GSM.Manager.Core
 
         ''' <summary>
         ''' Returns the list of players the node currently believes are
-        ''' online for this instance. Backed by the node's log parser.
+        ''' online for this instance. Backed by the node's log parser —
+        ''' except for IRemoteControlProvider games (Slice 4b), where
+        ''' the plugin's own admin-channel player list (e.g. Palworld
+        ''' REST /players) takes precedence when available: those games
+        ''' have no log-based tracking, so the node list is permanently
+        ''' empty for them. Provider unavailable/declining (Nothing)
+        ''' falls back to the node list as before.
         ''' </summary>
         Public Async Function GetPlayersAsync(instanceId As String) As Task(Of IReadOnlyList(Of PlayerSession))
             Dim client = GetClientForInstance(instanceId)
             If client Is Nothing Then Return New List(Of PlayerSession)()
+
+            ' Remote-control override source. Plugin returns the
+            ' PlayerSession shape directly — all game-specific field
+            ' mapping lives plugin-side.
+            Try
+                Dim rc = Await BuildRemoteControlContextAsync(instanceId, client)
+                If rc IsNot Nothing Then
+                    Using cts As New CancellationTokenSource(TimeSpan.FromSeconds(8))
+                        Dim remote = Await rc.Item1.GetPlayersAsync(rc.Item2, cts.Token)
+                        If remote IsNot Nothing Then Return remote
+                    End Using
+                End If
+            Catch ex As Exception
+                _logger.LogDebug(ex, "Remote-control player fetch failed for {Id}; using node list", instanceId)
+            End Try
+
             Try
                 Return Await client.GetPlayersAsync(instanceId, CancellationToken.None)
             Catch ex As Exception
@@ -3920,6 +3951,113 @@ Namespace GSM.Manager.Core
                     nodeEntity.NodeId, nodeEntity.HostAddress,
                     nodeEntity.Port, nodeEntity.AuthToken)
             End Using
+        End Function
+
+        ''' <summary>
+        ''' Remote-control pre-stop. When the instance's plugin
+        ''' implements IRemoteControlProvider, build the
+        ''' RemoteControlContext (node host + merged config + a
+        ''' file-fetch delegate over the same /files endpoints the
+        ''' editor and startup render use) and give the plugin a
+        ''' bounded chance to shut the game down via its own admin
+        ''' channel. Strictly best-effort: any failure, decline, or
+        ''' timeout (10s hard cap — this sits on the user's Stop
+        ''' click) just falls through to the normal node stop path,
+        ''' which runs regardless of the outcome here so the node's
+        ''' stop-intent flag and kill ladder always apply.
+        ''' </summary>
+        Private Async Function TryRemoteControlStopAsync(instanceId As String,
+                                                          client As INodeClient) As Task
+            Try
+                Dim rc = Await BuildRemoteControlContextAsync(instanceId, client)
+                If rc Is Nothing Then Return
+
+                Using cts As New CancellationTokenSource(TimeSpan.FromSeconds(10))
+                    Dim handled = Await rc.Item1.RequestStopAsync(rc.Item2, cts.Token)
+                    If handled Then
+                        _logger.LogInformation(
+                            "Remote-control stop: plugin initiated in-game shutdown for {Id}", instanceId)
+                    End If
+                End Using
+            Catch ex As Exception
+                ' Decline-by-exception (contract): warn and fall
+                ' through to the node stop path.
+                _logger.LogWarning(ex,
+                    "Remote-control stop failed for {Id}; falling back to node stop path", instanceId)
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Resolve the instance's plugin as IRemoteControlProvider and
+        ''' assemble the RemoteControlContext (node host + merged config
+        ''' + file-fetch delegate). Nothing when the plugin doesn't opt
+        ''' in or the entity chain is broken. Shared by the stop hook
+        ''' and the player-list override (Slice 4b).
+        ''' </summary>
+        Private Async Function BuildRemoteControlContextAsync(instanceId As String,
+                                                               client As INodeClient) _
+                As Task(Of Tuple(Of IRemoteControlProvider, RemoteControlContext))
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim instanceEntity = db.Instances.Find(instanceId)
+                If instanceEntity Is Nothing Then Return Nothing
+                Dim installEntity = db.Installations.Find(instanceEntity.InstallationId)
+                If installEntity Is Nothing Then Return Nothing
+                Dim nodeEntity = db.Nodes.Find(installEntity.NodeId)
+                If nodeEntity Is Nothing Then Return Nothing
+
+                Dim provider = TryCast(_pluginRegistry.GetPlugin(instanceEntity.GameId),
+                                       IRemoteControlProvider)
+                If provider Is Nothing Then Return Nothing
+
+                ' Platform is cached per-client after the first
+                ' resolve (the start path warms it), so this is
+                ' normally wire-free.
+                Dim nodePlatform = Await NodePlatformResolver.ResolveAsync(client, CancellationToken.None)
+
+                Dim installPath = installEntity.InstallPath
+                Dim context = New RemoteControlContext With {
+                    .NodeHost = nodeEntity.HostAddress,
+                    .Config = New InstanceConfig With {
+                        .InstanceId = instanceId,
+                        .GameId = instanceEntity.GameId,
+                        .DisplayName = instanceEntity.DisplayName,
+                        .InstallationId = instanceEntity.InstallationId,
+                        .WorkingDirectory = installPath,
+                        .CustomFields = MergeConfigLayers(db, installEntity, instanceEntity),
+                        .Platform = nodePlatform
+                    },
+                    .FetchInstanceFile =
+                        Function(relPath) FetchInstanceFileTextAsync(client, instanceId,
+                                                                      installPath, relPath)
+                }
+                Return Tuple.Create(provider, context)
+            End Using
+        End Function
+
+        ''' <summary>
+        ''' RemoteControlContext.FetchInstanceFile implementation:
+        ''' read one file's text from the instance install dir via
+        ''' the node /files download endpoint (same allowedRoots /
+        ''' extension derivation as the startup-file render).
+        ''' Nothing on 404 or any failure — the plugin treats that
+        ''' as "can't read, decline".
+        ''' </summary>
+        Private Async Function FetchInstanceFileTextAsync(client As INodeClient,
+                                                           instanceId As String,
+                                                           installPath As String,
+                                                           relPath As String) As Task(Of String)
+            Try
+                Using ms As New MemoryStream()
+                    Await client.DownloadFileAsync(instanceId, installPath, relPath,
+                                                   StartupFileAllowedRoots(relPath),
+                                                   StartupFileAllowedExtensions(relPath),
+                                                   ms, CancellationToken.None)
+                    Return Encoding.UTF8.GetString(ms.ToArray())
+                End Using
+            Catch
+                Return Nothing
+            End Try
         End Function
 
         Private Function GetGameIdForInstance(instanceId As String) As String

@@ -9,7 +9,34 @@ compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-13
+
 ### Added
+
+- **Remote-control plugin interface (`IRemoteControlProvider`, contracts +
+  Manager).** Opt-in for games administered via their own out-of-band
+  admin channel (HTTP REST etc.) instead of RCON/stdin. Two capabilities,
+  plugin-owned protocol: a graceful-stop hook (Manager calls it at the
+  start of Stop, 10s cap, then runs the normal node stop path regardless
+  — crash classification and the force-kill ladder are unaffected), and
+  a remote player list (Manager polls it as the Players source for games
+  with no log-based tracking; node list remains the fallback). The
+  `RemoteControlContext` carries the node host, merged config, and a
+  file-fetch delegate so plugins can read admin credentials from the
+  game's own config file rather than duplicating them in PowerGSM.
+  ContractsVersion 2 → 3: although additive, plugins distribute
+  independently via plugin sources, so the gate lets a v3-requiring
+  plugin fail cleanly (ContractsVersionTooNew) on a 0.5.0 manager
+  instead of with a raw compile error.
+- **Palworld plugin REST integration (plugin v0.2.0, requires contracts
+  v3).** Stop now performs
+  an announced graceful in-game shutdown via Palworld's REST API
+  (announce → save → shutdown) when the REST API is enabled in Server
+  Settings, and the Players tab shows the live player list (character
+  name, Steam persona, SteamID64, IP) from REST — Palworld has no
+  log-based player tracking. Credentials are read live from
+  PalWorldSettings.ini; with the REST API disabled everything behaves as
+  before.
 
 - **Palworld plugin (`palworld`, plugin v0.1.0).** Windows + native Linux
   dedicated server via anonymous SteamCMD (appid 2394010, per-platform

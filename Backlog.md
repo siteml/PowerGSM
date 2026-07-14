@@ -11,6 +11,41 @@ doc (or open a new mini-plan), then delete from here.
 
 ## Hardening & QoL
 
+### Node HTTP relay for game admin APIs (IRemoteControlProvider hardening)
+
+**Surfaced:** Palworld Slice 4, July 2026.
+**Priority:** Low — nice-to-have hardening.
+
+**Current state:** IRemoteControlProvider calls (Palworld REST) go
+Manager → node-host:RESTAPIPort directly. Works, but requires the game's
+admin port open Manager→node and sends HTTP Basic in cleartext on that
+leg (marginal: the manager↔node file channel already carries the
+AdminPassword-bearing settings file over plain HTTP + bearer token).
+Palworld's REST has no bind-address setting — it listens on all
+interfaces — so firewalling it fully is only possible with a relay.
+
+**Target shape:** generic node endpoint that executes an HTTP request
+against localhost-only targets (SSRF-guarded: loopback destinations,
+size/time caps) over the existing authenticated 8765 channel.
+RemoteControlContext gains a SendHttp delegate; the Manager implements
+it as relay when the node supports the endpoint, direct otherwise.
+Plugin code unchanged. Admin port then firewalled to loopback.
+
+### Managed-files listing is flat (top-level files only)
+
+**Surfaced:** Palworld plugin Slice 5, July 2026.
+**Priority:** Low-medium — blocks raw managed dirs over nested trees.
+
+**Observed:** `FileEndpoints.ListFiles` uses `Directory.EnumerateFiles`
+(top level, no recursion). A managed dir whose content is a directory tree
+(Palworld `Pal/Saved/SaveGames/0/<worldid>/...`) lists as permanently
+empty. All shipped managed dirs happen to be flat, so it never surfaced.
+Options when picking up: recursive enumeration + nested RelativePath
+display in ManagedFilesPanel (needs directory-aware delete/upload
+semantics), or leave flat and steer tree-shaped content to SDV-style
+archive/restore operations (current Palworld approach). Node + Manager
+change either way.
+
 ### CopyFileStep reports success without producing the file
 
 **Surfaced:** Palworld plugin Slice 1, July 2026.
