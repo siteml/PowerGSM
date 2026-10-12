@@ -137,8 +137,26 @@ Namespace GSM.Manager.UI
         Private _hostLabel As Label
         Private _statusLabel As Label
         Private _compatLabel As Label
+        Private _tlsLabel As Label
+        Private _tlsActionLink As LinkLabel
+        Private _tlsSecondaryLink As LinkLabel
+        ' Third link slot. Actions: "moveport" (Active node still on a
+        ' dedicated alternate HTTPS port → shared listen port) or
+        ' "disablehttp" (Active + LoopbackOnly → HTTP off). Tag in
+        ' _tlsTertiaryAction.
+        Private _tlsMoveLink As LinkLabel
+        Private _tlsTertiaryAction As String = Nothing
+        ' Process control (2026-10-10): restart / shut down the node process
+        ' from here. Sit on the status row, right of "Attached".
+        Private _restartLink As LinkLabel
+        Private _shutdownLink As LinkLabel
+        Private _rotateLink As LinkLabel
         Private _idLabel As Label
         Private _installationsListView As ListView
+
+        ' Current TLS actions bound to the links (decided by RefreshTlsUiAsync).
+        Private _tlsAction As String = Nothing
+        Private _tlsSecondaryAction As String = Nothing
 
         ' Cancellation source for the on-load /api/version fetch.
         ' Tripped from Dispose so the async resumption sees the
@@ -162,6 +180,625 @@ Namespace GSM.Manager.UI
             ' writes don't need an explicit BeginInvoke marshal.
             _versionFetchCts = New System.Threading.CancellationTokenSource()
             Dim _unused = LoadProtocolVersionAsync(_versionFetchCts.Token)
+            Dim _unusedTls = RefreshTlsUiAsync(_versionFetchCts.Token)
+        End Sub
+
+        ' --------------------------------------------------------
+        '  0.7.0 — HTTPS status + onboarding actions
+        ' --------------------------------------------------------
+
+        Private Async Function RefreshTlsUiAsync(token As System.Threading.CancellationToken) As Task
+            Dim onboarding = ManagerProgram.Services.GetService(Of TlsOnboardingService)()
+            If onboarding Is Nothing Then Return
+
+            ' Entity state first (cheap, no wire) so mismatch/enabling
+            ' render even when the node is unreachable.
+            Dim tlsState As String = "None"
+            Dim pinnedFp As String = Nothing
+            Dim useTls As Boolean = False
+            Dim nodeDetached As Boolean = False
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Dim n = db.Nodes.Find(_nodeId)
+                If n IsNot Nothing Then
+                    tlsState = If(n.TlsState, "None")
+                    pinnedFp = n.PinnedCertFingerprint
+                    useTls = n.UseTls
+                    nodeDetached = Not n.IsEnabled
+                End If
+            End Using
+
+            If token.IsCancellationRequested OrElse Me.IsDisposed Then Return
+
+            ' Detached: render what the entity knows, no wire calls (no
+            ' HttpMode fetch, no probe) and no actions — every TLS action
+            ' needs the node, and the operator asked us not to go there.
+            If nodeDetached Then
+                Dim pinnedNote = If(useTls AndAlso Not String.IsNullOrEmpty(pinnedFp),
+                                    $"HTTPS: {tlsState} (pinned {FingerprintTail(pinnedFp)}) — detached, not checked",
+                                    "HTTPS: not checked (node detached)")
+                SetTlsUi(pinnedNote, Color.Gray, Nothing, Nothing)
+                Return
+            End If
+
+            If String.Equals(tlsState, "FingerprintMismatch", StringComparison.OrdinalIgnoreCase) Then
+                SetTlsUi("HTTPS: CERTIFICATE MISMATCH — connection blocked. The node's certificate no " &
+                         "longer matches the trusted fingerprint.", Color.Firebrick,
+                         "Re-trust certificate...", "retrust")
+                Return
+            End If
+            If useTls AndAlso String.Equals(tlsState, "Active", StringComparison.OrdinalIgnoreCase) Then
+                ' Slice 3 wording: TlsPort 0 or = listen port means HTTPS
+                ' shares the node's single port (sniffed); anything else
+                ' is a dedicated alternate HTTPS listener.
+                Dim tlsPort As Integer = 0
+                Dim listenPort As Integer = 0
+                Using scope2 = ManagerProgram.Services.CreateScope()
+                    Dim db2 = scope2.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim n2 = db2.Nodes.Find(_nodeId)
+                    If n2 IsNot Nothing Then
+                        tlsPort = n2.TlsPort
+                        listenPort = n2.Port
+                    End If
+                End Using
+                Dim portText As String =
+                    If(tlsPort <= 0 OrElse tlsPort = listenPort,
+                       $"shared port {listenPort}",
+                       $"alternate port {tlsPort}")
+                SetTlsUi($"HTTPS: active on {portText} (pinned {FingerprintTail(pinnedFp)})", Color.DarkGreen,
+                         "Switch back to HTTP", "rollback")
+                If tlsPort > 0 AndAlso tlsPort <> listenPort Then
+                    SetTlsTertiary("Move HTTPS to shared port...", "moveport")
+                End If
+
+                ' Show HTTP-restriction state + toggle. Async fetch over
+                ' pinned HTTPS; quietly absent if it fails or the node
+                ' predates HttpMode.
+                Dim httpMode = Await onboarding.GetHttpModeAsync(_nodeId, token)
+                If token.IsCancellationRequested OrElse Me.IsDisposed Then Return
+                If String.IsNullOrEmpty(httpMode) Then
+                    ' The pinned call may have just failed certificate
+                    ' validation (GetHttpModeAsync marks the entity). Re-read
+                    ' so a regenerated node cert surfaces as MISMATCH with
+                    ' the re-trust link instead of "active — HTTP still open".
+                    Dim nowEntity = LoadNodeEntity()
+                    If nowEntity IsNot Nothing AndAlso
+                       String.Equals(nowEntity.TlsState, "FingerprintMismatch", StringComparison.OrdinalIgnoreCase) Then
+                        SetTlsUi("HTTPS: CERTIFICATE MISMATCH — connection blocked. The node's certificate no " &
+                                 "longer matches the trusted fingerprint.", Color.Firebrick,
+                                 "Re-trust certificate...", "retrust")
+                        Return
+                    End If
+                End If
+                If String.IsNullOrEmpty(httpMode) Then
+                    ' Pinned status call failed (node restarting, older
+                    ' build without HttpMode, transient) — say so rather
+                    ' than guessing "still open".
+                    _tlsLabel.Text &= " — HTTP mode unknown (status call failed; reopen panel to retry)"
+                ElseIf httpMode.Equals("Open", StringComparison.OrdinalIgnoreCase) Then
+                    _tlsLabel.Text &= " — HTTP still open"
+                    SetTlsSecondary("Restrict HTTP to localhost...", "restrict")
+                    If _tlsTertiaryAction Is Nothing Then
+                        SetTlsTertiary("Turn HTTP off...", "disablehttp")
+                    End If
+                ElseIf httpMode.Equals("LoopbackOnly", StringComparison.OrdinalIgnoreCase) Then
+                    _tlsLabel.Text &= " — HTTP restricted to localhost"
+                    SetTlsSecondary("Re-open HTTP...", "openhttp")
+                    ' Last hardening step is one click away, not only via
+                    ' the fleet form (found live on Win-Host 2026-10-10).
+                    If _tlsTertiaryAction Is Nothing Then
+                        SetTlsTertiary("Turn HTTP off...", "disablehttp")
+                    End If
+                ElseIf httpMode.Equals("Disabled", StringComparison.OrdinalIgnoreCase) Then
+                    _tlsLabel.Text &= " — HTTP: off"
+                    SetTlsSecondary("Re-open HTTP...", "openhttp")
+                End If
+                Return
+            End If
+            If String.Equals(tlsState, "Enabling", StringComparison.OrdinalIgnoreCase) Then
+                SetTlsUi($"HTTPS: enabling — waiting for node (pinned {FingerprintTail(pinnedFp)})",
+                         Color.DarkOrange, "Verify HTTPS now", "verify")
+                Return
+            End If
+
+            ' No local TLS state — ask the node what it can do.
+            Dim probe As TlsProbeResult
+            Try
+                probe = Await onboarding.ProbeAsync(_nodeId, token)
+            Catch
+                Return
+            End Try
+            If token.IsCancellationRequested OrElse Me.IsDisposed Then Return
+
+            Select Case probe
+                Case TlsProbeResult.SupportedNotEnabled
+                    ' Slice 4: primary = the guided sequence (enable →
+                    ' verify → HTTP off → rotate-token reminder); the
+                    ' stepwise enable-only path stays under Advanced.
+                    SetTlsUi("HTTPS: available (not enabled)", Color.DarkOrange,
+                             "Secure this node...", "secure")
+                    SetTlsSecondary("Advanced: enable HTTPS only...", "enable-only")
+                Case TlsProbeResult.EnabledNotAdopted
+                    SetTlsUi("HTTPS: node is serving HTTPS, but this manager still uses HTTP", Color.DarkOrange,
+                             "Trust certificate and switch to HTTPS...", "adopt")
+                Case TlsProbeResult.NotSupported
+                    SetTlsUi("HTTPS: not supported by this node build — update the node to 0.7.0+",
+                             SystemColors.GrayText, Nothing, Nothing)
+                Case TlsProbeResult.NodeUnreachable
+                    SetTlsUi("HTTPS: unknown (node unreachable)", SystemColors.GrayText, Nothing, Nothing)
+                Case Else
+                    SetTlsUi("HTTPS: active", Color.DarkGreen, Nothing, Nothing)
+            End Select
+        End Function
+
+        Private Sub SetTlsUi(text As String, textColor As Color, linkText As String, action As String)
+            _tlsLabel.Text = text
+            _tlsLabel.ForeColor = textColor
+            _tlsAction = action
+            If String.IsNullOrEmpty(linkText) Then
+                _tlsActionLink.Visible = False
+            Else
+                _tlsActionLink.Text = linkText
+                _tlsActionLink.Visible = True
+            End If
+            _tlsSecondaryAction = Nothing
+            _tlsSecondaryLink.Visible = False
+            _tlsTertiaryAction = Nothing
+            _tlsMoveLink.Visible = False
+            LayoutTlsLinks()
+        End Sub
+
+        Private Sub SetTlsTertiary(linkText As String, action As String)
+            _tlsTertiaryAction = action
+            _tlsMoveLink.Text = linkText
+            _tlsMoveLink.Visible = True
+            LayoutTlsLinks()
+        End Sub
+
+        Private Sub SetTlsSecondary(linkText As String, action As String)
+            _tlsSecondaryAction = action
+            _tlsSecondaryLink.Text = linkText
+            _tlsSecondaryLink.Visible = True
+            LayoutTlsLinks()
+        End Sub
+
+        ''' <summary>Flow the visible TLS links left-to-right on one row.</summary>
+        Private Sub LayoutTlsLinks()
+            Dim x As Integer = _tlsActionLink.Location.X
+            Dim y As Integer = _tlsActionLink.Location.Y
+            If _tlsActionLink.Visible Then x += _tlsActionLink.Width + 24
+            If _tlsSecondaryLink.Visible Then
+                _tlsSecondaryLink.Location = New Point(x, y)
+                x += _tlsSecondaryLink.Width + 24
+            End If
+            If _tlsMoveLink.Visible Then
+                _tlsMoveLink.Location = New Point(x, y)
+            End If
+        End Sub
+
+        Private Async Sub OnTlsMoveClicked(sender As Object, e As LinkLabelLinkClickedEventArgs)
+            Dim onboarding = ManagerProgram.Services.GetService(Of TlsOnboardingService)()
+            If onboarding Is Nothing OrElse _tlsTertiaryAction Is Nothing Then Return
+            Dim action = _tlsTertiaryAction
+            Dim n0 = LoadNodeEntity()
+            If n0 Is Nothing Then Return
+            _tlsMoveLink.Enabled = False
+            Try
+                Dim err As String = Nothing
+                Select Case action
+                    Case "moveport"
+                        If MessageBox.Show(
+                            $"Move this node's HTTPS from port {n0.TlsPort} onto its listen port {n0.Port}?" &
+                            Environment.NewLine & Environment.NewLine &
+                            "Same certificate, same pinned fingerprint — only the port changes. The node " &
+                            "restarts once; this manager re-verifies on the shared port and switches over. " &
+                            "Any other Manager pinned to the old port will need to re-adopt.",
+                            "Move HTTPS to shared port", MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then
+                            Return
+                        End If
+                        _tlsLabel.Text = "HTTPS: moving to shared port — node is restarting..."
+                        _tlsLabel.ForeColor = Color.DarkOrange
+                        err = Await onboarding.MoveTlsToSharedPortAsync(_nodeId, System.Threading.CancellationToken.None)
+
+                    Case "disablehttp"
+                        If MessageBox.Show(
+                            "Turn this node's plain-HTTP listener OFF?" & Environment.NewLine & Environment.NewLine &
+                            "After this the node accepts HTTPS only — even from the node machine itself. " &
+                            "The node restarts to apply. You can re-open HTTP later from this panel " &
+                            "(the command rides HTTPS)." & Environment.NewLine & Environment.NewLine &
+                            "Note: any other Manager still using HTTP for this node will lose access.",
+                            "Turn HTTP off", MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then
+                            Return
+                        End If
+                        _tlsLabel.Text = "HTTPS: turning plain HTTP off — node is restarting..."
+                        _tlsLabel.ForeColor = Color.DarkOrange
+                        err = Await onboarding.SetHttpModeAsync(_nodeId, "Disabled",
+                                                                System.Threading.CancellationToken.None)
+                End Select
+                If Me.IsDisposed Then Return
+                If Not String.IsNullOrEmpty(err) Then
+                    MessageBox.Show(err, "HTTPS", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                End If
+            Finally
+                If Not Me.IsDisposed Then
+                    _tlsMoveLink.Enabled = True
+                    Dim _unused = RefreshTlsUiAsync(If(_versionFetchCts IsNot Nothing,
+                                                       _versionFetchCts.Token,
+                                                       System.Threading.CancellationToken.None))
+                End If
+            End Try
+        End Sub
+
+        Private Async Sub OnTlsSecondaryClicked(sender As Object, e As LinkLabelLinkClickedEventArgs)
+            Dim onboarding = ManagerProgram.Services.GetService(Of TlsOnboardingService)()
+            If onboarding Is Nothing OrElse _tlsSecondaryAction Is Nothing Then Return
+            Dim action = _tlsSecondaryAction
+            _tlsSecondaryLink.Enabled = False
+            Try
+                Dim err As String = Nothing
+                Select Case action
+                    Case "restrict"
+                        If MessageBox.Show(
+                            "Restrict this node's plain-HTTP listener to localhost?" & Environment.NewLine & Environment.NewLine &
+                            "After this, the node only accepts unencrypted connections from the node machine " &
+                            "itself; all remote traffic (including the auth token) rides HTTPS only. " &
+                            "The node restarts to apply. You can re-open HTTP later from this panel." &
+                            Environment.NewLine & Environment.NewLine &
+                            "Note: any other Manager still using HTTP for this node will lose access.",
+                            "Restrict HTTP", MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then
+                            Return
+                        End If
+                        _tlsLabel.Text = "HTTPS: applying HTTP restriction — node is restarting..."
+                        _tlsLabel.ForeColor = Color.DarkOrange
+                        err = Await onboarding.SetHttpModeAsync(_nodeId, "LoopbackOnly",
+                                                                System.Threading.CancellationToken.None)
+                    Case "openhttp"
+                        _tlsLabel.Text = "HTTPS: re-opening HTTP — node is restarting..."
+                        _tlsLabel.ForeColor = Color.DarkOrange
+                        err = Await onboarding.SetHttpModeAsync(_nodeId, "Open",
+                                                                System.Threading.CancellationToken.None)
+                    Case "enable-only"
+                        ' Stepwise path (pre-slice-4 primary action): enable +
+                        ' verify, leave plain HTTP open for manual rollback.
+                        If MessageBox.Show(
+                            "Enable HTTPS on this node (leaving plain HTTP open)?" & Environment.NewLine & Environment.NewLine &
+                            "The node will generate a self-signed certificate, restart, and this manager " &
+                            "will pin the certificate's fingerprint and switch to HTTPS. Plain HTTP stays " &
+                            "available on the node until you restrict it from this panel.",
+                            "Enable HTTPS", MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then
+                            Return
+                        End If
+                        _tlsLabel.Text = "HTTPS: enabling — node is restarting..."
+                        _tlsLabel.ForeColor = Color.DarkOrange
+                        err = Await onboarding.EnableTlsAsync(_nodeId, System.Threading.CancellationToken.None)
+                End Select
+
+                If Me.IsDisposed Then Return
+                If Not String.IsNullOrEmpty(err) Then
+                    MessageBox.Show(err, "HTTPS", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                End If
+            Finally
+                If Not Me.IsDisposed Then
+                    _tlsSecondaryLink.Enabled = True
+                    Dim _unused = RefreshTlsUiAsync(If(_versionFetchCts IsNot Nothing,
+                                                       _versionFetchCts.Token,
+                                                       System.Threading.CancellationToken.None))
+                End If
+            End Try
+        End Sub
+
+        ' --------------------------------------------------------
+        '  Process control — restart / shutdown (2026-10-10)
+        ' --------------------------------------------------------
+
+        Private Function GetConcreteClient() As NodeHttpClient
+            Dim factory = ManagerProgram.Services.GetService(Of NodeHttpClientFactory)()
+            Dim n0 = LoadNodeEntity()
+            If factory Is Nothing OrElse n0 Is Nothing Then Return Nothing
+            Return TryCast(factory.GetClient(n0.NodeId, n0.HostAddress, n0.Port, n0.AuthToken), NodeHttpClient)
+        End Function
+
+        Private Async Sub OnRestartNodeClicked(sender As Object, e As LinkLabelLinkClickedEventArgs)
+            Dim client = GetConcreteClient()
+            If client Is Nothing Then Return
+            If MessageBox.Show(
+                "Restart this node's process?" & Environment.NewLine & Environment.NewLine &
+                "The node exits and is relaunched by its survivor (service, systemd, or NodeSetup). " &
+                "Running instances keep running under their shims and are re-adopted when it " &
+                "comes back (~10-30 s). A node launched from a console window comes back in a window.",
+                "Restart node", MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then
+                Return
+            End If
+            _restartLink.Enabled = False
+            _shutdownLink.Enabled = False
+            Try
+                Await client.RestartNodeAsync(System.Threading.CancellationToken.None)
+                _compatLabel.Text = "Node restarting... reopen this panel in a moment."
+                _compatLabel.ForeColor = Color.DarkOrange
+            Catch ex As Exception
+                MessageBox.Show("Restart request failed: " & ex.Message & NodeControlFailureHint(ex),
+                                "Restart node", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            Finally
+                If Not Me.IsDisposed Then
+                    _restartLink.Enabled = True
+                    _shutdownLink.Enabled = True
+                End If
+            End Try
+        End Sub
+
+        Private Async Sub OnShutdownNodeClicked(sender As Object, e As LinkLabelLinkClickedEventArgs)
+            Dim client = GetConcreteClient()
+            Dim n0 = LoadNodeEntity()
+            If client Is Nothing OrElse n0 Is Nothing Then Return
+            ' Deliberately loud: after this the Manager has NO way back in.
+            If MessageBox.Show(
+                $"SHUT DOWN the node process on {n0.HostAddress}?" & Environment.NewLine & Environment.NewLine &
+                "THE NODE WILL NOT COME BACK ON ITS OWN. It exits without a relauncher, and this " &
+                "Manager cannot start it again — someone must start it on that machine " &
+                "(run GSM.Node, start the GSMNode service, or systemctl start). Until then this node " &
+                "is unreachable here." & Environment.NewLine & Environment.NewLine &
+                "Running instances keep running under their shims and are re-adopted when the " &
+                "node is started again." & Environment.NewLine & Environment.NewLine &
+                "If you just want it bounced, use Restart node instead.",
+                "Shut down node — are you sure?", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) <> DialogResult.Yes Then
+                Return
+            End If
+            If MessageBox.Show(
+                $"Last check: shut down {n0.DisplayName} now? You will need physical/remote access to " &
+                "that machine to bring it back.",
+                "Confirm shutdown", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) <> DialogResult.Yes Then
+                Return
+            End If
+            _restartLink.Enabled = False
+            _shutdownLink.Enabled = False
+            Try
+                Await client.ShutdownNodeAsync(System.Threading.CancellationToken.None)
+                _compatLabel.Text = "Node shut down. Start it on the node machine to reconnect."
+                _compatLabel.ForeColor = Color.Firebrick
+            Catch ex As Exception
+                MessageBox.Show("Shutdown request failed: " & ex.Message & NodeControlFailureHint(ex),
+                                "Shut down node", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            Finally
+                If Not Me.IsDisposed Then
+                    _restartLink.Enabled = True
+                    _shutdownLink.Enabled = True
+                End If
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Status-aware hint for the restart/shutdown failure dialogs. The
+        ''' old text appended "Nodes older than 0.6.3 do not support this"
+        ''' to EVERY failure, which misread a 429 from the node's own
+        ''' per-IP rate limiter as a version problem (2026-10-11).
+        ''' </summary>
+        Private Shared Function NodeControlFailureHint(ex As Exception) As String
+            Dim api = TryCast(ex, NodeApiException)
+            If api Is Nothing OrElse Not api.StatusCode.HasValue Then Return ""
+            Dim sep = Environment.NewLine & Environment.NewLine
+            Select Case api.StatusCode.Value
+                Case System.Net.HttpStatusCode.NotFound
+                    Return sep & "Nodes older than 0.6.3 do not support this."
+                Case System.Net.HttpStatusCode.TooManyRequests
+                    Return sep & "The node is rate-limiting this Manager's IP (too many requests in the last minute — " &
+                           "usually log tails and status polls right after a node restart). Wait a minute and try again."
+                Case System.Net.HttpStatusCode.Unauthorized
+                    Return sep & "The node rejected this Manager's auth token. Check the node's token or re-pair it."
+                Case Else
+                    Return ""
+            End Select
+        End Function
+
+        Private Async Sub OnRotateTokenClicked(sender As Object, e As LinkLabelLinkClickedEventArgs)
+            Dim onboarding = ManagerProgram.Services.GetService(Of TlsOnboardingService)()
+            Dim n0 = LoadNodeEntity()
+            If onboarding Is Nothing OrElse n0 Is Nothing Then Return
+            If Not n0.UseTls Then
+                MessageBox.Show("Token rotation needs active pinned HTTPS first — the new token must never " &
+                                "travel in the clear. Secure this node, then rotate.",
+                                "Rotate auth token", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Return
+            End If
+            If MessageBox.Show(
+                $"Rotate the auth token for {n0.DisplayName}?" & Environment.NewLine & Environment.NewLine &
+                "A new random token is generated here, sent over pinned HTTPS, and the node restarts " &
+                "with it. This Manager keeps working. Any OTHER Manager attached to this node is locked " &
+                "out until its token is re-entered there (Edit Node) — you can read the new token from " &
+                "Edit Node here afterwards.",
+                "Rotate auth token", MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then
+                Return
+            End If
+            _rotateLink.Enabled = False
+            Try
+                _tlsLabel.Text = "HTTPS: rotating auth token — node is restarting..."
+                _tlsLabel.ForeColor = Color.DarkOrange
+                Dim err = Await onboarding.RotateTokenAsync(_nodeId, System.Threading.CancellationToken.None)
+                If Me.IsDisposed Then Return
+                If String.IsNullOrEmpty(err) Then
+                    MessageBox.Show("Auth token rotated and confirmed.", "Rotate auth token",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Else
+                    MessageBox.Show(err, "Rotate auth token", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                End If
+            Finally
+                If Not Me.IsDisposed Then
+                    _rotateLink.Enabled = True
+                    Dim _unused = RefreshTlsUiAsync(If(_versionFetchCts IsNot Nothing,
+                                                       _versionFetchCts.Token,
+                                                       System.Threading.CancellationToken.None))
+                End If
+            End Try
+        End Sub
+
+        ''' <summary>UI-thread-safe progress line for the guided sequence.</summary>
+        Private Sub ReportTlsProgress(line As String)
+            Try
+                If Me.IsDisposed OrElse Not Me.IsHandleCreated Then Return
+                If Me.InvokeRequired Then
+                    Me.BeginInvoke(Sub() ReportTlsProgress(line))
+                    Return
+                End If
+                _tlsLabel.Text = "HTTPS: " & line
+                _tlsLabel.ForeColor = Color.DarkOrange
+            Catch
+            End Try
+        End Sub
+
+        ''' <summary>Fresh NodeEntity for this panel's node (Nothing if gone).</summary>
+        Private Function LoadNodeEntity() As NodeEntity
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                Return db.Nodes.Find(_nodeId)
+            End Using
+        End Function
+
+        Private Shared Function FingerprintTail(fp As String) As String
+            If String.IsNullOrWhiteSpace(fp) Then Return "no fingerprint"
+            Dim t = fp.Trim()
+            Return "…" & If(t.Length > 12, t.Substring(t.Length - 12), t)
+        End Function
+
+        Private Async Sub OnTlsActionClicked(sender As Object, e As LinkLabelLinkClickedEventArgs)
+            Dim onboarding = ManagerProgram.Services.GetService(Of TlsOnboardingService)()
+            If onboarding Is Nothing OrElse _tlsAction Is Nothing Then Return
+            Dim action = _tlsAction
+            _tlsActionLink.Enabled = False
+            Try
+                Dim err As String = Nothing
+                Select Case action
+                    Case "enable"
+                        If MessageBox.Show(
+                            "Enable HTTPS on this node?" & Environment.NewLine & Environment.NewLine &
+                            "The node will generate a self-signed certificate, restart, and this manager " &
+                            "will pin the certificate's fingerprint and switch to HTTPS. Plain HTTP stays " &
+                            "available on the node until you restrict it, so you can roll back at any time.",
+                            "Enable HTTPS", MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then
+                            Return
+                        End If
+                        _tlsLabel.Text = "HTTPS: enabling — node is restarting..."
+                        _tlsLabel.ForeColor = Color.DarkOrange
+                        err = Await onboarding.EnableTlsAsync(_nodeId, System.Threading.CancellationToken.None)
+
+                    Case "secure"
+                        ' Slice 4 guided sequence. Two restarts (enable, HTTP
+                        ' off); shim-mode instances ride through both, but a
+                        ' pre-shim (direct) instance loses its stdio on a
+                        ' node bounce, so surface the running count first.
+                        Dim runningNote As String = ""
+                        Try
+                            Dim factory = ManagerProgram.Services.GetService(Of NodeHttpClientFactory)()
+                            Dim n0 = LoadNodeEntity()
+                            If factory IsNot Nothing AndAlso n0 IsNot Nothing Then
+                                Dim st = Await factory.GetClient(n0.NodeId, n0.HostAddress, n0.Port, n0.AuthToken).
+                                    GetStatusAsync(System.Threading.CancellationToken.None)
+                                If st IsNot Nothing AndAlso st.RunningInstanceCount > 0 Then
+                                    runningNote = Environment.NewLine & Environment.NewLine &
+                                        $"This node has {st.RunningInstanceCount} running instance(s). Shim-supervised " &
+                                        "instances survive the two restarts; any instance still running in direct " &
+                                        "(pre-shim) mode will lose console capture until its next restart."
+                                End If
+                            End If
+                        Catch
+                            ' Status is advisory only.
+                        End Try
+                        If MessageBox.Show(
+                            "Secure this node?" & Environment.NewLine & Environment.NewLine &
+                            "1. Enable HTTPS on the node's listen port (node restarts)" & Environment.NewLine &
+                            "2. Verify over the pinned certificate and switch this manager to HTTPS" & Environment.NewLine &
+                            "3. Turn plain HTTP OFF on the node (node restarts again)" & Environment.NewLine &
+                            "4. Rotate the auth token over HTTPS (node restarts once more)" & Environment.NewLine & Environment.NewLine &
+                            "Afterwards all traffic rides HTTPS only and the token that once travelled in " &
+                            "cleartext is retired. Any OTHER Manager attached to this node loses access until " &
+                            "its token is re-entered there (Edit Node). Each step can be undone from this panel." & runningNote,
+                            "Secure this node", MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then
+                            Return
+                        End If
+                        _tlsLabel.ForeColor = Color.DarkOrange
+                        err = Await onboarding.SecureNodeAsync(
+                            _nodeId,
+                            Sub(line) ReportTlsProgress(line),
+                            System.Threading.CancellationToken.None)
+                        If err Is Nothing AndAlso Not Me.IsDisposed Then
+                            MessageBox.Show(
+                                "Node secured: HTTPS pinned, plain HTTP off, auth token rotated.",
+                                "Secure this node", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                        End If
+
+                    Case "verify"
+                        _tlsLabel.Text = "HTTPS: verifying..."
+                        err = Await onboarding.VerifyAndActivateAsync(_nodeId, System.Threading.CancellationToken.None)
+
+                    Case "adopt"
+                        Dim fp = Await onboarding.GetReportedFingerprintAsync(_nodeId, System.Threading.CancellationToken.None)
+                        If String.IsNullOrWhiteSpace(fp) Then
+                            err = "Could not read the node's certificate fingerprint — neither the HTTP " &
+                                  "status endpoint nor an HTTPS handshake on its port answered. Is the node up?"
+                        ElseIf MessageBox.Show(
+                            "Trust this node certificate and switch to HTTPS?" & Environment.NewLine & Environment.NewLine &
+                            "SHA-256 fingerprint:" & Environment.NewLine & fp & Environment.NewLine & Environment.NewLine &
+                            "You can verify this fingerprint in the node's log (it is printed at startup).",
+                            "Trust node certificate", MessageBoxButtons.YesNo, MessageBoxIcon.Question) = DialogResult.Yes Then
+                            err = Await onboarding.AdoptExistingTlsAsync(_nodeId, System.Threading.CancellationToken.None)
+                        Else
+                            Return
+                        End If
+
+                    Case "retrust"
+                        Dim fp = Await onboarding.GetReportedFingerprintAsync(_nodeId, System.Threading.CancellationToken.None)
+                        If String.IsNullOrWhiteSpace(fp) Then
+                            err = "Could not read the node's current certificate fingerprint — neither the " &
+                                  "HTTP status endpoint nor an HTTPS handshake on its port answered. Check the " &
+                                  "node is running and reachable; the presented fingerprint is also printed in " &
+                                  "the Manager log on each mismatch (" & """Certificate PIN MISMATCH""" & ")."
+                        ElseIf MessageBox.Show(
+                            "The node is presenting a DIFFERENT certificate than the one this manager trusts." &
+                            Environment.NewLine & Environment.NewLine &
+                            "This is expected if the node was reinstalled or regenerated its certificate — " &
+                            "but it is also exactly what an interception attack looks like. Only continue if " &
+                            "you can explain the change." & Environment.NewLine & Environment.NewLine &
+                            "New SHA-256 fingerprint:" & Environment.NewLine & fp & Environment.NewLine & Environment.NewLine &
+                            "Trust this new certificate?",
+                            "Certificate changed", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) = DialogResult.Yes Then
+                            err = Await onboarding.RetrustAsync(_nodeId, fp, System.Threading.CancellationToken.None)
+                        Else
+                            Return
+                        End If
+
+                    Case "rollback"
+                        ' Lockout guard: if the node's HTTP listener is
+                        ' restricted, dropping the Manager to HTTP would
+                        ' cut off remote control entirely. Re-open HTTP
+                        ' first (over HTTPS), then roll back.
+                        Dim currentMode = Await onboarding.GetHttpModeAsync(_nodeId, System.Threading.CancellationToken.None)
+                        If currentMode IsNot Nothing AndAlso
+                           Not currentMode.Equals("Open", StringComparison.OrdinalIgnoreCase) Then
+                            err = "This node's plain-HTTP listener is restricted (" & currentMode & "), so " &
+                                  "switching the Manager to HTTP would lose contact with it. " &
+                                  "Use 'Re-open HTTP...' first, then switch back to HTTP."
+                        ElseIf MessageBox.Show(
+                            "Switch this node back to plain HTTP?" & Environment.NewLine & Environment.NewLine &
+                            "The pinned certificate is kept, so you can switch back to HTTPS later with one click.",
+                            "Switch to HTTP", MessageBoxButtons.YesNo, MessageBoxIcon.Question) = DialogResult.Yes Then
+                            onboarding.RollbackToHttp(_nodeId)
+                        Else
+                            Return
+                        End If
+                End Select
+
+                If Me.IsDisposed Then Return
+                If Not String.IsNullOrEmpty(err) Then
+                    MessageBox.Show(err, "HTTPS", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                End If
+            Finally
+                If Not Me.IsDisposed Then
+                    _tlsActionLink.Enabled = True
+                    Dim _unused = RefreshTlsUiAsync(If(_versionFetchCts IsNot Nothing,
+                                                       _versionFetchCts.Token,
+                                                       System.Threading.CancellationToken.None))
+                End If
+            End Try
         End Sub
 
         Protected Overrides Sub Dispose(disposing As Boolean)
@@ -193,6 +830,27 @@ Namespace GSM.Manager.UI
             _statusLabel.AutoSize = True
             _statusLabel.Location = New Point(2, 75)
 
+            _restartLink = New LinkLabel()
+            _restartLink.Font = New Font("Segoe UI", 9)
+            _restartLink.AutoSize = True
+            _restartLink.Location = New Point(110, 77)
+            _restartLink.Text = "Restart node..."
+            AddHandler _restartLink.LinkClicked, AddressOf OnRestartNodeClicked
+
+            _shutdownLink = New LinkLabel()
+            _shutdownLink.Font = New Font("Segoe UI", 9)
+            _shutdownLink.AutoSize = True
+            _shutdownLink.Location = New Point(220, 77)
+            _shutdownLink.Text = "Shut down node..."
+            AddHandler _shutdownLink.LinkClicked, AddressOf OnShutdownNodeClicked
+
+            _rotateLink = New LinkLabel()
+            _rotateLink.Font = New Font("Segoe UI", 9)
+            _rotateLink.AutoSize = True
+            _rotateLink.Location = New Point(345, 77)
+            _rotateLink.Text = "Rotate auth token..."
+            AddHandler _rotateLink.LinkClicked, AddressOf OnRotateTokenClicked
+
             ' Phase 5f-2 — protocol-compatibility line. Sits
             ' between Status and the Installations heading. Starts
             ' as a placeholder "Checking node version..." rendered
@@ -209,16 +867,51 @@ Namespace GSM.Manager.UI
             _compatLabel.Text = "Checking node version..."
             _compatLabel.ForeColor = SystemColors.GrayText
 
+            ' 0.7.0 — HTTPS status row + action link. Sits between the
+            ' compat line and the node-id backstop.
+            _tlsLabel = New Label()
+            _tlsLabel.Font = New Font("Segoe UI", 9)
+            _tlsLabel.AutoSize = True
+            _tlsLabel.MaximumSize = New Size(700, 0)
+            _tlsLabel.Location = New Point(2, 122)
+            _tlsLabel.Text = "HTTPS: checking..."
+            _tlsLabel.ForeColor = SystemColors.GrayText
+
+            _tlsActionLink = New LinkLabel()
+            _tlsActionLink.Font = New Font("Segoe UI", 9)
+            _tlsActionLink.AutoSize = True
+            _tlsActionLink.Location = New Point(2, 144)
+            _tlsActionLink.Visible = False
+            AddHandler _tlsActionLink.LinkClicked, AddressOf OnTlsActionClicked
+
+            ' Secondary action (e.g. Restrict HTTP while "Switch back to
+            ' HTTP" occupies the primary slot). Same handler; carries its
+            ' own action tag.
+            _tlsSecondaryLink = New LinkLabel()
+            _tlsSecondaryLink.Font = New Font("Segoe UI", 9)
+            _tlsSecondaryLink.AutoSize = True
+            _tlsSecondaryLink.Location = New Point(160, 144)
+            _tlsSecondaryLink.Visible = False
+            AddHandler _tlsSecondaryLink.LinkClicked, AddressOf OnTlsSecondaryClicked
+
+            _tlsMoveLink = New LinkLabel()
+            _tlsMoveLink.Font = New Font("Segoe UI", 9)
+            _tlsMoveLink.AutoSize = True
+            _tlsMoveLink.Location = New Point(360, 144)
+            _tlsMoveLink.Text = "Move HTTPS to shared port..."
+            _tlsMoveLink.Visible = False
+            AddHandler _tlsMoveLink.LinkClicked, AddressOf OnTlsMoveClicked
+
             ' Node ID backstop — dim, right-click-copyable. Sits
-            ' below the compat line, above the Installations heading.
-            _idLabel = PanelIdLabel.Create(New Point(2, 132))
+            ' below the TLS rows, above the Installations heading.
+            _idLabel = PanelIdLabel.Create(New Point(2, 172))
             PanelIdLabel.SetId(_idLabel, _nodeId)
 
             Dim installLabel As New Label()
             installLabel.Text = "Installations"
             installLabel.Font = New Font("Segoe UI", 11, FontStyle.Bold)
             installLabel.AutoSize = True
-            installLabel.Location = New Point(0, 160)
+            installLabel.Location = New Point(0, 200)
 
             ' Header section docked to top holds the info labels.
             ' Height bumped from 140 to 160 to accommodate the
@@ -227,9 +920,10 @@ Namespace GSM.Manager.UI
             ' the header section.
             Dim header As New Panel()
             header.Dock = DockStyle.Top
-            header.Height = 186
+            header.Height = 226
             header.Controls.AddRange(New Control() {
-                _nameLabel, _hostLabel, _statusLabel, _compatLabel, _idLabel, installLabel
+                _nameLabel, _hostLabel, _statusLabel, _restartLink, _shutdownLink, _rotateLink, _compatLabel,
+                _tlsLabel, _tlsActionLink, _tlsSecondaryLink, _tlsMoveLink, _idLabel, installLabel
             })
 
             _installationsListView = New ListView()
@@ -268,6 +962,13 @@ Namespace GSM.Manager.UI
                 _hostLabel.Text = $"{nodeEntity.HostAddress}:{nodeEntity.Port}"
                 _statusLabel.Text = If(nodeEntity.IsEnabled, "Attached", "Detached")
                 _statusLabel.ForeColor = If(nodeEntity.IsEnabled, Color.DarkGreen, Color.Gray)
+
+                ' Detached = the operator knows it's down and wants it left
+                ' alone: no restart/shutdown/rotate links (each would dial
+                ' the node). Re-attaching re-renders the panel (2026-10-11).
+                If _restartLink IsNot Nothing Then _restartLink.Visible = nodeEntity.IsEnabled
+                If _shutdownLink IsNot Nothing Then _shutdownLink.Visible = nodeEntity.IsEnabled
+                If _rotateLink IsNot Nothing Then _rotateLink.Visible = nodeEntity.IsEnabled
 
                 ' Load installations
                 Dim installations = db.Installations.
@@ -318,6 +1019,7 @@ Namespace GSM.Manager.UI
             Dim hostAddress As String = Nothing
             Dim port As Integer = 0
             Dim authToken As String = Nothing
+            Dim detached As Boolean = False
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
                 Dim nodeEntity = db.Nodes.Find(_nodeId)
@@ -325,7 +1027,17 @@ Namespace GSM.Manager.UI
                 hostAddress = nodeEntity.HostAddress
                 port = nodeEntity.Port
                 authToken = nodeEntity.AuthToken
+                detached = Not nodeEntity.IsEnabled
             End Using
+
+            ' Detached = opted out of contact. No version probe, no red
+            ' "could not contact" — the panel says so and leaves it
+            ' (2026-10-11).
+            If detached Then
+                _compatLabel.Text = "Detached — not contacted (attach the node to check its version)"
+                _compatLabel.ForeColor = Color.Gray
+                Return
+            End If
 
             Dim client = factory.GetClient(_nodeId, hostAddress, port, authToken)
 
@@ -336,6 +1048,15 @@ Namespace GSM.Manager.UI
             Catch ex As OperationCanceledException
                 ' Panel disposed mid-flight — nothing to render.
                 Return
+            Catch ex As NodeCertificateException
+                ' 0.7.0 — pinned HTTPS refused the presented cert.
+                ' Record the mismatch so the TLS row (and any other
+                ' consumer) renders the blocked state and offers the
+                ' explicit re-trust flow.
+                Try
+                    ManagerProgram.Services.GetService(Of TlsOnboardingService)()?.MarkMismatch(_nodeId)
+                Catch
+                End Try
             Catch ex As Exception
                 ' Connection or API failure. Surface as red on the
                 ' panel; don't propagate — a transient failure

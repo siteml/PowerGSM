@@ -218,6 +218,7 @@ Namespace GSM.Manager.Core
         ''' Locates the requested target's binary inside an extracted node zip:
         '''   node      -> GSM.Node[.exe]       at the zip root
         '''   nodesetup -> GSM.NodeSetup[.exe]  at the zip root
+        '''   ctrlcsender -> GSM.CtrlCSender.exe at the zip root (Windows zip only)
         '''   shim      -> GSM.Shim\&lt;ver&gt;\GSM.Shim[.exe] (the versioned
         '''                folder the publish drops it into; pick the one that
         '''                actually holds the exe). Returns Nothing if absent.
@@ -239,6 +240,12 @@ Namespace GSM.Manager.Core
                     Return Nothing
                 Case "nodesetup"
                     Dim p = Path.Combine(exDir, If(isWin, "GSM.NodeSetup.exe", "GSM.NodeSetup"))
+                    Return If(File.Exists(p), p, Nothing)
+                Case "ctrlcsender"
+                    ' Windows-only helper at the zip root; the Linux zip never
+                    ' carries it (callers skip Linux rows for this target).
+                    If Not isWin Then Return Nothing
+                    Dim p = Path.Combine(exDir, "GSM.CtrlCSender.exe")
                     Return If(File.Exists(p), p, Nothing)
                 Case Else
                     Dim p = Path.Combine(exDir, If(isWin, "GSM.Node.exe", "GSM.Node"))

@@ -569,6 +569,21 @@ Namespace GSM.Plugin
         ServerStateChange  ' Match state transitions
         TileLoaded
         Custom
+
+        ' ---- Lifecycle kinds (EventStream Slice 1, 2026-08-02) ----
+        ' APPEND-ONLY at the enum end, same discipline as
+        ' NodeErrorCodes: these serialise as integers in the node's
+        ' events table and on the wire, so reordering or inserting
+        ' above would silently re-label persisted history. Emitted
+        ' by the node's own ProcessManager (SourceId "lifecycle") —
+        ' plugin parse rules cannot claim them.
+        ProcessStarted
+        ProcessExited              ' Intentional stop completed (carries ExitCode)
+        ProcessExitedUnexpectedly  ' Crash-shaped exit (carries ExitCode)
+        CrashRestartScheduled      ' Carries CrashCount / MaxCrashCount / DelayMs
+        CrashLoopHalted            ' Carries Reason
+        InstanceStopRequested      ' Operator/Manager stop intent recorded
+        InstanceAdopted            ' Node re-attached to a surviving process/shim
     End Enum
 
     ''' <summary>
@@ -1354,8 +1369,16 @@ Namespace GSM.Plugin
     '  redirect stdio to pipes, which precludes any console
     '  arrangement.
     '
+    '  A third question since the ConPTY work (2026-08):
+    '
+    '    NeedsPseudoConsole: "my game writes only via the console
+    '      API (WriteConsole) — give it a console AND capture it."
+    '      True for Palworld on Windows. The node spawns the game
+    '      under a pseudoconsole (CreatePseudoConsole) via the shim
+    '      and captures the rendered text like stdout.
+    '
     '  Future capabilities go on as additional booleans (e.g.
-    '  RequiresJobObject, NeedsPseudoConsole, etc.) without
+    '  RequiresJobObject, etc.) without
     '  breaking existing plugins. The contract intentionally keeps
     '  node-side terminology (Strategy A/B/C, NUL redirection,
     '  etc.) on the node side; plugins describe their game, the
@@ -1407,6 +1430,29 @@ Namespace GSM.Plugin
         ''' isolate when stdio is captured.
         ''' </summary>
         Public Property RequiresConsoleIsolation As Boolean = False
+
+        ''' <summary>
+        ''' True when the game writes its output ONLY via the
+        ''' Windows console API (WriteConsole) — piped stdio
+        ''' captures nothing and a hidden console makes the text
+        ''' invisible — and the node should therefore give the game
+        ''' a console it can ALSO read: a pseudoconsole
+        ''' (CreatePseudoConsole), whose rendered output is captured
+        ''' into the log buffer and parse pipeline like stdout.
+        ''' Canonical case: UE dedicated servers with no file log
+        ''' (Palworld — verified 12 Jul 2026 that redirected pipes
+        ''' see nothing while an interactive console logs richly).
+        '''
+        ''' Windows-only by nature; ignored off-Windows (Linux
+        ''' resolves to stdout capture, where the same engines write
+        ''' to real stdout). StdoutIsLog wins if both are set (the
+        ''' existing "stdio capture wins" rule). A plugin that sets
+        ''' this should NOT also declare file log sources — the
+        ''' pseudoconsole text is the authoritative log surface.
+        ''' The node resolves this to its ConPty spawn strategy;
+        ''' as ever, strategy names stay node-side.
+        ''' </summary>
+        Public Property NeedsPseudoConsole As Boolean = False
 
         ''' <summary>
         ''' How long the node should wait, after a tailed log file
@@ -2222,6 +2268,53 @@ Namespace GSM.Plugin
         ''' </summary>
         Public Property FetchInstanceFile As Func(Of String, Task(Of String))
     End Class
+
+    ''' <summary>
+    ''' Context handed to IStatePollProvider.GetStatePollSourcesAsync
+    ''' (EventStream Slice 2). Deliberately the same shape as
+    ''' RemoteControlContext minus NodeHost — the poller runs ON the
+    ''' node, so plugins resolve URLs against 127.0.0.1, and the
+    ''' game's own config file (admin password, API port) is read via
+    ''' the same FetchInstanceFile pattern the remote-control surface
+    ''' established. Values resolved here are valid for the whole game
+    ''' run: games read their config at boot, so a password/port
+    ''' change requires an instance restart anyway — which re-invokes
+    ''' this resolution.
+    ''' </summary>
+    Public Class StatePollResolveContext
+        ''' <summary>Merged install+instance config (same shape the
+        ''' lifecycle methods receive).</summary>
+        Public Property Config As InstanceConfig
+
+        ''' <summary>Fetch a file's text from the instance install
+        ''' dir on the node (relative path, forward slashes); Nothing
+        ''' on absence/failure. Same delegate contract as
+        ''' RemoteControlContext.FetchInstanceFile.</summary>
+        Public Property FetchInstanceFile As Func(Of String, Task(Of String))
+    End Class
+
+    ''' <summary>
+    ''' Opt-in interface (additive, EventStream Slice 2) for games
+    ''' whose live state is best read from their own admin/status API
+    ''' rather than (or before) log capture — the node polls the
+    ''' declared endpoint, diffs successive snapshots, and synthesizes
+    ''' PlayerJoin/PlayerLeave events into the canonical stream.
+    ''' Downstream cannot tell a polled event from a parsed one; that
+    ''' is the point. Motivating case: Palworld — UE console output is
+    ''' invisible to piped stdio (no log capture until ConPTY lands),
+    ''' but /v1/api/players is a stable, sanctioned contract.
+    '''
+    ''' The plugin returns FULLY RESOLVED sources (final URL against
+    ''' 127.0.0.1, literal credentials) — the Manager copies them onto
+    ''' StartInstanceRequest verbatim and the node needs zero
+    ''' game-specific knowledge. Return Nothing or an empty list to
+    ''' decline (API disabled/unconfigured); like the remote-control
+    ''' surface, declining must be cheap.
+    ''' </summary>
+    Public Interface IStatePollProvider
+        Function GetStatePollSourcesAsync(context As StatePollResolveContext) _
+            As Task(Of IReadOnlyList(Of GSM.Node.Api.ResolvedStatePollSource))
+    End Interface
 
     ''' <summary>
     ''' Opt-in interface (additive, post-0.5.0) for games whose

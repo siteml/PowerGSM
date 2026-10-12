@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to PowerGSM are documented in this file.
 
@@ -8,6 +8,208 @@ as documented in [VERSIONING.md](VERSIONING.md): `MINOR` bumps may break
 compatibility with the previous version, `PATCH` bumps do not.
 
 ## [Unreleased]
+
+## [0.7.0] - 2026-10-11
+
+The HTTPS release: every Manager↔Node hop can now be pinned TLS on the
+node's one port with plain HTTP off, a new node is added pinned from its
+first contact, and the whole August–October run of resilience work
+(event stream, ConPTY, boot resurrection, self-update hardening) ships
+with it. `MINOR` bump: contracts v4 (plugins declaring
+`<RequiresContracts: 3>` or lower still load), additive REST surface.
+
+Interim builds of this tree ran on the production Manager + nodes as
+hand-deployed stamps `0.6.1`…`0.6.6` (2026-10-10/11, no GitHub release);
+0.7.0 is the first tagged build and shows as a normal upgrade from any
+of them.
+
+### Added
+
+- **HTTPS node transport (two-port TOFU onboarding).** Kestrel HTTPS on
+  `TlsPort`, self-signed cert minted by the node, SHA-256 fingerprint pinning
+  in the Manager (`CreateHandler()` single trust source, chain/hostname
+  ignored), `TlsOnboardingService` (probe → enable over authed HTTP → verify
+  over pinned HTTPS → active; adopt / rollback / re-trust; `HttpMode`
+  Open/LoopbackOnly/Disabled), NodePanel HTTPS row, `AddNodeTls` migration.
+  Pinned-client downgrade guard: a resolver failure never rebuilds on HTTP.
+- **HTTPS single-port + HTTP-off-by-default + cert-at-setup.** _(all
+  slices live-validated 2026-10-10/11 — see
+  docs/plans/HTTPS_SinglePort_Plan.md)_ Protocol-
+  sniffing connection middleware serves TLS and plaintext on `ListenPort`;
+  `HttpMode=Disabled` closes plaintext at byte 1; `TlsCertificateService`
+  moved to GSM.Contracts so NodeSetup mints the SAME cert at setup time:
+  wizard step "Transport" (HTTPS on by default, plain HTTP None /
+  Localhost / Open, advanced separate port), GUI "Transport" tab with
+  fingerprint + Copy / Create / Regenerate, menu "Show TLS fingerprint" /
+  "Regenerate TLS certificate", `--auto-init` now `--tls` by default
+  (`--no-tls`, `--http-mode`) and prints the fingerprint after the token;
+  Manager Add-Node accepts a
+  "Cert SHA-256" fingerprint for pinned-first-contact (no plaintext TOFU;
+  Test Connection runs over pinned HTTPS when a fingerprint is given);
+  `TlsPort = 0` now means "shared listen port" throughout the Manager;
+  node panel reads "shared port N" / "alternate port N" / "HTTP: off";
+  Diagnostics probe grid TLS column shows n/a / off / shared / alt :N;
+  node panel's primary action is now the guided **"Secure this node…"**
+  (enable → verify → plain HTTP off, with the stepwise enable-only path
+  under "Advanced"), and Nodes → **"Secure All Nodes (HTTPS)…"** runs the
+  same sequence across a ticked checklist of not-yet-secured nodes, one at
+  a time, with per-node results. Both finish by **rotating the node's auth
+  token** over the now-pinned channel (`POST /api/auth/rotate`, HTTPS-only;
+  the old token travelled in cleartext before HTTPS) — optional in the fleet
+  form, also a standalone "Rotate auth token…" panel link. Active
+  nodes get one-click "Turn HTTP off…" and, for pre-single-port nodes,
+  "Move HTTPS to shared port…" (same certificate, one bounce).
+- **Node-boot start stagger.** New per-instance lifecycle field
+  **"Node-boot start delay (seconds)"** (`BootStartDelaySeconds`, default 0):
+  the node's boot-resurrect/autostart pass launches instances in ascending
+  delay, each waiting until its offset from the start of the pass has
+  elapsed (0 / 30 / 60 brings three servers up a minute apart). Manager
+  starts are unaffected. Pushed live via `/boot-flags` on Edit Instance
+  save (new optional field; old nodes ignore it) and persisted on the
+  node's snapshot row.
+- **CtrlCSender is updatable from the Manager.** Update Nodes gains a 4th
+  target, **CtrlCSender** (`ctrlcsender` on the wire): staged beside the
+  node and swapped in place like NodeSetup (the helper is idle between
+  graceful stops; no node bounce). Windows-only — Linux rows are skipped
+  for a single-target push and left out of the "all components" sequence,
+  which is now NodeSetup → Shim → CtrlCSender → Node on Windows. Feed mode
+  sources it from the Windows node zip root. The binary now carries the
+  `PGSMBUILD` marker and a Windows Node publish copies it to
+  `publish-drop\<version>\` with the other uploadables.
+- **Node process control.** `POST /api/system/restart` (survivor relaunch)
+  and `POST /api/system/shutdown` (exit, no relaunch — double-confirmed in
+  the Manager since the node stays down until started on its machine).
+  Node panel: "Restart node…" / "Shut down node…". A node launched from a
+  console window is relaunched **with** a console (NodeSetup `--console`)
+  instead of silently going headless after a Manager-triggered restart.
+- **EventStream unification.** Node-side durable per-instance event stream
+  (`events` table, monotonic seq, replay dedup, per-kind retention —
+  join/leave never pruned, hard-purge watermarks via
+  `POST /api/instances/{id}/events/purge`), roster hydration from the stream
+  on adoption (closes the 8-3 lean-adopt roster gap), authority gate per
+  event kind (`/events/sources` diagnostics). Generic REST poller host +
+  `IStatePollProvider` (ContractsVersion 3 → 4). Manager `EventSyncService`:
+  cursor sync in AppSettings KV riding the projection transaction
+  (exactly-once), SSE live phase with pull fallback, rows stamped at true
+  event time, `manager:identity` push so LoMyrealm names become stream
+  facts. Lifecycle rows (start/stop/crash/restart/halt/adopt) in History
+  behind a "Server events" filter.
+- **ConPTY console capture (shim protocol v2).** Pty-backed spawn strategy
+  for console-API games (Palworld on Windows), VT filter + repaint gate on
+  the node, ring-cursor replay so node restarts replay only the gap.
+  `--shim-reconnect-test` / `--eventstream-selftest` / `--shim-conpty-test`
+  self-test flags.
+- **Node-boot resurrection.** Per-instance "Recover state on node restart"
+  and "Auto start with node" (parked snapshot), `POST /boot-flags`,
+  `/forget`, `/park`; persisted flap guard (3 attempts <10 min apart →
+  suppressed until 10 quiet minutes).
+- **Manager Diagnostics window** (Tools → Diagnostics): fleet probe grid
+  (build/protocol/contracts/platform/EventStream/TLS), per-instance event
+  sources, stream health, purge watermarks, parse trace ring + re-arm, rule
+  dry-run, boot state, shim link. Old nodes degrade per-tab.
+- **Orphan reaper.** Image-path-scoped reap of ex-children + port
+  verification on crash-restart and CrashLoopHalted; `orphan-reap` stream
+  event.
+- **Redist verification** surfaced in install progress
+  (`RedistStatus`/`RedistResults`).
+- **Palworld plugin 0.3.0** (requires contracts v4): console-first
+  join/leave via ConPTY (pal-rest poller demoted; REST kept for the stop
+  flow), World Settings editor tab (~80 gameplay keys), single Join per
+  join with persona-first naming.
+
+### Changed
+
+- **Tree shows where the players are.** Instance rows carry a green
+  person glyph + online count while running (installations roll the sum
+  up), refreshed on the existing 2 s status tick from the Manager's
+  tracked roster. Everything under a **[detached]** node is grey — dots and text —
+  and the selected instance panel no longer polls a detached node (its
+  cached state is dropped, so nothing lights up from stale data).
+- Update Nodes: Close / X / Esc are refused while a push is running;
+  an older node that doesn't know a target yet (CtrlCSender on <0.7.0)
+  has that step skipped with a note instead of aborting the sequence.
+- A detached node is left alone: its panel no longer probes version /
+  HTTP mode and hides restart / shutdown / rotate.
+- Instance panel Players source: when the plugin declares join/leave rules
+  the node roster is authoritative and the RC `/players` fetch is skipped.
+- `InstanceFileEditorPanel` Save re-downloads the file before writing
+  (two tabs may share one INI).
+
+### Fixed
+
+- **Node update rolled back on secured nodes.** NodeSetup's survivor health
+  gate polled `/api/version` over plain HTTP only; with `HttpMode=Disabled`
+  the probe is dropped at byte 1, the gate timed out and restored `.old`.
+  The gate now tries http and https (loopback, no cert check) each round.
+- **Manager locked out of every node after a token rotation (HTTP 429
+  storm).** `EventSyncService` captured its `NodeHttpClient` once per
+  instance loop; after `RotateTokenAsync` evicted the cached client the
+  loop kept using the old token → silent 401s → `AuthFailureTracker`
+  locked the Manager's IP for 15 min → every call 429 → re-lock. The loop
+  now re-resolves the client on every SSE (re)connect and pull; a 401 there
+  logs at Warning. Node `RequestRateTracker` logs once/min/IP what tripped
+  it (top paths) instead of staying silent. Restart/shutdown dialogs map
+  404/429/401 to accurate hints. The state poller now routes 429/401/403
+  through the per-node dedup (one Warning, heartbeat, "reachable again")
+  instead of a full stack trace per instance per 3 s poll.
+- **Boot-resurrect ran crash-ladder knobs on node defaults.**
+  `CrashCountResetAfterSeconds` and `MinRestartDelayMs` were not on the
+  snapshot row, so a resurrected instance respawned with no restart floor
+  (0 instead of the Manager's 5000 ms) — fast enough for the Manager's 3 s
+  poller to miss the Crashed transition and drop the crash notification.
+  Both now persist (additive columns) and round-trip through adoption,
+  park and resurrect. (RCON port/password were never consumed by the node
+  from the start request — the Manager drives `/rcon/connect` itself — so
+  nothing to persist there.)
+- **Stardew Valley died on every node restart (exit 458839).** Boot-
+  resurrect and park/autostart rebuilt the start request without the
+  plugin's `EnvironmentVars` (`GALLIUM_DRIVER=llvmpipe`) — the game landed
+  on the Basic Render Driver and crashed at first draw; only crash-restart
+  (which reuses the live `StartInfo`) survived. `InstanceSnapshots` now
+  persists `EnvironmentVarsJson` (additive column) and resurrection
+  restores it. A pre-migration snapshot logs a warning and is refreshed by
+  one Manager-driven Start.
+- **False "certificate mismatch" on every fresh HTTPS enable.**
+  `NodeHttpClient` classified any TLS `AuthenticationException` as a pin
+  failure, including "unexpected packet format" from probing the old
+  plaintext process during the restart gap; the verify step aborted as MITM.
+  Only a real pin rejection maps to `NodeCertificateException` now.
+- **Edit Node → Test Connection failed on alternate-port HTTPS nodes** — it
+  dialled TLS on the listen port instead of the recorded `TlsPort`.
+- **Shim-mode crash-restart orphaned the new shim** — `RestartInstanceAsync`
+  read `StartViaShimAsync`'s String result into a Boolean; success was
+  mislabelled (or threw `InvalidCastException` on `""`), the instance went
+  CrashLoopHalted and the freshly spawned shim+game kept running unsupervised.
+  Observed live on 0.6.0 2026-10-10.
+- **EventSyncService wedge** on catch-up batches with ≥2 events for a
+  never-seen player (`UNIQUE PlayerSessions` on SaveChanges → cursor never
+  advanced → loop restarted ~20×/min, 100+ MB/day logs). `UpsertPlayerSession`
+  checks the change tracker first; `ApplyBatchResilientAsync` falls back to
+  per-event apply and skips a POISON event with an Error log.
+- **HTTPS re-trust lockout.** The re-trust / adopt dialogs read the node's
+  current fingerprint only over *authenticated plain HTTP* — the channel the
+  recommended "Restrict HTTP" step closes — so a cert regeneration on a
+  hardened node left no in-app recovery. The Manager now falls back to an
+  unpinned, tokenless HTTPS handshake and reports the hash of the cert
+  actually presented; the trust decision is still the operator's dialog.
+- `FindInstancesForIdentityScope` compared full identity to game-stripped
+  scope → `manager:identity` push targeted zero instances.
+- Aborted-connect Leave suppression (Palworld connect without join → no lone
+  Leave row).
+- NodeSetup `Save` dropped keys it didn't model (`EnableTls`/`TlsPort`/
+  `HttpMode`/`DisableShim`) — any edit after TLS onboarding silently put
+  the node back on HTTP. Unknown keys now merge through.
+- MYREALM join-time roster regression, STOP-TAIL drain (v3), first-seed
+  start miss, Windrose nameless-join, Factorio IP capture — all found and
+  fixed during the ConPTY G4 gate.
+- Pre-existing: `GatedSystemdNotifier` missing `ISystemdNotifier.IsEnabled`;
+  zip-slip guard in `InstallRunner`; CA1416 guard in `SelfUpdate`.
+
+### Compatibility
+
+- ContractsVersion 3 → 4 (plugins must be recompiled; Palworld 0.3.0 requires
+  v4). ProtocolVersion unchanged. Shim protocol v2 (additive; v1 shims
+  downgrade ConPty to HiddenConsoleDirect with a warning).
 
 ## [0.6.0] - 2026-07-13
 
@@ -410,7 +612,7 @@ compatibility with the previous version, `PATCH` bumps do not.
 - **Phase 8-3 — shim rediscovery + `node.db` hardening (`node.db` becomes a
   cache, not a source of truth).** A lost or corrupt `node.db` no longer orphans
   running games. **Built clean on all targets; runtime verification deferred
-  (build-only this pass).** See `Phase8-3_Plan.md`.
+  (build-only this pass).** See `docs/plans/Phase8-3_Plan.md`.
   - **Shim rediscovery sweep** (`ProcessManager.SweepAdoptLiveShims` +
     `EnumerateShimEndpoints` + `TryLeanAdoptShim`, called after `AdoptSnapshots`
     in `NodeProgram`). The shim endpoint is a pure function of the instance id
@@ -467,7 +669,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   image it's executing. **Verified end to end on all four survivor paths —
   Linux (systemd + bare-exe) and Windows (service + bare-exe)** — game PID
   unchanged across the bounce in each. Manager-driven push, version detection,
-  and NodeSetup/shim co-update are slice 7. See `Phase8-2_Plan.md`.
+  and NodeSetup/shim co-update are slice 7. See `docs/plans/Phase8-2_Plan.md`.
   - **Chunked staging endpoint** (`SelfUpdate.vb`, `SystemEndpoints`) —
     `POST /api/system/staged-binary/{begin,{uploadId}/chunk,{uploadId}/commit}`:
     a begin/chunk/commit session streams the binary append-only to a temp
@@ -526,7 +728,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   `GSM.Shim` process that owns the game's stdin/stdout/stderr and relays them
   to the Node over a named pipe (Windows) / Unix socket (Linux) — the Node
   never holds the game's pipes. **Build-verified on Windows; the live game
-  test runs on the Linux node.** See `Phase8_Plan.md`.
+  test runs on the Linux node.** See `docs/plans/Phase8_Plan.md`.
   - New projects `GSM.Shim.Protocol` (versioned, append-only frame protocol)
     and `GSM.Shim` (self-contained .NET 8, native spawn — `CreateProcessW` on
     Windows, `posix_spawn`/`pipe2` on Linux, the Linux path starting the game
@@ -571,7 +773,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   couldn't receive an allocator-assigned port, and arg-garbling text
   values (Conan's server name / password) corrupted through the command
   line but read clean from a config file. See
-  `StartupConfigRender_Plan.md`.
+  `docs/plans/StartupConfigRender_Plan.md`.
   - **Contract + Manager hook** — new opt-in side-interface
     `IStartupFileProvider` (`GetStartupFiles` / `RenderStartupFile`) in
     `GSM.Contracts`; `ContractsVersion` unchanged at 2 (the still-in-dev
@@ -617,7 +819,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   instance is in scope if it matches **any** checked dimension; only
   the all-empty state means "all instances." Sets reuse the existing
   per-instance `InstanceSetTag` (no new entity, no set-management UI —
-  the form only consumes the tag). See `Phase5n_Plan.md`.
+  the form only consumes the tag). See `docs/plans/Phase5n_Plan.md`.
   - **Schema + editor (5n-1)** — `NotificationDestinationEntity` gains
     `NodeFilterJson` and `InstanceSetFilterJson` (additive TEXT
     columns; forward-only migration `NotificationScopeDimensions`);
@@ -677,7 +879,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   documented exception to the breaking-only rule — a new
   plugin-facing surface bumps so plugins that require it fail fast
   on an older Manager; v1 game plugins load unchanged). See
-  `Phase7_Plan.md`.
+  `docs/plans/Phase7_Plan.md`.
   - **Discovery + Status (7-1)** — utility plugins are discovered
     in the same per-file compile; the Plugin Status list renames
     "Game ID" → "Plugin ID" and adds a **Kind** column (Game /
@@ -904,7 +1106,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   count-labelled (e.g. "Install (3)...") and state-aware (Enable
   counts only checked disabled files, and vice versa).
   New `PluginSources` table (EF migration `PluginSources`); staged
-  plugins persist in settings. See `Phase6_Plan.md`.
+  plugins persist in settings. See `docs/plans/Phase6_Plan.md`.
 
 - **Phase 5l-3 — Apply updates (pre-flight + binary swap + history).**
   The **Apply update** button is now live on the "Update ready"
@@ -929,7 +1131,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   to `.updates\apply-error.log` and surfaced on the next launch. Every
   apply attempt — success or failure — is recorded to an update-
   history table, viewable under **Help → Update History** (when /
-  from → to / outcome / detail). See `Phase5l_Plan.md`.
+  from → to / outcome / detail). See `docs/plans/Phase5l_Plan.md`.
 
 - **Phase 5l-2 — Download + stage updates.** Builds on 5l-1: the
   update dialog now has a **Download update** button (when an update
@@ -945,7 +1147,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   download** button that wipes the staged folder. Releases predating
   the `SHA256SUMS` pipeline step stage without checksum verification
   (logged). Applying a staged update is Phase 5l-3. See
-  `Phase5l_Plan.md`.
+  `docs/plans/Phase5l_Plan.md`.
 
 - **Phase 5l-1 — Update notifications (detection + notify only).**
   PowerGSM now checks GitHub for newer releases on a background
@@ -965,7 +1167,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   writeability probe warns once (and shows a persistent "read-only
   install" indicator) when PowerGSM lives in a folder it can't write
   to, since automatic updates couldn't apply there. See
-  `Phase5l_Plan.md`.
+  `docs/plans/Phase5l_Plan.md`.
 
 - **Phase 5m-3 — Watchdog (auto-restart + start at sign-in).** A tiny
   standalone supervisor (`GSM.Watchdog`) whose only job is to keep the
@@ -993,7 +1195,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   `InteractiveToken` → no UAC, GUI visible, per-user/DPAPI scope
   unchanged), created from an XML definition with a restart-on-failure
   backstop; the checkbox reflects the live task state and disables
-  itself if the watchdog isn't co-located. See `Phase5m_Plan.md`.
+  itself if the watchdog isn't co-located. See `docs/plans/Phase5m_Plan.md`.
 
 - **Phase 5m-2e — Missing-plugin detection + start enforcement.**
   Guards against an installation/instance whose game plugin isn't
@@ -1018,7 +1220,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   The guard covers every start path (panel, tree menu, autostart,
   scheduled restart); the panel and tree-menu Start/Restart actions
   are also disabled for orphaned instances, with Stop left enabled so
-  a running orphan can be brought down. See `Phase5m_Plan.md`.
+  a running orphan can be brought down. See `docs/plans/Phase5m_Plan.md`.
 
 - **Phase 5m-2 — Safe mode.** A recovery mode that boots the Manager
   with the surfaces most likely to carry broken code disabled — plugin
@@ -1034,7 +1236,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   the File/tray entries mirror it. Restart-into-mode relaunches the
   exe with/without the flag *after* the outgoing instance has shut
   down cleanly and cleared its marker, so an intentional restart never
-  trips the crash-recovery offer. See `Phase5m_Plan.md`.
+  trips the crash-recovery offer. See `docs/plans/Phase5m_Plan.md`.
 
 - **Phase 5m-2c — Safe-mode feature re-enable.** A "Re-enable
   Features…" panel (File menu, safe mode only) that turns the
@@ -1046,7 +1248,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   `ManagerProgram` mirroring Main's per-subsystem start steps;
   re-enable only (restart safe mode to turn something back off),
   idempotent, and version-check pulls the automation engine up first
-  since it raises events into it. See `Phase5m_Plan.md`.
+  since it raises events into it. See `docs/plans/Phase5m_Plan.md`.
 
 - **Phase 5m-2d — Plugin enable/disable.** The Plugin Status form
   gained a "Plugin files" list (every `.vb` in `Plugins\`, plus
@@ -1061,7 +1263,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   form refreshes the orphan banner + tree badges, so a disable→reload
   immediately reflects in the warnings (and the start guard) — also
   fixing a gap where reloads done inside that form previously didn't.
-  See `Phase5m_Plan.md`.
+  See `docs/plans/Phase5m_Plan.md`.
 
 - **Phase 5m-1 — System tray + window-state persistence.** The Manager
   owns a tray icon (Open / Exit, double-click to restore) and honours
@@ -1070,7 +1272,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   The tree/content splitter width is persisted and restored across
   launches. Settings now shows the database and plugins directory
   paths as read-only, selectable text boxes with Copy buttons instead
-  of truncated labels. See `Phase5m_Plan.md`.
+  of truncated labels. See `docs/plans/Phase5m_Plan.md`.
 
 - **Phase 5k-2 — Player-list panel polish + grouping fix.** Three
   refinements on top of 5k-1. **(2a)** Fixed a grouping-header bleed in
@@ -1088,7 +1290,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   timestamp (`PlayerSession.JoinedUtc`), and `ShowTotalInTitle`
   appends the online count to the panel title. Schema adds the two
   bool columns (migration `Phase5k2c_PlayerPanelToggles`, both default
-  False). See `Phase5k_Plan.md`.
+  False). See `docs/plans/Phase5k_Plan.md`.
 
 - **Phase 5k-1 — Player-list Discord panel (core).** A new panel kind
   that renders a live online-players roster instead of the instance-
@@ -1114,7 +1316,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   migration `Phase5k_PlayerListPanel`, both defaulted so existing
   panels are unchanged. Polish — per-group counts in the title,
   grouping options, per-row join time, empty-whole-panel state — is the
-  5k-2 follow-on. See `Phase5k_Plan.md`.
+  5k-2 follow-on. See `docs/plans/Phase5k_Plan.md`.
 
 - **Phase 5d-8 — `/lastseen` Discord slash command.** Operators can
   ask when and where a player was last seen, or list who's been on
@@ -1144,7 +1346,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   autocomplete providers back the arguments (player names, games,
   installations; instance reuses the existing one). Built in four
   rounds — command shape, identity-awareness, scope filters, roster.
-  See `Phase5d-8_Plan.md`.
+  See `docs/plans/Phase5d-8_Plan.md`.
 
 - **Phase 5g-2d — Manager-side IdentityResolver.** Centralised
   in-memory cache that promotes the Manager to system-of-record
@@ -1213,7 +1415,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   mutable from outside. Diagnostic surface (`RecordCount`,
   `GetAllRecords`, `IsHydrated`) is in place for a future Tools
   menu `View IdentityResolver cache...` UI; the UI itself is
-  deferred. See `Phase5g-2d_Plan.md` for the full architectural
+  deferred. See `docs/plans/Phase5g-2d_Plan.md` for the full architectural
   framing and the six resolved planning decisions.
 
 - **Tools → Purge && Rebuild History...** lets the operator
@@ -1236,7 +1438,7 @@ compatibility with the previous version, `PATCH` bumps do not.
   plus typed-REBUILD gate, modeless progress dialog with
   live status updates while the work runs, and a result
   summary showing row counts, filtered-out chat count, and
-  any non-fatal warnings. See `Phase5j_Plan.md` for the full
+  any non-fatal warnings. See `docs/plans/Phase5j_Plan.md` for the full
   design.
 
 ### Fixed
@@ -3184,8 +3386,5 @@ not intended for 0.1.x; the immediate motivation for naming this
 version is to establish the versioning, changelog, and release-process
 groundwork before the first external user arrives.
 
-<!--
-  Comparison and tag links go here once phase 5f-4 stands up
-  the GitHub Actions release workflow and the repo's public URL
-  is settled. Form: [0.1.0]: <repo-url>/releases/tag/v0.1.0
--->
+[Unreleased]: https://github.com/siteml/PowerGSM/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/siteml/PowerGSM/releases/tag/v0.7.0

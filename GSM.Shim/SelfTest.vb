@@ -23,6 +23,7 @@ Imports GSM.Shim.Protocol
 Friend Module SelfTest
 
     Private Const Marker As String = "SHIM_SELFTEST_MARKER"
+    Private Const ConPtyMarker As String = "SHIM_CONPTY_MARKER"
 
     Public Async Function RunAsync() As Task(Of Integer)
         Dim endpoint As String = MakeTempEndpoint()
@@ -53,6 +54,109 @@ Friend Module SelfTest
 
         Console.WriteLine(If(ok, "[self-test] PASS", "[self-test] FAIL"))
         Return If(ok, 0, 1)
+    End Function
+
+    ''' <summary>
+    ''' ConPTY self-test (`GSM.Shim --self-test-conpty`, Windows only,
+    ''' EventStream Slice 4): same listener/Supervisor scaffolding as the
+    ''' main self-test, but the dummy is spawned with Strategy "ConPty" — a
+    ''' real CreatePseudoConsole spawn. Asserts the marker text arrives
+    ''' through the pty output pump (embedded in raw VT — the shim relays
+    ''' unstripped by design; the marker substring still appears verbatim),
+    ''' then StopGame(kill) → Exited (which also exercises the
+    ''' ClosePseudoConsole-before-drain ordering in WatchExitAsync — a hang
+    ''' here means the pty release regressed).
+    ''' </summary>
+    Public Async Function RunConPtyAsync() As Task(Of Integer)
+        If Not OperatingSystem.IsWindows() Then
+            Console.WriteLine("[conpty-test] skipped (ConPTY is Windows-only; Linux resolves to stdout capture)")
+            Return 0
+        End If
+
+        Dim endpoint As String = MakeTempEndpoint()
+        Console.WriteLine($"[conpty-test] OS={GetOsName()}  endpoint={endpoint}")
+
+        Dim ok As Boolean = False
+        Using listener As IShimListener = ShimTransport.CreateListener(endpoint)
+            Dim serverTask As Task = ServerOnceAsync(listener)
+
+            Dim client As Stream = Await ShimTransport.ConnectAsync(endpoint, CancellationToken.None).ConfigureAwait(False)
+            Using conn As New FrameConnection(client)
+                Dim ack As HelloAckMessage = Await ShimHandshake.ConnectAsync(conn, CancellationToken.None).ConfigureAwait(False)
+                Console.WriteLine($"[conpty-test] HelloAck: proto=v{ack.ProtocolVersion} shim={ack.ShimVersion} state={ack.GameState}")
+                Dim handshakeOk As Boolean = (ack.ProtocolVersion >= 2) AndAlso
+                                             String.Equals(ack.GameState, "none", StringComparison.Ordinal)
+
+                Dim spawnOk As Boolean = Await RunConPtyRoundTripAsync(conn, CancellationToken.None).ConfigureAwait(False)
+
+                Await conn.WriteFrameAsync(FrameType.Shutdown, Nothing, CancellationToken.None).ConfigureAwait(False)
+                ok = handshakeOk AndAlso spawnOk
+            End Using
+
+            Await serverTask.ConfigureAwait(False)
+        End Using
+
+        Console.WriteLine(If(ok, "[conpty-test] PASS", "[conpty-test] FAIL"))
+        Return If(ok, 0, 1)
+    End Function
+
+    Private Async Function RunConPtyRoundTripAsync(conn As FrameConnection, ct As CancellationToken) As Task(Of Boolean)
+        ' cmd.exe under a pseudoconsole: echo the marker, then pause so the
+        ' game stays alive until the kill. The pty renders this with VT
+        ' decoration; the marker substring survives verbatim.
+        Dim spec As New SpawnSpec With {
+            .ExePath = "cmd.exe",
+            .Arguments = "/c ""echo " & ConPtyMarker & " & pause >nul""",
+            .WorkingDirectory = Nothing,
+            .Environment = Nothing,
+            .Strategy = "ConPty"
+        }
+        Await conn.WriteFrameAsync(FrameType.Spawn, ProtocolCodec.Encode(spec), ct).ConfigureAwait(False)
+
+        Dim ackFrame As Frame = Await conn.ReadFrameAsync(ct).ConfigureAwait(False)
+        If ackFrame.Kind <> FrameType.SpawnAck Then
+            Console.WriteLine($"[conpty-test] spawn: expected SpawnAck, got {ackFrame.Kind}")
+            Return False
+        End If
+        Dim ack As SpawnAckMessage = ProtocolCodec.Decode(Of SpawnAckMessage)(ackFrame.Payload)
+        Console.WriteLine($"[conpty-test] SpawnAck: success={ack.Success} gamePid={ack.GamePid} err={ack.ErrorMessage}")
+        If ack Is Nothing OrElse Not ack.Success OrElse ack.GamePid <= 0 Then Return False
+
+        ' Accumulate stdout across frames: the pty chunks its VT stream
+        ' arbitrarily, so the marker may straddle a frame boundary.
+        Dim seen As New StringBuilder()
+        Dim sawMarker As Boolean = False
+        Dim sawExited As Boolean = False
+        Dim sentStop As Boolean = False
+
+        Do
+            Dim f As Frame
+            Try
+                f = Await conn.ReadFrameAsync(ct).ConfigureAwait(False)
+            Catch
+                Exit Do
+            End Try
+
+            Select Case f.Kind
+                Case FrameType.Stdout, FrameType.Stderr
+                    seen.Append(Encoding.UTF8.GetString(f.Payload))
+                    If Not sawMarker AndAlso seen.ToString().Contains(ConPtyMarker) Then sawMarker = True
+                    If sawMarker AndAlso Not sentStop Then
+                        sentStop = True
+                        Dim stopMsg As New StopMessage With {.Kind = "kill", .TimeoutMs = 5000}
+                        Await conn.WriteFrameAsync(FrameType.StopGame, ProtocolCodec.Encode(stopMsg), ct).ConfigureAwait(False)
+                    End If
+                Case FrameType.Exited
+                    Dim exited As ExitedMessage = ProtocolCodec.Decode(Of ExitedMessage)(f.Payload)
+                    Console.WriteLine($"[conpty-test] Exited: code={If(exited Is Nothing, -1, exited.Code)}")
+                    sawExited = True
+                    Exit Do
+            End Select
+        Loop
+
+        Dim vtSeen As Boolean = seen.ToString().Contains(ChrW(27))
+        Console.WriteLine($"[conpty-test] spawn: marker={sawMarker} exited={sawExited} vtSequencesSeen={vtSeen} bytes={seen.Length}")
+        Return sawMarker AndAlso sawExited
     End Function
 
     ''' <summary>

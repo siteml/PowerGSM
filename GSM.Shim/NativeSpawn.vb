@@ -40,6 +40,15 @@ Friend Interface IGameProcess
     Function WaitForExitAsync(ct As CancellationToken) As Task(Of Integer)
     ''' <summary>Force-terminate (basic kill; graceful CTRL_C is slice 5).</summary>
     Sub Kill()
+    ''' <summary>
+    ''' Called by the supervisor's exit watcher AFTER the game exits and
+    ''' BEFORE the pump drain (ConPTY, EventStream Slice 4): a pty's output
+    ''' pipe never EOFs while conhost holds its end, so the ConPTY process
+    ''' closes its pseudoconsole here to release the pipe — otherwise every
+    ''' exit eats the full drain timeout and the tail output is dropped.
+    ''' No-op for the pipe-based processes (their EOF arrives naturally).
+    ''' </summary>
+    Sub PrepareForDrain()
 End Interface
 
 ''' <summary>Windows IGameProcess backed by a raw process handle from CreateProcessW.</summary>
@@ -96,6 +105,11 @@ Friend NotInheritable Class WindowsGameProcess
         If _hProcess <> IntPtr.Zero Then
             NativeSpawn.TerminateProcess(_hProcess, 1UI)
         End If
+    End Sub
+
+    Public Sub PrepareForDrain() Implements IGameProcess.PrepareForDrain
+        ' Pipe-based spawn: EOF propagates when the game closes its
+        ' handles — nothing to release.
     End Sub
 
     Public Sub Dispose() Implements IDisposable.Dispose
@@ -205,6 +219,10 @@ Friend NotInheritable Class LinuxGameProcess
         End If
     End Sub
 
+    Public Sub PrepareForDrain() Implements IGameProcess.PrepareForDrain
+        ' Pipe-based spawn: EOF propagates naturally — nothing to release.
+    End Sub
+
     Public Sub Dispose() Implements IDisposable.Dispose
         If _disposed Then Return
         _disposed = True
@@ -214,6 +232,116 @@ Friend NotInheritable Class LinuxGameProcess
         ' No process handle to close on Linux; the pid is reaped by the
         ' supervisor's exit watcher (WaitForExitAsync), so we don't waitpid
         ' here and risk a double-reap.
+    End Sub
+
+    Private Shared Sub TryDispose(s As Stream)
+        Try
+            If s IsNot Nothing Then s.Dispose()
+        Catch
+            ' best-effort
+        End Try
+    End Sub
+
+End Class
+
+''' <summary>
+''' Windows IGameProcess for the ConPTY strategy (EventStream Slice 4): the
+''' game is attached to a pseudoconsole (CreatePseudoConsole); StdOut is the
+''' pty OUTPUT pipe (conhost's rendered VT stream — pumped by the supervisor
+''' exactly like redirected stdout), StdIn is the pty INPUT pipe (keystrokes;
+''' 0x03 = Ctrl+C via processed input), StdErr is Nothing (a console has no
+''' separate stderr — conhost merges). Owns the pseudoconsole handle:
+'''
+'''   - PrepareForDrain (game exited): ClosePseudoConsole FIRST — the output
+'''     pipe never EOFs while conhost holds its end, so without this every
+'''     exit stalls the drain and drops the tail output.
+'''   - Dispose (teardown/kill paths): also closes the pseudoconsole (which
+'''     ends conhost). Only paths that already kill the game reach Dispose;
+'''     Detach never does — the supervisor keeps game + pumps + pty across
+'''     Node bounces, which is what makes adopt-with-capture work.
+''' </summary>
+Friend NotInheritable Class WindowsConPtyGameProcess
+    Implements IGameProcess
+
+    Private ReadOnly _pid As Integer
+    Private _hProcess As IntPtr
+    Private _hPseudoConsole As IntPtr
+    Private ReadOnly _stdin As Stream
+    Private ReadOnly _stdout As Stream
+    Private _disposed As Boolean
+
+    Public Sub New(pid As Integer, hProcess As IntPtr, hPseudoConsole As IntPtr,
+                   stdinStream As Stream, stdoutStream As Stream)
+        _pid = pid
+        _hProcess = hProcess
+        _hPseudoConsole = hPseudoConsole
+        _stdin = stdinStream
+        _stdout = stdoutStream
+    End Sub
+
+    Public ReadOnly Property Pid As Integer Implements IGameProcess.Pid
+        Get
+            Return _pid
+        End Get
+    End Property
+
+    Public ReadOnly Property StdIn As Stream Implements IGameProcess.StdIn
+        Get
+            Return _stdin
+        End Get
+    End Property
+
+    Public ReadOnly Property StdOut As Stream Implements IGameProcess.StdOut
+        Get
+            Return _stdout
+        End Get
+    End Property
+
+    Public ReadOnly Property StdErr As Stream Implements IGameProcess.StdErr
+        Get
+            Return Nothing   ' conhost merges; there is no separate stderr
+        End Get
+    End Property
+
+    Public Async Function WaitForExitAsync(ct As CancellationToken) As Task(Of Integer) Implements IGameProcess.WaitForExitAsync
+        Await Task.Run(Sub() NativeSpawn.WaitForSingleObject(_hProcess, NativeSpawn.INFINITE)).ConfigureAwait(False)
+        Dim code As UInteger = 0UI
+        NativeSpawn.GetExitCodeProcess(_hProcess, code)
+        Return CInt(code And &H7FFFFFFFUI)
+    End Function
+
+    Public Sub Kill() Implements IGameProcess.Kill
+        If _hProcess <> IntPtr.Zero Then
+            NativeSpawn.TerminateProcess(_hProcess, 1UI)
+        End If
+    End Sub
+
+    Public Sub PrepareForDrain() Implements IGameProcess.PrepareForDrain
+        ClosePty()
+    End Sub
+
+    Private Sub ClosePty()
+        Dim h As IntPtr = _hPseudoConsole
+        _hPseudoConsole = IntPtr.Zero
+        If h <> IntPtr.Zero Then
+            Try
+                NativeSpawn.ClosePseudoConsole(h)
+            Catch
+                ' best-effort — never let pty teardown break exit handling
+            End Try
+        End If
+    End Sub
+
+    Public Sub Dispose() Implements IDisposable.Dispose
+        If _disposed Then Return
+        _disposed = True
+        ClosePty()
+        TryDispose(_stdin)
+        TryDispose(_stdout)
+        If _hProcess <> IntPtr.Zero Then
+            NativeSpawn.CloseHandle(_hProcess)
+            _hProcess = IntPtr.Zero
+        End If
     End Sub
 
     Private Shared Sub TryDispose(s As Stream)
@@ -253,6 +381,8 @@ Friend Module NativeSpawn
             Return SpawnWindowsHiddenConsole(spec, wrapInCmd:=False)
         ElseIf String.Equals(strat, "HiddenConsoleWrapped", StringComparison.OrdinalIgnoreCase) Then
             Return SpawnWindowsHiddenConsole(spec, wrapInCmd:=True)
+        ElseIf String.Equals(strat, "ConPty", StringComparison.OrdinalIgnoreCase) Then
+            Return SpawnWindowsConPty(spec)
         End If
         Return SpawnWindowsRedirected(spec)
     End Function
@@ -437,6 +567,159 @@ Friend Module NativeSpawn
     End Function
 
     ''' <summary>
+    ''' Strategy D (ConPTY, EventStream Slice 4): attach the game to a
+    ''' pseudoconsole so a WriteConsole-only engine (Palworld/UE) has a real
+    ''' console AND the shim captures its rendered output. Two pipes
+    ''' (pty input / pty output) + CreatePseudoConsole + CreateProcessW with
+    ''' the PSEUDOCONSOLE proc-thread attribute (EXTENDED_STARTUPINFO_PRESENT,
+    ''' no handle inheritance — the attribute wires the console). The child
+    ''' ends (inputRead / outputWrite) are closed right after
+    ''' CreatePseudoConsole duplicates them; the parent keeps inputWrite
+    ''' (keystrokes; 0x03 = Ctrl+C) and outputRead (the VT stream, pumped by
+    ''' the supervisor like stdout). The raw VT is relayed as-is — the Node
+    ''' strips escape sequences (node-side by design: stripping fixes ride a
+    ''' node redeploy, never a shim generation).
+    '''
+    ''' Fixed size 512x200: wide to minimise mid-line wraps (a wrapped long
+    ''' line surfaces as two lines — parse rules anchor on prefixes). No
+    ''' resize support. Requires Windows 10 1809+; an older kernel32 without
+    ''' CreatePseudoConsole surfaces as a clear spawn error (SpawnAck
+    ''' failure), not a crash.
+    ''' </summary>
+    Private Function SpawnWindowsConPty(spec As SpawnSpec) As IGameProcess
+        Dim sa As New SECURITY_ATTRIBUTES()
+        sa.nLength = Marshal.SizeOf(Of SECURITY_ATTRIBUTES)()
+        sa.lpSecurityDescriptor = IntPtr.Zero
+        sa.bInheritHandle = False   ' no inheritance — the pty attribute wires the console
+
+        Dim inRead, inWrite As IntPtr    ' game keyboard input: we write -> conhost reads
+        Dim outRead, outWrite As IntPtr  ' rendered output: conhost writes -> we read
+
+        If Not CreatePipe(inRead, inWrite, sa, 0UI) Then ThrowLastError("CreatePipe(pty-in)")
+        If Not CreatePipe(outRead, outWrite, sa, 0UI) Then
+            CloseHandle(inRead) : CloseHandle(inWrite)
+            ThrowLastError("CreatePipe(pty-out)")
+        End If
+
+        Dim hPC As IntPtr = IntPtr.Zero
+        Dim size As COORD
+        size.X = 512S
+        size.Y = 200S
+
+        Dim hr As Integer
+        Try
+            hr = CreatePseudoConsole(size, inRead, outWrite, 0UI, hPC)
+        Catch ex As EntryPointNotFoundException
+            CloseHandle(inRead) : CloseHandle(inWrite)
+            CloseHandle(outRead) : CloseHandle(outWrite)
+            Throw New IOException(
+                "ConPty spawn failed: CreatePseudoConsole is not available on this Windows build (requires Windows 10 1809+)")
+        End Try
+        If hr <> 0 Then
+            CloseHandle(inRead) : CloseHandle(inWrite)
+            CloseHandle(outRead) : CloseHandle(outWrite)
+            Throw New IOException($"CreatePseudoConsole failed (HRESULT=0x{hr:X8})")
+        End If
+
+        ' The pseudoconsole holds its own references to the child-side ends;
+        ' close ours now so the output pipe can EOF once ClosePseudoConsole
+        ' runs (PrepareForDrain) and nothing leaks.
+        CloseHandle(inRead)
+        CloseHandle(outWrite)
+
+        ' Proc-thread attribute list carrying the pseudoconsole.
+        Dim attrListSize As IntPtr = IntPtr.Zero
+        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, attrListSize)
+        Dim attrList As IntPtr = Marshal.AllocHGlobal(attrListSize)
+        Dim attrListInitialized As Boolean = False
+
+        Dim si As New STARTUPINFOEXW()
+        si.StartupInfo.cb = CUInt(Marshal.SizeOf(Of STARTUPINFOEXW)())
+        ' THE 2026-08-11 FIX (found live): without STARTF_USESTDHANDLES a
+        ' console child inherits DUPLICATES of the parent's std handles
+        ' whenever those aren't console handles — even with
+        ' bInheritHandles=False (legacy CreateProcess console rule). The
+        ' node launches this shim with REDIRECTED stdio, so the game's
+        ' stdout became the shim's own stdout pipe and the pseudoconsole
+        ' stayed dark (console-attached shims — the self-test — dodge the
+        ' rule, which is why it passed there). The Windows Terminal
+        ' approach: set USESTDHANDLES with NULL handles so nothing is
+        ' duplicated; console connect then binds the child's stdio to the
+        ' pseudoconsole's conhost.
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+        si.StartupInfo.hStdInput = IntPtr.Zero
+        si.StartupInfo.hStdOutput = IntPtr.Zero
+        si.StartupInfo.hStdError = IntPtr.Zero
+        Dim pi As New PROCESS_INFORMATION()
+
+        Dim cmdLine As New StringBuilder()
+        cmdLine.Append(""""c)
+        cmdLine.Append(spec.ExePath)
+        cmdLine.Append(""""c)
+        If Not String.IsNullOrEmpty(spec.Arguments) Then
+            cmdLine.Append(" "c)
+            cmdLine.Append(spec.Arguments)
+        End If
+
+        Dim envBlockPtr As IntPtr = IntPtr.Zero
+        Dim spawned As Boolean = False
+        Try
+            If Not InitializeProcThreadAttributeList(attrList, 1, 0, attrListSize) Then
+                ThrowLastError("InitializeProcThreadAttributeList")
+            End If
+            attrListInitialized = True
+            If Not UpdateProcThreadAttribute(attrList, 0,
+                                             New IntPtr(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE),
+                                             hPC, New IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero) Then
+                ThrowLastError("UpdateProcThreadAttribute(pseudoconsole)")
+            End If
+            si.lpAttributeList = attrList
+
+            envBlockPtr = BuildEnvironmentBlock(spec.Environment)
+            Dim flags As UInteger = EXTENDED_STARTUPINFO_PRESENT Or CREATE_UNICODE_ENVIRONMENT
+            Dim workDir As String = If(String.IsNullOrEmpty(spec.WorkingDirectory), Nothing, spec.WorkingDirectory)
+
+            Dim ok = CreateProcessExW(
+                Nothing,
+                cmdLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                False,          ' no handle inheritance — the attribute wires the console
+                flags,
+                envBlockPtr,
+                workDir,
+                si,
+                pi)
+
+            If Not ok Then
+                Dim err = Marshal.GetLastWin32Error()
+                Throw New IOException($"CreateProcessW (ConPty) failed for {spec.ExePath} (Win32Error={err})")
+            End If
+            spawned = True
+
+            If pi.hThread <> IntPtr.Zero Then CloseHandle(pi.hThread)
+
+            Dim stdinStream As New FileStream(New SafeFileHandle(inWrite, ownsHandle:=True), FileAccess.Write)
+            Dim stdoutStream As New FileStream(New SafeFileHandle(outRead, ownsHandle:=True), FileAccess.Read)
+
+            Return New WindowsConPtyGameProcess(pi.dwProcessId, pi.hProcess, hPC, stdinStream, stdoutStream)
+        Finally
+            If envBlockPtr <> IntPtr.Zero Then Marshal.FreeHGlobal(envBlockPtr)
+            If attrListInitialized Then DeleteProcThreadAttributeList(attrList)
+            Marshal.FreeHGlobal(attrList)
+            If Not spawned Then
+                ' Failure cleanup: nothing took ownership yet.
+                Try
+                    ClosePseudoConsole(hPC)
+                Catch
+                End Try
+                CloseHandle(inWrite)
+                CloseHandle(outRead)
+            End If
+        End Try
+    End Function
+
+    ''' <summary>
     ''' Unicode env block (KEY=VAL\0...\0\0) for CreateProcess. IntPtr.Zero
     ''' when empty => child inherits the parent's environment. Caller frees a
     ''' non-zero pointer. Mirrors ProcessManager.BuildEnvironmentBlock but
@@ -552,6 +835,66 @@ Friend Module NativeSpawn
     Private Const HANDLE_FLAG_INHERIT As UInteger = &H1UI
     Private Const CREATE_NEW_CONSOLE As UInteger = &H10UI
     Private Const SW_HIDE As UShort = 0US
+
+    ' ---------- ConPTY interop (EventStream Slice 4) ----------
+
+    <StructLayout(LayoutKind.Sequential)>
+    Private Structure COORD
+        Public X As Short
+        Public Y As Short
+    End Structure
+
+    ''' <summary>STARTUPINFOW + lpAttributeList, for EXTENDED_STARTUPINFO_PRESENT.</summary>
+    <StructLayout(LayoutKind.Sequential, CharSet:=CharSet.Unicode)>
+    Private Structure STARTUPINFOEXW
+        Public StartupInfo As STARTUPINFOW
+        Public lpAttributeList As IntPtr
+    End Structure
+
+    ' CreateProcessW overload taking STARTUPINFOEXW (same entry point; the
+    ' EXTENDED_STARTUPINFO_PRESENT flag tells the OS which shape it got).
+    <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True, EntryPoint:="CreateProcessW")>
+    Private Function CreateProcessExW(
+        <MarshalAs(UnmanagedType.LPWStr)> lpApplicationName As String,
+        lpCommandLine As StringBuilder,
+        lpProcessAttributes As IntPtr,
+        lpThreadAttributes As IntPtr,
+        bInheritHandles As Boolean,
+        dwCreationFlags As UInteger,
+        lpEnvironment As IntPtr,
+        <MarshalAs(UnmanagedType.LPWStr)> lpCurrentDirectory As String,
+        ByRef lpStartupInfo As STARTUPINFOEXW,
+        ByRef lpProcessInformation As PROCESS_INFORMATION) As Boolean
+    End Function
+
+    ' Returns an HRESULT (0 = S_OK), not a BOOL. Windows 10 1809+.
+    <DllImport("kernel32.dll", SetLastError:=False)>
+    Private Function CreatePseudoConsole(size As COORD, hInput As IntPtr, hOutput As IntPtr,
+                                         dwFlags As UInteger, ByRef phPC As IntPtr) As Integer
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=False)>
+    Friend Sub ClosePseudoConsole(hPC As IntPtr)
+    End Sub
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Function InitializeProcThreadAttributeList(lpAttributeList As IntPtr, dwAttributeCount As Integer,
+                                                       dwFlags As Integer, ByRef lpSize As IntPtr) As Boolean
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Function UpdateProcThreadAttribute(lpAttributeList As IntPtr, dwFlags As Integer,
+                                               attribute As IntPtr, lpValue As IntPtr,
+                                               cbSize As IntPtr, lpPreviousValue As IntPtr,
+                                               lpReturnSize As IntPtr) As Boolean
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Sub DeleteProcThreadAttributeList(lpAttributeList As IntPtr)
+    End Sub
+
+    Private Const EXTENDED_STARTUPINFO_PRESENT As UInteger = &H80000UI
+    Private Const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE As Integer = &H20016
 
     ' ---------- Linux (posix_spawn + pipe2) ----------
 

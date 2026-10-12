@@ -42,6 +42,12 @@ Namespace GSM.Manager.UI
         Private _hostTextBox As TextBox
         Private _portNumeric As NumericUpDown
         Private _tokenTextBox As TextBox
+        ' HTTPS_SinglePort_Plan slice 3: optional SHA-256 fingerprint. On
+        ' Add, a value pins the node BEFORE first contact (no TOFU over
+        ' plaintext — the fingerprint comes from NodeSetup's console /
+        ' the node log, out of band). On Edit it is display-only; re-pin
+        ' goes through the node panel's explicit re-trust flow.
+        Private _fingerprintTextBox As TextBox
         Private _serversDirLabel As Label
         Private _testButton As Button
         Private _saveButton As Button
@@ -49,6 +55,13 @@ Namespace GSM.Manager.UI
         Private _statusLabel As Label
 
         Private ReadOnly _editNodeId As String  ' Nothing for new node
+        ' Edit path only: the entity's recorded TlsPort (0 = shared
+        ' listen port). Test Connection over pinned HTTPS must dial
+        ' THIS, not the listen port — a node on an alternate TLS port
+        ' serves plain HTTP on the listen port, and a TLS handshake
+        ' there fails and reads as a bogus "certificate validation
+        ' failed" (found live 2026-10-10).
+        Private _editTlsPort As Integer = 0
 
         Public Sub New(Optional editNodeId As String = Nothing)
             FormIconHelper.ApplyTo(Me)
@@ -63,10 +76,27 @@ Namespace GSM.Manager.UI
                 ' Connection — the host/port/token fields are blank
                 ' at that point so there's nothing to fetch with
                 ' anyway.
-                Task.Run(Async Function()
-                             Await FetchAndDisplayServersDirAsync(silent:=True)
-                         End Function)
+                '
+                ' Deferred to Shown (NOT fired here in the ctor): the
+                ' fetch's first act is Me.Invoke, and before the form is
+                ' shown the window handle doesn't exist yet — Invoke/
+                ' BeginInvoke then throw InvalidOperationException. The
+                ' ctor-time race sometimes lost, killing the silent fetch
+                ' (directory stayed unpopulated) and spraying first-chance
+                ' exceptions in the debugger. Shown guarantees the handle.
+                AddHandler Me.Shown, AddressOf OnShownAutoFetch
             End If
+        End Sub
+
+        ''' <summary>
+        ''' One-shot Shown handler for the edit-path auto-fetch — runs
+        ''' once the window handle exists, then unhooks itself.
+        ''' </summary>
+        Private Sub OnShownAutoFetch(sender As Object, e As EventArgs)
+            RemoveHandler Me.Shown, AddressOf OnShownAutoFetch
+            Task.Run(Async Function()
+                         Await FetchAndDisplayServersDirAsync(silent:=True)
+                     End Function)
         End Sub
 
         Private Sub InitializeControls()
@@ -74,7 +104,7 @@ Namespace GSM.Manager.UI
             ' Form height bumped from 350 to 400 to fit the
             ' Servers Directory display row without the status
             ' label and buttons getting clipped.
-            Me.Size = New Size(500, 400)
+            Me.Size = New Size(500, 435)
             Me.FormBorderStyle = FormBorderStyle.FixedDialog
             Me.MaximizeBox = False
             Me.MinimizeBox = False
@@ -108,6 +138,15 @@ Namespace GSM.Manager.UI
             AddLabel("Auth Token:", 20, y)
             _tokenTextBox = AddTextBox(150, y, 300)
             _tokenTextBox.UseSystemPasswordChar = True
+            y += 35
+
+            ' Certificate fingerprint (optional). Empty = today's
+            ' behaviour: plain HTTP first, HTTPS via the panel's
+            ' Enable/TOFU flow later.
+            AddLabel("Cert SHA-256:", 20, y)
+            _fingerprintTextBox = AddTextBox(150, y, 300)
+            _fingerprintTextBox.Font = New Font("Consolas", 9)
+            _fingerprintTextBox.PlaceholderText = "optional — pins HTTPS before first contact"
             y += 35
 
             ' Servers directory — read-only display populated by
@@ -173,9 +212,38 @@ Namespace GSM.Manager.UI
                     _hostTextBox.Text = entity.HostAddress
                     _portNumeric.Value = entity.Port
                     _tokenTextBox.Text = entity.AuthToken
+                    ' Display-only on edit: changing a pin is a trust
+                    ' decision that belongs to the panel's re-trust flow.
+                    _fingerprintTextBox.Text = If(entity.PinnedCertFingerprint, "")
+                    _editTlsPort = entity.TlsPort
+                    _fingerprintTextBox.ReadOnly = True
+                    _fingerprintTextBox.BackColor = SystemColors.Control
                 End If
             End Using
         End Sub
+
+        ''' <summary>
+        ''' Normalises operator-typed fingerprint text: strips colons,
+        ''' spaces and a leading "sha256:"/"sha-256:" label, lowercases,
+        ''' and requires exactly 64 hex chars. Returns Nothing for empty
+        ''' input; throws ArgumentException on anything else invalid.
+        ''' </summary>
+        Private Shared Function NormalizeFingerprint(raw As String) As String
+            If String.IsNullOrWhiteSpace(raw) Then Return Nothing
+            Dim s = raw.Trim().ToLowerInvariant()
+            If s.StartsWith("sha256:") Then s = s.Substring(7)
+            If s.StartsWith("sha-256:") Then s = s.Substring(8)
+            s = s.Replace(":", "").Replace(" ", "").Replace("-", "")
+            If s.Length <> 64 Then
+                Throw New ArgumentException("A SHA-256 fingerprint is 64 hex characters (colons/spaces are fine).")
+            End If
+            For Each ch In s
+                If Not Uri.IsHexDigit(ch) Then
+                    Throw New ArgumentException($"Fingerprint contains a non-hex character: '{ch}'.")
+                End If
+            Next
+            Return s
+        End Function
 
         Private Async Sub OnTestConnection(sender As Object, e As EventArgs)
             _statusLabel.Text = "Testing connection..."
@@ -202,6 +270,7 @@ Namespace GSM.Manager.UI
             Dim host = ""
             Dim port As Integer = 0
             Dim token = ""
+            Dim fingerprintRaw = ""
             Try
                 ' Capture inputs on the UI thread; the rest runs off it.
                 If Me.IsDisposed Then Return
@@ -209,8 +278,26 @@ Namespace GSM.Manager.UI
                               host = _hostTextBox.Text.Trim()
                               port = CInt(_portNumeric.Value)
                               token = _tokenTextBox.Text.Trim()
+                              fingerprintRaw = _fingerprintTextBox.Text
                           End Sub)
             Catch
+                Return
+            End Try
+
+            ' A typed fingerprint means the operator expects this node to
+            ' be HTTPS-only (fresh single-port node, HttpMode=Disabled) —
+            ' test over pinned HTTPS on the same port, or the test would
+            ' just report "connection reset" from the plaintext refusal.
+            Dim pin As String = Nothing
+            Try
+                pin = NormalizeFingerprint(fingerprintRaw)
+            Catch ex As ArgumentException
+                Dim validationMsg As String = ex.Message
+                Try
+                    If Me.IsDisposed OrElse Not Me.IsHandleCreated Then Return
+                    Me.BeginInvoke(Sub() ApplyStatusResult(Nothing, validationMsg, silent))
+                Catch
+                End Try
                 Return
             End Try
 
@@ -225,16 +312,35 @@ Namespace GSM.Manager.UI
             Dim errMsg As String = Nothing
             Try
                 Dim factory = ManagerProgram.Services.GetRequiredService(Of NodeHttpClientFactory)()
-                Dim client = factory.GetClient(
-                    "test-" & Guid.NewGuid().ToString("N"),
-                    host, port, token)
+                Dim client As INodeClient
+                If pin IsNot Nothing Then
+                    ' Add path: TlsPort 0 → shared port = the typed port.
+                    ' Edit path: the recorded alternate port if any.
+                    Dim tlsPort As Integer = If(_editNodeId IsNot Nothing AndAlso _editTlsPort > 0,
+                                                _editTlsPort, port)
+                    client = factory.CreateExplicitClient(host, tlsPort, token,
+                                                          useTls:=True, pinnedCertFingerprint:=pin)
+                Else
+                    client = factory.GetClient(
+                        "test-" & Guid.NewGuid().ToString("N"),
+                        host, port, token)
+                End If
                 status = Await client.GetStatusAsync(CancellationToken.None)
             Catch ex As Exception
                 errMsg = ex.Message
             End Try
 
-            If Me.IsDisposed Then Return
-            Me.BeginInvoke(Sub() ApplyStatusResult(status, errMsg, silent))
+            ' Guarded: the dialog can be closed (or, defensively, not yet
+            ' shown) while the HTTP call was in flight — posting to a
+            ' handle-less/disposed form throws InvalidOperationException,
+            ' and from this fire-and-forget task it would go unobserved.
+            Try
+                If Me.IsDisposed OrElse Not Me.IsHandleCreated Then Return
+                Me.BeginInvoke(Sub() ApplyStatusResult(status, errMsg, silent))
+            Catch
+                ' Form torn down between the check and the post — nothing
+                ' left to show the result on.
+            End Try
         End Function
 
         ''' <summary>
@@ -292,6 +398,16 @@ Namespace GSM.Manager.UI
                               MessageBoxButtons.OK, MessageBoxIcon.Warning)
                 Return
             End If
+            Dim pin As String = Nothing
+            If _editNodeId Is Nothing Then
+                Try
+                    pin = NormalizeFingerprint(_fingerprintTextBox.Text)
+                Catch ex As ArgumentException
+                    MessageBox.Show(ex.Message, "Validation",
+                                  MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                    Return
+                End Try
+            End If
 
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
@@ -309,6 +425,19 @@ Namespace GSM.Manager.UI
                         .NodeId = Guid.NewGuid().ToString("N")
                     }
                     db.Nodes.Add(entity)
+                    If pin IsNot Nothing Then
+                        ' Pinned-first-contact: every request from the
+                        ' first one rides HTTPS with this pin. TlsPort 0 =
+                        ' shared listen port (single-port node); the
+                        ' factory's EffectivePort resolves it. A wrong
+                        ' fingerprint surfaces as the normal
+                        ' FingerprintMismatch handling and the token is
+                        ' never sent (handshake fails before any request).
+                        entity.UseTls = True
+                        entity.TlsState = "Active"
+                        entity.PinnedCertFingerprint = pin
+                        entity.TlsPort = 0
+                    End If
                 End If
 
                 entity.DisplayName = _nameTextBox.Text.Trim()

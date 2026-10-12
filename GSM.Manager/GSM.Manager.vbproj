@@ -61,7 +61,20 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
     <PackageReference Include="Basic.Reference.Assemblies" Version="1.8.5" />
-    <PackageReference Include="HtmlRenderer.WinForms" Version="1.5.2" />
+    <!--
+      HtmlRenderer 1.5.2 is a .NET Framework-era package (last
+      released 2018, no netcore/net8 TFM exists) restored via
+      AssetTargetFallback — hence NU1701. It works fine on
+      net8.0-windows (pure managed WinForms drawing, verified in
+      production since Phase 5d) and there is no maintained
+      successor to swap to, so the warning is suppressed rather
+      than actionable. Core is referenced explicitly (it's
+      otherwise transitive) so its copy of NU1701 can be
+      suppressed too — NoWarn on a PackageReference only covers
+      that package.
+    -->
+    <PackageReference Include="HtmlRenderer.Core" Version="1.5.2" NoWarn="NU1701" />
+    <PackageReference Include="HtmlRenderer.WinForms" Version="1.5.2" NoWarn="NU1701" />
     <PackageReference Include="Microsoft.CodeAnalysis.VisualBasic.Workspaces" Version="4.11.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="8.0.2">

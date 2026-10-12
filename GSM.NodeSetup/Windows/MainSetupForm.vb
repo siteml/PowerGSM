@@ -13,8 +13,10 @@ Imports System.Windows.Forms
 '  GSM.Manager. Tabs:
 '    1. General   — node identity, port, paths, limits
 '    2. Auth Token — view, copy, regenerate
-'    3. Security  — advanced limits, hidden behind a tab
-'    4. Service   — install/uninstall/start/stop service
+'    3. Transport — HTTPS on/off, plain-HTTP policy, HTTPS port,
+'                   certificate fingerprint (slice 2, 2026-10-11)
+'    4. Security  — advanced limits, hidden behind a tab
+'    5. Service   — install/uninstall/start/stop service
 '
 '  The form binds to a NodeSetupConfig instance loaded on construction
 '  and re-saves on Save / Save & Exit. Cancel discards in-memory edits.
@@ -50,6 +52,15 @@ Namespace Windows
         Private _showTokenCheck As CheckBox
         Private _copyTokenButton As Button
         Private _regenTokenButton As Button
+
+        ' Transport tab (HTTPS_SinglePort_Plan slice 2)
+        Private _tlsCheck As CheckBox
+        Private _httpModeCombo As ComboBox
+        Private _tlsPortBox As NumericUpDown
+        Private _fingerprintBox As TextBox
+        Private _mintCertButton As Button
+        Private _copyFingerprintButton As Button
+        Private _regenCertButton As Button
 
         ' Security tab
         Private _maxFailedBox As NumericUpDown
@@ -154,6 +165,7 @@ Namespace Windows
             }
             tabs.TabPages.Add(BuildGeneralTab())
             tabs.TabPages.Add(BuildAuthTokenTab())
+            tabs.TabPages.Add(BuildTransportTab())
             tabs.TabPages.Add(BuildSecurityTab())
             tabs.TabPages.Add(BuildServiceTab())
             Me.Controls.Add(tabs)
@@ -385,6 +397,76 @@ Namespace Windows
                 .Padding = New Padding(0, 16, 0, 0)
             }
             grid.Controls.Add(helpText, 0, 3)
+
+            tab.Controls.Add(grid)
+            Return tab
+        End Function
+
+        ''' <summary>
+        ''' HTTPS / plain-HTTP / HTTPS-port + certificate fingerprint. The
+        ''' cert is minted on Save (same TlsCertificateService the node runs)
+        ''' so the fingerprint shown here is what the Manager pins; "Create /
+        ''' show certificate" does it on demand without saving.
+        ''' </summary>
+        Private Function BuildTransportTab() As TabPage
+            Dim tab As New TabPage("Transport")
+            Dim grid = MakeFieldGrid(7)
+
+            _tlsCheck = New CheckBox() With {
+                .Text = "Use HTTPS (recommended) — self-signed certificate, pinned by the Manager",
+                .AutoSize = True, .Anchor = AnchorStyles.Left}
+            AddHandler _tlsCheck.CheckedChanged, AddressOf OnTlsCheckChanged
+            grid.SetColumnSpan(_tlsCheck, 2)
+            grid.Controls.Add(_tlsCheck, 0, 0)
+
+            _httpModeCombo = New ComboBox() With {
+                .DropDownStyle = ComboBoxStyle.DropDownList, .Width = 260, .Anchor = AnchorStyles.Left}
+            _httpModeCombo.Items.AddRange(New Object() {
+                "Disabled — HTTPS only (recommended)",
+                "LoopbackOnly — plain HTTP from this machine only",
+                "Open — plain HTTP from anywhere (legacy)"})
+            AddRow(grid, 1, "Plain HTTP:", _httpModeCombo)
+
+            _tlsPortBox = New NumericUpDown() With {
+                .Minimum = 0, .Maximum = 65535, .Width = 100, .Anchor = AnchorStyles.Left}
+            Dim portRow As New FlowLayoutPanel() With {.AutoSize = True, .WrapContents = False, .Margin = New Padding(0)}
+            _tlsPortBox.Margin = New Padding(0, 0, 8, 0)
+            portRow.Controls.Add(_tlsPortBox)
+            portRow.Controls.Add(New Label() With {
+                .Text = "0 = same as the listen port (single port; recommended)",
+                .AutoSize = True, .ForeColor = SystemColors.GrayText, .Margin = New Padding(0, 6, 0, 0)})
+            AddRow(grid, 2, "HTTPS port (advanced):", portRow)
+
+            _fingerprintBox = New TextBox() With {
+                .ReadOnly = True, .Font = New Font("Consolas", 9.5F),
+                .Anchor = AnchorStyles.Left Or AnchorStyles.Right, .Width = 420}
+            AddRow(grid, 3, "Certificate SHA-256:", _fingerprintBox)
+
+            Dim buttons As New FlowLayoutPanel() With {.AutoSize = True, .WrapContents = False, .Margin = New Padding(0)}
+            _mintCertButton = New Button() With {.Text = "Create / show certificate", .Width = 170, .Margin = New Padding(0, 0, 6, 0)}
+            _copyFingerprintButton = New Button() With {.Text = "Copy", .Width = 80, .Margin = New Padding(0, 0, 6, 0)}
+            _regenCertButton = New Button() With {.Text = "Regenerate…", .Width = 110, .Margin = New Padding(0)}
+            AddHandler _mintCertButton.Click, AddressOf OnMintCertClick
+            AddHandler _copyFingerprintButton.Click, AddressOf OnCopyFingerprintClick
+            AddHandler _regenCertButton.Click, AddressOf OnRegenCertClick
+            buttons.Controls.Add(_mintCertButton)
+            buttons.Controls.Add(_copyFingerprintButton)
+            buttons.Controls.Add(_regenCertButton)
+            AddRow(grid, 4, "", buttons)
+
+            Dim helpLabel As New Label() With {
+                .Text = "With HTTPS on, Save creates the certificate and shows its fingerprint here. Paste the fingerprint " &
+                        "into the Manager (Add Node → Cert SHA-256) together with the auth token so the first contact is already " &
+                        "pinned and plain HTTP never has to be open. Regenerating the certificate makes every Manager pinned to " &
+                        "this node ask to re-trust it; stop the node first. Leaving HTTPS off keeps the node on plain HTTP until " &
+                        "you secure it from the Manager.",
+                .ForeColor = SystemColors.GrayText,
+                .AutoSize = True,
+                .MaximumSize = New Size(620, 0),
+                .Dock = DockStyle.Top,
+                .Padding = New Padding(0, 12, 0, 0)}
+            grid.SetColumnSpan(helpLabel, 2)
+            grid.Controls.Add(helpLabel, 0, 5)
 
             tab.Controls.Add(grid)
             Return tab
@@ -631,6 +713,20 @@ Namespace Windows
 
             _tokenBox.Text = If(_config.NeedsAuthTokenSetup, "", _config.Node.AuthToken)
 
+            ' Transport. A brand-new file defaults HTTPS ON + plain HTTP off
+            ' (the typed defaults say off/Open so an OLD file round-trips to
+            ' its old behaviour; a new node should start secure).
+            Dim freshFile = Not File.Exists(_configPath)
+            _tlsCheck.Checked = If(freshFile, True, _config.Node.EnableTls)
+            Dim mode = ConfigHelpers.NormalizeHttpMode(_config.Node.HttpMode)
+            If freshFile OrElse mode Is Nothing Then mode = "Disabled"
+            _httpModeCombo.SelectedIndex = Array.IndexOf(ConfigHelpers.HttpModes, mode)
+            If _httpModeCombo.SelectedIndex < 0 Then _httpModeCombo.SelectedIndex = 0
+            _tlsPortBox.Value = ClampDecimal(If(_config.Node.TlsPort = _config.Node.ListenPort, 0, _config.Node.TlsPort),
+                                             _tlsPortBox.Minimum, _tlsPortBox.Maximum)
+            _fingerprintBox.Text = If(ConfigHelpers.ReadTlsFingerprint(_config), "(no certificate yet — created on Save)")
+            OnTlsCheckChanged(Nothing, EventArgs.Empty)
+
             _maxFailedBox.Value = ClampDecimal(_config.Security.MaxFailedAttempts, _maxFailedBox.Minimum, _maxFailedBox.Maximum)
             _failureWindowBox.Value = ClampDecimal(_config.Security.FailureWindowMinutes, _failureWindowBox.Minimum, _failureWindowBox.Maximum)
             _lockoutBox.Value = ClampDecimal(_config.Security.LockoutMinutes, _lockoutBox.Minimum, _lockoutBox.Maximum)
@@ -673,6 +769,17 @@ Namespace Windows
             _config.Node.LogRetentionDays = CInt(_logRetentionBox.Value)
             _config.Node.MetricsIntervalSeconds = CInt(_metricsIntervalBox.Value)
 
+            ' Transport.
+            _config.Node.EnableTls = _tlsCheck.Checked
+            Dim idx = _httpModeCombo.SelectedIndex
+            _config.Node.HttpMode = If(idx >= 0 AndAlso idx < ConfigHelpers.HttpModes.Length, ConfigHelpers.HttpModes(idx), "Open")
+            _config.Node.TlsPort = CInt(_tlsPortBox.Value)
+            Dim tlsPortErr = ConfigHelpers.ValidateTlsPort(_config.Node.TlsPort, _config.Node.ListenPort)
+            If tlsPortErr IsNot Nothing AndAlso Not tlsPortErr.StartsWith("Warning") Then
+                Return tlsPortErr
+            End If
+            ConfigHelpers.NormalizeTransport(_config.Node)
+
             ' AuthToken: if the field is empty, generate one. If the user
             ' edited it manually, accept the value as-is (advanced workflow).
             If String.IsNullOrWhiteSpace(_tokenBox.Text) Then
@@ -696,10 +803,78 @@ Namespace Windows
             If _config.NeedsAuthTokenSetup Then
                 _statusLabel.Text = "NOT CONFIGURED  (auth token is the default)"
                 _statusLabel.ForeColor = Color.DarkGoldenrod
-            Else
-                _statusLabel.Text = "Configured"
+            ElseIf _config.Node.EnableTls Then
+                _statusLabel.Text = "Configured — HTTPS on, plain HTTP " & If(ConfigHelpers.NormalizeHttpMode(_config.Node.HttpMode), "Open")
                 _statusLabel.ForeColor = Color.ForestGreen
+            Else
+                _statusLabel.Text = "Configured — plain HTTP only (secure it from the Manager)"
+                _statusLabel.ForeColor = Color.DarkGoldenrod
             End If
+        End Sub
+
+        ' --------------------------------------------------------
+        ' Event handlers — Transport tab
+        ' --------------------------------------------------------
+
+        Private Sub OnTlsCheckChanged(sender As Object, e As EventArgs)
+            Dim tlsOn = _tlsCheck.Checked
+            _httpModeCombo.Enabled = tlsOn
+            _tlsPortBox.Enabled = tlsOn
+            _mintCertButton.Enabled = tlsOn
+            _regenCertButton.Enabled = tlsOn
+        End Sub
+
+        ''' <summary>Mint (or just load) the cert using the CURRENT Data
+        ''' directory / Node ID fields, without saving the config.</summary>
+        Private Sub OnMintCertClick(sender As Object, e As EventArgs)
+            Dim probe As New NodeSetupConfig()
+            probe.Node.DataDirectory = _dataDirBox.Text.Trim()
+            probe.Node.NodeId = _nodeIdBox.Text.Trim()
+            Dim certErr As String = Nothing
+            Dim fp = ConfigHelpers.EnsureTlsCertificate(probe, certErr)
+            If fp Is Nothing Then
+                MessageBox.Show(Me, "Could not create the certificate: " & certErr,
+                                "TLS certificate", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                Return
+            End If
+            _fingerprintBox.Text = fp
+        End Sub
+
+        Private Sub OnCopyFingerprintClick(sender As Object, e As EventArgs)
+            Dim fp = _fingerprintBox.Text
+            If String.IsNullOrWhiteSpace(fp) OrElse fp.StartsWith("(") Then
+                MessageBox.Show(Me, "No certificate yet — click 'Create / show certificate' or Save first.",
+                                "No fingerprint", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                Return
+            End If
+            Try
+                Clipboard.SetText(fp)
+            Catch ex As Exception
+                MessageBox.Show(Me, "Failed to copy to clipboard: " & ex.Message,
+                                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            End Try
+        End Sub
+
+        Private Sub OnRegenCertClick(sender As Object, e As EventArgs)
+            Dim r = MessageBox.Show(Me,
+                "Regenerating the certificate makes every Manager pinned to this node report a certificate " &
+                "MISMATCH until it re-trusts the node (node panel → Re-trust certificate)." & vbCrLf & vbCrLf &
+                "Stop the node first — a running node keeps serving the old certificate until it restarts." & vbCrLf & vbCrLf &
+                "Regenerate now?",
+                "Regenerate TLS certificate", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2)
+            If r <> DialogResult.Yes Then Return
+            Dim probe As New NodeSetupConfig()
+            probe.Node.DataDirectory = _dataDirBox.Text.Trim()
+            probe.Node.NodeId = _nodeIdBox.Text.Trim()
+            Dim certErr As String = Nothing
+            Dim fp = ConfigHelpers.RegenerateTlsCertificate(probe, certErr)
+            If fp Is Nothing Then
+                MessageBox.Show(Me, "Could not regenerate the certificate: " & certErr,
+                                "TLS certificate", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                Return
+            End If
+            _fingerprintBox.Text = fp
         End Sub
 
         ' --------------------------------------------------------
@@ -956,12 +1131,32 @@ Namespace Windows
                 Return
             End Try
 
+            ' Mint the certificate now so the fingerprint can go to the
+            ' Manager with the token (slice 2). Failure is not fatal: the
+            ' node mints one itself at startup.
+            Dim certNote As String = ""
+            If _config.Node.EnableTls Then
+                Dim certErr As String = Nothing
+                Dim fp = ConfigHelpers.EnsureTlsCertificate(_config, certErr)
+                If fp IsNot Nothing Then
+                    _fingerprintBox.Text = fp
+                    certNote = vbCrLf & vbCrLf & "Certificate SHA-256 (paste into Manager → Add Node):" & vbCrLf & fp
+                Else
+                    certNote = vbCrLf & vbCrLf & "TLS certificate could not be created: " & certErr &
+                               vbCrLf & "The node will create one at startup."
+                End If
+            End If
+
             UpdateStatusLabel()
 
             If closeAfter Then
+                If certNote.Length > 0 Then
+                    MessageBox.Show(Me, "Configuration saved." & certNote, "Saved",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Information)
+                End If
                 Me.Close()
             Else
-                MessageBox.Show(Me, "Configuration saved.", "Saved",
+                MessageBox.Show(Me, "Configuration saved." & certNote, "Saved",
                                 MessageBoxButtons.OK, MessageBoxIcon.Information)
             End If
         End Sub

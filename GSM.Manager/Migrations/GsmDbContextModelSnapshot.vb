@@ -423,7 +423,21 @@ Namespace Global.Migrations
                     b.Property(Of String)("OsDescription").
                         HasColumnType("TEXT")
 
+                    b.Property(Of String)("PinnedCertFingerprint").
+                        HasMaxLength(128).
+                        HasColumnType("TEXT")
+
                     b.Property(Of Integer)("Port").
+                        HasColumnType("INTEGER")
+
+                    b.Property(Of Integer)("TlsPort").
+                        HasColumnType("INTEGER")
+
+                    b.Property(Of String)("TlsState").
+                        HasMaxLength(32).
+                        HasColumnType("TEXT")
+
+                    b.Property(Of Boolean)("UseTls").
                         HasColumnType("INTEGER")
 
                     b.HasKey("NodeId")

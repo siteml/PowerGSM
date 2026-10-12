@@ -52,6 +52,7 @@ Namespace GSM.Manager.UI
         Private _chatCheck As CheckBox
         Private _joinCheck As CheckBox
         Private _leaveCheck As CheckBox
+        Private _lifecycleCheck As CheckBox
         Private _searchButton As Button
         Private _cancelButton As Button
 
@@ -236,6 +237,18 @@ Namespace GSM.Manager.UI
                 .Location = New Point(270, row + 2),
                 .Checked = True
             }
+            ' Server lifecycle rows (start/stop/crash/restart/
+            ' halt/adopt from the synced event stream). Checked by
+            ' default here — the History window is exactly where an
+            ' operator wants crash context — while the underlying
+            ' HistoryFilter defaults False so player-centric
+            ' consumers (Discord /lastseen, snapshot) stay clean.
+            _lifecycleCheck = New CheckBox() With {
+                .Text = "Server events",
+                .AutoSize = True,
+                .Location = New Point(345, row + 2),
+                .Checked = True
+            }
 
             ' "Use UTC" — off by default (show local time in pickers
             ' and results). Toggle converts the picker values to the
@@ -244,7 +257,7 @@ Namespace GSM.Manager.UI
             _utcCheck = New CheckBox() With {
                 .Text = "Use UTC",
                 .AutoSize = True,
-                .Location = New Point(400, row + 2),
+                .Location = New Point(455, row + 2),
                 .Checked = False
             }
             AddHandler _utcCheck.CheckedChanged, AddressOf OnUtcModeChanged
@@ -253,6 +266,7 @@ Namespace GSM.Manager.UI
             filterPanel.Controls.Add(_chatCheck)
             filterPanel.Controls.Add(_joinCheck)
             filterPanel.Controls.Add(_leaveCheck)
+            filterPanel.Controls.Add(_lifecycleCheck)
             filterPanel.Controls.Add(_utcCheck)
 
             ' Search / Cancel
@@ -418,6 +432,7 @@ Namespace GSM.Manager.UI
             _chatCheck.Checked = filter.IncludeChat
             _joinCheck.Checked = filter.IncludeJoins
             _leaveCheck.Checked = filter.IncludeLeaves
+            _lifecycleCheck.Checked = filter.IncludeLifecycle
 
             ' Player / chat patterns
             If Not String.IsNullOrEmpty(filter.PlayerNamePattern) Then
@@ -596,7 +611,8 @@ Namespace GSM.Manager.UI
                 .ChatTextPattern = _chatText.Text.Trim(),
                 .IncludeChat = _chatCheck.Checked,
                 .IncludeJoins = _joinCheck.Checked,
-                .IncludeLeaves = _leaveCheck.Checked
+                .IncludeLeaves = _leaveCheck.Checked,
+                .IncludeLifecycle = _lifecycleCheck.Checked
             }
             If _endEnabledCheck.Checked Then
                 f.EndUtc = PickerToUtc(_endPicker.Value)
@@ -752,6 +768,12 @@ Namespace GSM.Manager.UI
                 Case TimelineRow.RowKind.Chat : Return "Chat"
                 Case TimelineRow.RowKind.Join : Return "Join"
                 Case TimelineRow.RowKind.Leave : Return "Leave"
+                Case TimelineRow.RowKind.ServerStart : Return "Start"
+                Case TimelineRow.RowKind.ServerStop : Return "Stop"
+                Case TimelineRow.RowKind.ServerCrash : Return "Crash"
+                Case TimelineRow.RowKind.ServerRestart : Return "Restart"
+                Case TimelineRow.RowKind.ServerHalt : Return "Halted"
+                Case TimelineRow.RowKind.ServerAdopt : Return "Adopted"
                 Case Else : Return ""
             End Select
         End Function
@@ -762,6 +784,14 @@ Namespace GSM.Manager.UI
                     item.ForeColor = Color.DarkGreen
                 Case TimelineRow.RowKind.Leave
                     item.ForeColor = Color.DarkRed
+                Case TimelineRow.RowKind.ServerStart, TimelineRow.RowKind.ServerAdopt
+                    item.ForeColor = Color.DarkBlue
+                Case TimelineRow.RowKind.ServerStop
+                    item.ForeColor = Color.Gray
+                Case TimelineRow.RowKind.ServerCrash, TimelineRow.RowKind.ServerRestart
+                    item.ForeColor = Color.DarkOrange
+                Case TimelineRow.RowKind.ServerHalt
+                    item.ForeColor = Color.Red
                 Case TimelineRow.RowKind.Chat
                     ' Leave default — chat is the common case, no tint.
             End Select

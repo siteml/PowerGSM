@@ -32,7 +32,21 @@ manual binary copies as Phase 9 develops.
 7b/7c shim + NodeSetup co-update and the slice-8 health-gate, 8-3 shim
 rediscovery) built clean and shipped in 0.4.0. Runtime verification of the
 slice-8 auto-rollback and the 8-3 rediscovery path is deferred to a
-post-release live check. Designed/confirmed with Site 2026-06-19; all decisions
+post-release live check.
+
+**8-2 closeout (2026-08-02): DONE.** The slice-8 auto-rollback is runtime-
+verified on BOTH platforms (accidental July 2026 old-binary push + deliberate
+re-drill — per-node detail in `Phase8-2_Plan.md`'s closeout), and the
+hardening follow-ups it spawned are settled: 5a embedded `PGSMBUILD` build
+marker + Manager pick-time scan, 5b `--version` on Node/Shim/NodeSetup,
+6 update-all-components sequence (NodeSetup → Shim → Node, abort-on-failure),
+and 1 self-test-gated readiness (systemd `Type=notify` READY withheld until a
+startup self-check passes — config, DB, shim resolution, loopback
+`/api/version`); follow-ups 2–4 dropped as YAGNI. Deployment note: the
+rollback machinery is only live on a systemd node whose unit was regenerated
+post-8b-2 — REQUIRED on every existing install.
+
+Designed/confirmed with Site 2026-06-19; all decisions
 below are confirmed. **Slice 1a** (`GSM.Shim.Protocol` + `GSM.Shim` projects,
 framing, `Hello`/`HelloAck`) and **1b** (Windows native spawn via
 `CreateProcessW`/`CreatePipe`, stdout/stderr pumps, basic stop, `SpawnAck`)

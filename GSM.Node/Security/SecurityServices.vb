@@ -1,6 +1,7 @@
 Imports System
 Imports System.Collections.Concurrent
 Imports System.Collections.Generic
+Imports System.Linq
 Imports System.Security.Cryptography
 Imports System.Text
 Imports System.Threading
@@ -205,15 +206,24 @@ Namespace GSM.Node.Security
 
         Private Class IpRequestEntry
             Public Timestamps As New List(Of DateTime)
+            ' Diagnostic (2026-10-11): request path per timestamp, same
+            ' index, so a trip can report WHAT flooded, not just that
+            ' something did. Path templates only (ids collapsed) so the
+            ' histogram stays small.
+            Public Paths As New List(Of String)
+            Public LastTripLogUtc As DateTime = DateTime.MinValue
         End Class
 
         Private ReadOnly _entries As New ConcurrentDictionary(Of String, IpRequestEntry)
         Private ReadOnly _config As SecurityConfiguration
+        Private ReadOnly _logger As ILogger(Of RequestRateTracker)
         Private ReadOnly _cleanupTimer As Timer
         Private _disposed As Boolean
 
-        Public Sub New(config As SecurityConfiguration)
+        Public Sub New(config As SecurityConfiguration,
+                       logger As ILogger(Of RequestRateTracker))
             _config = config
+            _logger = logger
             _cleanupTimer = New Timer(AddressOf CleanupCallback, Nothing,
                                       TimeSpan.FromMinutes(5),
                                       TimeSpan.FromMinutes(5))
@@ -224,8 +234,12 @@ Namespace GSM.Node.Security
         ''' exceeded the configured per-minute rate. When True is
         ''' returned the request is NOT counted against the bucket
         ''' (so rejection itself doesn't extend the lockout window).
+        ''' On a trip, logs (at most once per minute per IP) a
+        ''' histogram of the request paths in the window — the limiter
+        ''' was previously silent, which hid a sustained 300+/min 429
+        ''' storm on every node for a whole day (2026-10-11).
         ''' </summary>
-        Public Function IsOverLimit(ip As String) As Boolean
+        Public Function IsOverLimit(ip As String, Optional path As String = Nothing) As Boolean
             If String.IsNullOrEmpty(ip) Then Return False
             If _config.RequestsPerMinutePerIp <= 0 Then Return False
 
@@ -233,13 +247,56 @@ Namespace GSM.Node.Security
             SyncLock entry
                 Dim now = DateTime.UtcNow
                 Dim windowStart = now.AddMinutes(-1)
-                entry.Timestamps.RemoveAll(Function(t) t < windowStart)
+                While entry.Timestamps.Count > 0 AndAlso entry.Timestamps(0) < windowStart
+                    entry.Timestamps.RemoveAt(0)
+                    entry.Paths.RemoveAt(0)
+                End While
                 If entry.Timestamps.Count >= _config.RequestsPerMinutePerIp Then
+                    If (now - entry.LastTripLogUtc).TotalSeconds >= 60 Then
+                        entry.LastTripLogUtc = now
+                        LogTrip(ip, entry, now)
+                    End If
                     Return True
                 End If
                 entry.Timestamps.Add(now)
+                entry.Paths.Add(CollapsePath(path))
                 Return False
             End SyncLock
+        End Function
+
+        Private Sub LogTrip(ip As String, entry As IpRequestEntry, now As DateTime)
+            Try
+                Dim counts As New Dictionary(Of String, Integer)(StringComparer.Ordinal)
+                For Each p In entry.Paths
+                    Dim c As Integer = 0
+                    counts.TryGetValue(p, c)
+                    counts(p) = c + 1
+                Next
+                Dim top As New List(Of String)
+                For Each kvp In counts.OrderByDescending(Function(k) k.Value).Take(6)
+                    top.Add($"{kvp.Key}={kvp.Value}")
+                Next
+                _logger?.LogWarning(
+                    "Rate limit tripped for IP {Ip}: {Count} requests in the last 60s (limit {Limit}). Top paths: {Top}",
+                    ip, entry.Timestamps.Count, _config.RequestsPerMinutePerIp, String.Join(", ", top))
+            Catch
+                ' diagnostics only
+            End Try
+        End Sub
+
+        ''' <summary>Collapse 32-hex ids and numbers so one endpoint is one bucket.</summary>
+        Private Shared Function CollapsePath(path As String) As String
+            If String.IsNullOrEmpty(path) Then Return "(none)"
+            Dim parts = path.Split("/"c)
+            For i = 0 To parts.Length - 1
+                Dim s = parts(i)
+                If s.Length = 32 AndAlso s.All(Function(ch) Uri.IsHexDigit(ch)) Then
+                    parts(i) = "{id}"
+                ElseIf s.Length > 0 AndAlso s.All(Function(ch) Char.IsDigit(ch)) Then
+                    parts(i) = "{n}"
+                End If
+            Next
+            Return String.Join("/", parts)
         End Function
 
         Private Sub CleanupCallback(state As Object)
@@ -249,7 +306,10 @@ Namespace GSM.Node.Security
                 For Each kvp In _entries.ToArray()
                     Dim entry = kvp.Value
                     SyncLock entry
-                        entry.Timestamps.RemoveAll(Function(t) t < windowStart)
+                        While entry.Timestamps.Count > 0 AndAlso entry.Timestamps(0) < windowStart
+                            entry.Timestamps.RemoveAt(0)
+                            entry.Paths.RemoveAt(0)
+                        End While
                         If entry.Timestamps.Count = 0 Then
                             Dim removed As IpRequestEntry = Nothing
                             _entries.TryRemove(kvp.Key, removed)

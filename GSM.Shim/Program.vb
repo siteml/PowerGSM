@@ -20,6 +20,20 @@ Imports GSM.Shim.Protocol
 Module Program
 
     Function Main(args As String()) As Integer
+        ' Fast path (Phase 8-2 follow-up 5b): --version prints the same
+        ' identity axes the node's /api/version reports and exits 0 before
+        ' any other work — on-box diagnostics for binaries with no
+        ' VERSIONINFO (Linux ELF). Constants come from the MSBuild-generated
+        ' build marker (follow-up 5a) + GSM.Contracts, so the printed
+        ' identity and the byte-scannable PGSMBUILD marker never drift.
+        If args IsNot Nothing AndAlso Array.IndexOf(args, "--version") >= 0 Then
+            Console.WriteLine($"{PowerGSM.BuildInfo.PgsmBuildMarker.Component} {PowerGSM.BuildInfo.PgsmBuildMarker.BuildVersion} ({PowerGSM.BuildInfo.PgsmBuildMarker.Rid})")
+            Console.WriteLine($"ProtocolVersion: {GSM.Node.Api.NodeApiContract.ProtocolVersion}")
+            Console.WriteLine($"ContractsVersion: {GSM.Node.Api.NodeApiContract.ContractsVersion}")
+            Console.WriteLine($"ShimProtocolVersion: {ProtocolConstants.ProtocolVersion}")
+            Return 0
+        End If
+
         Try
             Return MainAsync(args).GetAwaiter().GetResult()
         Catch ex As Exception
@@ -38,6 +52,10 @@ Module Program
 
         If opts.SelfTest Then
             Return Await SelfTest.RunAsync().ConfigureAwait(False)
+        End If
+
+        If opts.SelfTestConPty Then
+            Return Await SelfTest.RunConPtyAsync().ConfigureAwait(False)
         End If
 
         If String.IsNullOrEmpty(opts.Endpoint) Then
@@ -68,6 +86,7 @@ Module Program
         Console.WriteLine("Usage:")
         Console.WriteLine("  GSM.Shim --instance-id <id> --endpoint <pipe:name|unix:path>")
         Console.WriteLine("  GSM.Shim --self-test")
+        Console.WriteLine("  GSM.Shim --self-test-conpty   (Windows only)")
         Console.WriteLine($"Protocol version: {ProtocolConstants.ProtocolVersion}   Shim version: {ShimVersionInfo.Version}")
     End Sub
 
@@ -78,6 +97,7 @@ Friend NotInheritable Class ShimArgs
     Public Property InstanceId As String = ""
     Public Property Endpoint As String = ""
     Public Property SelfTest As Boolean
+    Public Property SelfTestConPty As Boolean
     Public Property ShowHelp As Boolean
 
     Public Shared Function Parse(args As String()) As ShimArgs
@@ -95,6 +115,8 @@ Friend NotInheritable Class ShimArgs
                     If i < args.Length Then r.Endpoint = args(i)
                 Case "--self-test"
                     r.SelfTest = True
+                Case "--self-test-conpty"
+                    r.SelfTestConPty = True
                 Case "--help", "-h", "/?"
                     r.ShowHelp = True
                 Case Else

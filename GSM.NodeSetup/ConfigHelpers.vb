@@ -137,6 +137,149 @@ Public Module ConfigHelpers
         Return Nothing
     End Function
 
+    ' ---- Transport (HTTPS_SinglePort_Plan slice 2) ----
+
+    Public ReadOnly HttpModes As String() = {"Disabled", "LoopbackOnly", "Open"}
+
+    ''' <summary>
+    ''' Canonical casing for an HttpMode string ("disabled" → "Disabled");
+    ''' Nothing when it isn't one of the three modes.
+    ''' </summary>
+    Public Function NormalizeHttpMode(mode As String) As String
+        If String.IsNullOrWhiteSpace(mode) Then Return Nothing
+        For Each m In HttpModes
+            If String.Equals(m, mode.Trim(), StringComparison.OrdinalIgnoreCase) Then Return m
+        Next
+        Select Case mode.Trim().ToLowerInvariant()
+            Case "none", "off", "no" : Return "Disabled"
+            Case "localhost", "loopback", "local" : Return "LoopbackOnly"
+            Case "all", "yes", "on" : Return "Open"
+        End Select
+        Return Nothing
+    End Function
+
+    Public Function ValidateHttpMode(mode As String) As String
+        If NormalizeHttpMode(mode) Is Nothing Then
+            Return "Plain HTTP must be one of: Disabled, LoopbackOnly, Open."
+        End If
+        Return Nothing
+    End Function
+
+    ''' <summary>
+    ''' TLS port: 0 = share the listen port (single-port, the default);
+    ''' otherwise a valid port. Equal to the listen port is accepted and
+    ''' normalised to 0 by the caller.
+    ''' </summary>
+    Public Function ValidateTlsPort(tlsPort As Integer, listenPort As Integer) As String
+        If tlsPort = 0 Then Return Nothing
+        If tlsPort < 1 OrElse tlsPort > 65535 Then
+            Return "HTTPS port must be 0 (same as the listen port) or between 1 and 65535."
+        End If
+        If tlsPort = listenPort Then Return Nothing
+        If tlsPort < 1024 Then
+            Return "Warning: ports below 1024 typically require root/administrator privileges."
+        End If
+        Return Nothing
+    End Function
+
+    ''' <summary>
+    ''' Applies the transport invariants before save: TlsPort equal to
+    ''' ListenPort collapses to 0 (shared port); HttpMode is canonical-
+    ''' cased; without HTTPS, HttpMode falls back to Open (the node would
+    ''' coerce it anyway, and "Disabled" with no HTTPS = unreachable).
+    ''' </summary>
+    Public Sub NormalizeTransport(node As NodeSection)
+        If node Is Nothing Then Return
+        If node.TlsPort = node.ListenPort Then node.TlsPort = 0
+        If node.TlsPort < 0 Then node.TlsPort = 0
+        Dim mode = NormalizeHttpMode(node.HttpMode)
+        If mode Is Nothing Then mode = "Open"
+        If Not node.EnableTls AndAlso mode = "Disabled" Then mode = "Open"
+        node.HttpMode = mode
+    End Sub
+
+    ''' <summary>
+    ''' The node rebases a relative DataDirectory against its own
+    ''' AppContext.BaseDirectory (NodeConfiguration); mirror that here so
+    ''' the cert lands where the node will look, not under setup's cwd.
+    ''' </summary>
+    Public Function ResolveDataDirectory(cfg As NodeSetupConfig) As String
+        Dim d = If(cfg?.Node?.DataDirectory, "")
+        If String.IsNullOrWhiteSpace(d) Then d = NodeSection.DefaultDataDirectory()
+        If Not Path.IsPathRooted(d) Then d = Path.Combine(AppContext.BaseDirectory, d)
+        Return Path.GetFullPath(d)
+    End Function
+
+    ''' <summary>
+    ''' Mints (or loads) the node's self-signed certificate using the SAME
+    ''' service the node runs, so the fingerprint printed here is the one
+    ''' the Manager will pin. Returns the bare-hex SHA-256 fingerprint, or
+    ''' Nothing with <paramref name="errorMessage"/> set on failure. Never
+    ''' throws.
+    ''' </summary>
+    Public Function EnsureTlsCertificate(cfg As NodeSetupConfig, ByRef errorMessage As String) As String
+        errorMessage = Nothing
+        Try
+            Dim svc As New GSM.Node.Security.TlsCertificateService(ResolveDataDirectory(cfg))
+            Dim cert = svc.GetOrCreateCertificate(cfg.Node.NodeId)
+            Return GSM.Node.Security.TlsCertificateService.FingerprintSha256(cert)
+        Catch ex As Exception
+            errorMessage = ex.Message
+            Return Nothing
+        End Try
+    End Function
+
+    ''' <summary>Fingerprint of the cert already on disk, or Nothing if none.</summary>
+    Public Function ReadTlsFingerprint(cfg As NodeSetupConfig) As String
+        Try
+            Dim svc As New GSM.Node.Security.TlsCertificateService(ResolveDataDirectory(cfg))
+            Return svc.TryReadPersistedFingerprint()
+        Catch
+            Return Nothing
+        End Try
+    End Function
+
+    ''' <summary>Deletes and re-mints the cert. Returns the new fingerprint or Nothing (+ error).</summary>
+    Public Function RegenerateTlsCertificate(cfg As NodeSetupConfig, ByRef errorMessage As String) As String
+        errorMessage = Nothing
+        Try
+            Dim svc As New GSM.Node.Security.TlsCertificateService(ResolveDataDirectory(cfg))
+            Dim cert = svc.RegenerateCertificate(cfg.Node.NodeId)
+            Return GSM.Node.Security.TlsCertificateService.FingerprintSha256(cert)
+        Catch ex As Exception
+            errorMessage = ex.Message
+            Return Nothing
+        End Try
+    End Function
+
+    ''' <summary>
+    ''' The "paste into the Manager" block printed after a save / auto-init:
+    ''' token, fingerprint (when HTTPS is on) and the URL shape.
+    ''' </summary>
+    Public Function BuildManagerHandoffLines(cfg As NodeSetupConfig, fingerprint As String) As String()
+        Dim lines As New System.Collections.Generic.List(Of String)
+        lines.Add("Auth token:                 " & cfg.Node.AuthToken)
+        If cfg.Node.EnableTls Then
+            If Not String.IsNullOrEmpty(fingerprint) Then
+                lines.Add("TLS fingerprint (SHA-256):  " & fingerprint)
+                lines.Add("                            (paste into Manager -> Add Node -> Cert SHA-256)")
+            Else
+                lines.Add("TLS fingerprint (SHA-256):  (not available - see error above)")
+            End If
+            Dim tlsPort = If(cfg.Node.TlsPort > 0, cfg.Node.TlsPort, cfg.Node.ListenPort)
+            Dim plain As String
+            Select Case NormalizeHttpMode(cfg.Node.HttpMode)
+                Case "Disabled" : plain = "disabled"
+                Case "LoopbackOnly" : plain = "localhost only"
+                Case Else : plain = "open on port " & cfg.Node.ListenPort
+            End Select
+            lines.Add($"Listens on:                 https://<host>:{tlsPort}  (plain HTTP: {plain})")
+        Else
+            lines.Add($"Listens on:                 http://<host>:{cfg.Node.ListenPort}  (HTTPS off - use 'Secure this node' in the Manager later)")
+        End If
+        Return lines.ToArray()
+    End Function
+
     ''' <summary>
     ''' True when the running process is on Windows. Centralized so we
     ''' do not scatter OperatingSystem.IsWindows() checks throughout

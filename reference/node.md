@@ -1536,3 +1536,107 @@ mirror, tailer cursors — which the Manager re-pushes and the sweep rediscovers
 pass finds nothing, and the sweep re-adopts the live shims straight from the OS
 namespace. Net result of the whole phase: **a lost or corrupt `node.db` resets
 quietly and orphans nothing.**
+
+---
+
+## HTTPS transport, single port (0.7.0 — live since the 0.6.x interim builds, Oct 2026)
+
+Design + slice status: `docs/plans/HTTPS_SinglePort_Plan.md`. Current state:
+
+- **One listener.** `NodeProgram` binds `ListenPort` once; when `EnableTls`
+  is set and no explicit alternate `TlsPort`, `TlsSniffConnectionMiddleware`
+  (`Security\TlsSniffMiddleware.vb`) peeks byte 1: `0x16` → `SslStream` with
+  the node cert and `ITlsConnectionFeature` set (so `Request.IsHttps` is
+  truthful); anything else → plaintext per `HttpMode` (`Open` / `LoopbackOnly`
+  / `Disabled` = socket aborted before a byte is parsed). An explicit
+  `TlsPort ≠ ListenPort` keeps the legacy two-listener layout. `EnsureDefaults`
+  normalises `TlsPort = ListenPort` to 0 (`UsesSinglePort`).
+- **Certificate.** `TlsCertificateService` lives in **GSM.Contracts** since
+  slice 2 (0.6.6; namespace still `GSM.Node.Security`, logging via two
+  optional callbacks because Contracts is dependency-free) so NodeSetup
+  mints the very same cert at setup time and prints its fingerprint next to
+  the token (console wizard "Transport" step, GUI "Transport" tab, menu
+  9/10, `--auto-init --tls` default). It mints a 10-year self-signed ECDSA
+  cert into `<DataDirectory>\tls\node.pfx` + `.pwd` on first use (a
+  relative DataDirectory is rebased to the exe folder on both sides). Windows: imported
+  `MachineKeySet | PersistKeySet` (SChannel refuses ephemeral keys), falling
+  back to `UserKeySet`. The cert never changes across restarts unless the pfx
+  is missing/unloadable/expiring — a "mismatch" seen during an enable is far
+  more likely the Manager probing the old plaintext process mid-restart
+  (fixed Manager-side 0.6.3).
+- **Endpoints** (all authenticated except `/api/version`):
+  `GET /api/tls/status` (`TlsEnabled`, `TlsPort`, `SinglePort`, fingerprint,
+  `HttpMode`); `POST /api/tls/enable` (`TlsPort` 0 = shared; **while already
+  enabled, a different effective port = port move**, same cert, persist,
+  restart; same port = 409 `TlsAlreadyEnabled`); `POST /api/tls/http-mode`
+  (`Disabled` requires `EnableTls`; persists, restarts); `POST
+  /api/auth/rotate` (**HTTPS-only, 403 on plaintext**; Manager-generated
+  token, ≥32 chars; checks the restart vehicle first, then
+  `NodeSettingsFile.WriteAuthToken`, restarts — old token valid until then).
+- **Config writes** go through `NodeSettingsFile` (read-modify-write of
+  `nodesettings.json` as a `JsonNode` tree, temp + replace): `WriteTlsSettings`,
+  `WriteHttpMode`, `WriteAuthToken`. `NodeConfiguration` is bound once at
+  startup, so every one of these is followed by a restart.
+- **Restart vehicle** = `SelfUpdateService.RequestRestart()` (systemd: exit
+  non-zero for `Restart=on-failure`; else NodeSetup survivor
+  `--apply-update --wait-pid` which relaunches via `sc start` or directly).
+  `ScheduleStop` only fires after `RequestRestart` succeeds, so a node with no
+  survivor refuses the change (409) rather than going down.
+- **Survivor health gate** (`NodeSetup SelfUpdateApply.WaitForHealthy`) polls
+  `/api/version` on loopback over **both** http and https (cert check off)
+  — an HTTP-only probe against a `Disabled` node timed out and rolled a good
+  update back (0.6.5 fix).
+- **Rate limiter / auth lockout:** `AuthFailureTracker` locks an IP for 15 min
+  after 10 failed auths in 5 min → every request from it is **429** (not
+  401). A Manager holding a stale token (e.g. a long-lived client captured
+  before a rotation) produces exactly this; `RequestRateTracker` now logs
+  once/min/IP what tripped it with top paths.
+
+## Process control (0.6.3+)
+
+- `POST /api/system/restart` — `RequestRestart` + `ScheduleStop`; 409 if no
+  survivor. Shims detach and are re-adopted by the new process.
+- `POST /api/system/shutdown` — `ScheduleStop` only: exit 0, **no relaunch**
+  (systemd `on-failure` does not fire; SCM sees a clean stop). The node stays
+  down until started on its machine.
+- **Console preservation:** a hand-launched node passes `--console` to the
+  survivor when `GetConsoleWindow() ≠ 0`; `LaunchDirect` then starts the
+  relaunched node with `UseShellExecute=True` so it gets a window instead of
+  going headless (which left no way to stop it but Task Manager).
+- Not possible by design: promoting a user-mode node to a service remotely
+  — needs an elevation consent on the node box.
+
+## Fresh install set
+
+`GSM.Node.exe` is a self-contained single-file bundle **but natives stay
+loose**: `e_sqlite3.dll` must be beside it or the node dies in
+`NodeDatabase.EnsureCreated` before any log exists. A new box needs Node,
+NodeSetup, `e_sqlite3.dll`, `GSM.Shim\<version>\GSM.Shim.exe`,
+`GSM.CtrlCSender.exe` (Windows) and `nodesettings.json` — collected by the
+`node-fresh-<rid>` drop folder (see `build-and-project.md`). Run NodeSetup
+first: `nodesettings.json` is loaded `optional:=False` before file logging.
+
+## InstanceSnapshots persistence (what survives a node restart)
+
+`InstanceSnapshots` carries the recovery payload for boot-resurrect, park /
+autostart and shim re-adoption. As of 2026-10-11 it persists
+`EnvironmentVarsJson` (plugin env such as Stardew's `GALLIUM_DRIVER`; missing
+it put the game on the Basic Render Driver and killed it on every resurrect).
+Same day (0.6.6): `CrashCountResetAfterSeconds`, `MinRestartDelayMs` and
+the new `BootStartDelaySeconds` are columns too (migration defaults
+300 / 0 / 0; pre-existing rows refresh on the next Manager-driven Start).
+All three round-trip through `FinalizeStart`, `ParkInstance`, both adoption
+paths and `BuildResurrectionRequest`. `RconPort` / `RconPassword` /
+`RconProtocol` are deliberately **not** persisted: the node never reads them
+from `StartInstanceRequest` — the Manager drives `/rcon/connect` with its
+own values. Crash-restart is unaffected by any of this (it reuses the live
+`StartInfo`).
+
+**Boot stagger.** `StartBootResurrection` sorts the pending rows by
+`BootStartDelaySeconds` ascending; `ResurrectPassAsync` records the pass
+start time and, before each row, waits until that row's offset has elapsed
+(delays are absolute offsets from the pass, not gaps between launches). The
+wait happens *before* the dedup check so a Manager start arriving during
+the wait still wins. `POST /boot-flags` accepts an optional
+`BootStartDelaySeconds` (Nothing = unchanged) so an Edit Instance save
+updates the parked/live row without a start/stop cycle.

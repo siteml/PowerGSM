@@ -50,6 +50,17 @@ Namespace GSM.Manager.Core
         Public Property IncludeLeaves As Boolean = True
 
         ''' <summary>
+        ''' Include server lifecycle rows (start/stop/crash/
+        ''' restart/halt/adopt — synced from the node's event
+        ''' stream into PlayerActivity with the "(server)" player
+        ''' marker). Default FALSE on purpose: every pre-existing
+        ''' consumer (Discord /lastseen + roster, snapshot replay)
+        ''' is player-centric and must not suddenly see non-player
+        ''' rows; the History window opts in explicitly.
+        ''' </summary>
+        Public Property IncludeLifecycle As Boolean = False
+
+        ''' <summary>
         ''' Convenience: True when EndUtc is null → caller wants
         ''' snapshot-at-instant semantics, not a range query.
         ''' </summary>
@@ -70,6 +81,17 @@ Namespace GSM.Manager.Core
             Chat
             Join
             Leave
+            ' Lifecycle kinds (appended — EventStream follow-up:
+            ' crash/restart/halt/start rows in the History
+            ' timeline). One member per PlayerActivity lifecycle
+            ' EventKind so the renderers can label/color without
+            ' re-parsing strings.
+            ServerStart
+            ServerStop
+            ServerCrash
+            ServerRestart
+            ServerHalt
+            ServerAdopt
         End Enum
 
         Public Property Kind As RowKind
@@ -308,6 +330,28 @@ Namespace GSM.Manager.Core
         ' filters is the user's responsibility past this.
         Public Const TimelineRowLimit As Integer = 5000
 
+        ''' <summary>PlayerActivity.EventKind values that are
+        ''' server lifecycle rows (written by the stream sync with
+        ''' the "(server)" player marker) rather than player
+        ''' activity. Must stay in step with
+        ''' InstanceManager.LifecycleActivityKind.</summary>
+        Public Shared ReadOnly LifecycleEventKinds As String() =
+            {"start", "stop", "crash", "restart", "halt", "adopt"}
+
+        ''' <summary>RowKind for a lifecycle EventKind string;
+        ''' Nothing for join/leave/anything else.</summary>
+        Private Shared Function MapLifecycleRowKind(eventKind As String) As TimelineRow.RowKind?
+            Select Case eventKind
+                Case "start" : Return TimelineRow.RowKind.ServerStart
+                Case "stop" : Return TimelineRow.RowKind.ServerStop
+                Case "crash" : Return TimelineRow.RowKind.ServerCrash
+                Case "restart" : Return TimelineRow.RowKind.ServerRestart
+                Case "halt" : Return TimelineRow.RowKind.ServerHalt
+                Case "adopt" : Return TimelineRow.RowKind.ServerAdopt
+                Case Else : Return Nothing
+            End Select
+        End Function
+
         Public Sub New(serviceProvider As IServiceProvider,
                        logger As ILogger(Of HistoryQueryService))
             _serviceProvider = serviceProvider
@@ -479,7 +523,11 @@ Namespace GSM.Manager.Core
                     chatQ = chatQ.Where(Function(c) c.SessionIdentity = sessionIdentity)
                 End If
 
+                ' "(server)" marker rows (lifecycle) are not players
+                ' — keep them out of the name dropdown.
+                Dim serverMarker = InstanceManager.ServerActivityMarker
                 Dim fromActivity = activityQ.
+                    Where(Function(a) a.PlayerName <> serverMarker).
                     Select(Function(a) a.PlayerName).Distinct().ToList()
                 Dim fromChat = chatQ.
                     Where(Function(c) c.DisplayName IsNot Nothing).
@@ -601,7 +649,7 @@ Namespace GSM.Manager.Core
                 End If
 
                 ' ---- Activity slice ----
-                If filter.IncludeJoins OrElse filter.IncludeLeaves Then
+                If filter.IncludeJoins OrElse filter.IncludeLeaves OrElse filter.IncludeLifecycle Then
                     token.ThrowIfCancellationRequested()
                     ' Phase 5g-2d Round 3c — render-time identity
                     ' enrichment source. Singleton; GetService is
@@ -612,12 +660,16 @@ Namespace GSM.Manager.Core
                         Where(Function(a) a.TimestampUtc >= filter.StartUtc AndAlso
                                            a.TimestampUtc <= endUtc)
 
-                    If Not filter.IncludeJoins Then
-                        q = q.Where(Function(a) a.EventKind <> "join")
-                    End If
-                    If Not filter.IncludeLeaves Then
-                        q = q.Where(Function(a) a.EventKind <> "leave")
-                    End If
+                    ' Allowed-kinds list (translates to SQL IN).
+                    ' Explicit whitelist rather than the old
+                    ' exclusion filters: PlayerActivity now carries
+                    ' lifecycle kinds too, and a consumer that asked
+                    ' for joins+leaves must not receive them.
+                    Dim allowedKinds As New List(Of String)
+                    If filter.IncludeJoins Then allowedKinds.Add("join")
+                    If filter.IncludeLeaves Then allowedKinds.Add("leave")
+                    If filter.IncludeLifecycle Then allowedKinds.AddRange(LifecycleEventKinds)
+                    q = q.Where(Function(a) allowedKinds.Contains(a.EventKind))
                     If Not String.IsNullOrEmpty(filter.SessionIdentity) Then
                         q = q.Where(Function(a) a.SessionIdentity = filter.SessionIdentity)
                     End If
@@ -648,6 +700,29 @@ Namespace GSM.Manager.Core
                         New List(Of (Row As TimelineRow, SessionIdentity As String, PlatformUserId As String))
 
                     For Each r In actRows
+                        ' Lifecycle rows render as server events:
+                        ' the detail string (stored in DisplayName
+                        ' at write time) becomes the message text,
+                        ' and none of the player-identity machinery
+                        ' below applies.
+                        Dim lifecycleRowKind = MapLifecycleRowKind(r.EventKind)
+                        If lifecycleRowKind.HasValue Then
+                            merged.Add(New TimelineRow With {
+                                .Kind = lifecycleRowKind.Value,
+                                .TimestampUtc = r.TimestampUtc,
+                                .SessionIdentity = r.SessionIdentity,
+                                .TileDisplayName = ResolveDisplayName(tileNames, r.SessionIdentity),
+                                .InstanceId = r.InstanceId,
+                                .PlayerName = r.PlayerName,
+                                .PlatformUserId = Nothing,
+                                .CharacterId = Nothing,
+                                .CharacterName = Nothing,
+                                .PlatformPersona = Nothing,
+                                .Text = r.DisplayName
+                            })
+                            Continue For
+                        End If
+
                         Dim row = New TimelineRow With {
                             .Kind = If(r.EventKind = "join",
                                         TimelineRow.RowKind.Join,

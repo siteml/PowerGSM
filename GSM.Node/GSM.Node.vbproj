@@ -113,7 +113,21 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="8.0.0" />
     <PackageReference Include="Microsoft.Win32.Registry" Version="5.0.0" />
-    <PackageReference Include="SharpCompress" Version="0.36.0" />
+    <!--
+      NU1902 suppressed deliberately, not ignored: the advisory
+      (GHSA-6c8g-7p36-r338 / CVE-2026-44788, zip-slip via directory
+      entries in WriteToDirectory) affects ALL SharpCompress
+      releases up to and including the latest (<= 0.47.4) and has
+      NO patched version as of 2026-08 — so bumping the version
+      cannot clear it. Mitigated in our code instead:
+      InstallRunner.IsUnsafeEntryKey rejects rooted / ".." entry
+      paths in both SharpCompress extraction branches (the zip
+      branch already had an explicit zip-slip guard), and archives
+      only ever come from plugin-declared vendor URLs. Re-check for
+      a patched release when bumping dependencies, then drop this
+      NoWarn.
+    -->
+    <PackageReference Include="SharpCompress" Version="0.36.0" NoWarn="NU1902" />
   </ItemGroup>
 
   <ItemGroup>
@@ -274,6 +288,12 @@
       <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.pdb" />
       <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.Protocol.dll" />
       <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Shim.Protocol.pdb" />
+      <!-- GSM.Contracts rides along since the shim references it for the
+           version-flag constants (8-2 follow-up 5b); a framework-dependent
+           shim launch resolves deps.json against the same folder, so the
+           DLL must be present even though the constants are inlined. -->
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Contracts.dll" />
+      <_ShimBuildOutput Include="..\GSM.Shim\bin\$(Configuration)\net8.0\GSM.Contracts.pdb" />
     </ItemGroup>
     <Copy SourceFiles="@(_ShimBuildOutput)"
           DestinationFolder="$(OutDir)GSM.Shim\$(Version)"

@@ -48,13 +48,31 @@ Namespace GSM.Manager.Core
         Private _cachedVersion As NodeVersionResponse
         Private ReadOnly _versionLock As New Object()
 
+        ' ---- TLS (0.7.0) ----
+        ' When _useTls, every HttpClient this class creates (the shared
+        ' one AND every one-shot: staged-binary push, file upload, map
+        ' gen) is built over a handler whose server-certificate callback
+        ' compares the presented cert's SHA-256 fingerprint against the
+        ' pinned value — chain and hostname are deliberately ignored;
+        ' the pin IS the trust anchor (TOFU, like SSH host keys).
+        Private ReadOnly _useTls As Boolean
+        Private ReadOnly _pinnedFingerprintBytes As Byte()
+
         Public Sub New(hostAddress As String, port As Integer,
                        authToken As String,
-                       logger As ILogger(Of NodeHttpClient))
-            _baseUrl = $"http://{hostAddress}:{port}"
+                       logger As ILogger(Of NodeHttpClient),
+                       Optional useTls As Boolean = False,
+                       Optional pinnedCertFingerprint As String = Nothing)
+            _useTls = useTls AndAlso Not String.IsNullOrWhiteSpace(pinnedCertFingerprint)
+            If _useTls Then
+                _pinnedFingerprintBytes = Convert.FromHexString(pinnedCertFingerprint.Trim())
+                _baseUrl = $"https://{hostAddress}:{port}"
+            Else
+                _baseUrl = $"http://{hostAddress}:{port}"
+            End If
             _logger = logger
 
-            _httpClient = New HttpClient()
+            _httpClient = New HttpClient(CreateHandler(), disposeHandler:=True)
             _httpClient.BaseAddress = New Uri(_baseUrl)
             _httpClient.Timeout = TimeSpan.FromSeconds(30)
             If Not String.IsNullOrEmpty(authToken) Then
@@ -62,6 +80,69 @@ Namespace GSM.Manager.Core
                     New System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", authToken)
             End If
         End Sub
+
+        ' Set (1) by the pin callback when it REJECTS a presented cert;
+        ' consumed (reset to 0) by WrapException. Distinguishes a genuine
+        ' fingerprint mismatch from every other AuthenticationException
+        ' the TLS stack raises — above all "unexpected packet format",
+        ' which is what dialling HTTPS at a listener that is still (or
+        ' only) speaking plaintext throws. Found live 2026-10-10: every
+        ' fresh enable reported a false MISMATCH because the pinned
+        ' verify probe hit the old plaintext process during the ~30 s
+        ' restart gap, and VerifyAndActivateAsync aborted on it as a MITM.
+        Private _pinRejected As Integer = 0
+
+        ''' <summary>
+        ''' Single source of truth for transport-level trust. EVERY
+        ''' HttpClient created by this class must be built over this
+        ''' handler — a missed call site would fail only against TLS
+        ''' nodes and only on that feature's path.
+        ''' </summary>
+        Private Function CreateHandler() As HttpClientHandler
+            Dim handler As New HttpClientHandler()
+            If _useTls Then
+                handler.ServerCertificateCustomValidationCallback =
+                    Function(request, cert, chain, errors)
+                        If cert Is Nothing Then Return False
+                        Dim presented = cert.GetCertHash(Security.Cryptography.HashAlgorithmName.SHA256)
+                        Dim ok = Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                            presented, _pinnedFingerprintBytes)
+                        If Not ok Then
+                            ' Mark BEFORE logging: WrapException reads this to tell a
+                            ' real pin rejection from any other TLS handshake failure.
+                            Threading.Interlocked.Exchange(_pinRejected, 1)
+                            _logger.LogError(
+                                "Certificate PIN MISMATCH for {BaseUrl}: presented {Presented}. " &
+                                "Connection refused — possible MITM or node cert regeneration.",
+                                _baseUrl, Convert.ToHexString(presented).ToLowerInvariant())
+                        End If
+                        Return ok
+                    End Function
+            End If
+            Return handler
+        End Function
+
+        ''' <summary>
+        ''' One-shot client for long-running transfers (infinite timeout,
+        ''' same base address, auth header, and — critically — the same
+        ''' pinned-TLS handler as the shared client).
+        ''' </summary>
+        Private Function CreateOneShotClient() As HttpClient
+            Dim c As New HttpClient(CreateHandler(), disposeHandler:=True)
+            c.BaseAddress = _httpClient.BaseAddress
+            c.Timeout = Timeout.InfiniteTimeSpan
+            If _httpClient.DefaultRequestHeaders.Authorization IsNot Nothing Then
+                c.DefaultRequestHeaders.Authorization = _httpClient.DefaultRequestHeaders.Authorization
+            End If
+            Return c
+        End Function
+
+        ''' <summary>True when this client is talking pinned HTTPS.</summary>
+        Public ReadOnly Property IsTls As Boolean
+            Get
+                Return _useTls
+            End Get
+        End Property
 
         ' ---- Node ----
 
@@ -211,12 +292,7 @@ Namespace GSM.Manager.Core
             Dim totalBytes As Long = New FileInfo(localFilePath).Length
             Dim sha As String = Await ComputeFileSha256Async(localFilePath, cancellation)
 
-            Using pushClient As New HttpClient()
-                pushClient.BaseAddress = _httpClient.BaseAddress
-                pushClient.Timeout = Timeout.InfiniteTimeSpan
-                If _httpClient.DefaultRequestHeaders.Authorization IsNot Nothing Then
-                    pushClient.DefaultRequestHeaders.Authorization = _httpClient.DefaultRequestHeaders.Authorization
-                End If
+            Using pushClient As HttpClient = CreateOneShotClient()
 
                 Try
                     ' --- begin ---
@@ -451,6 +527,157 @@ Namespace GSM.Manager.Core
             End Try
         End Function
 
+        Public Async Function UpdateBootFlagsAsync(instanceId As String,
+                                                    request As BootFlagsRequest,
+                                                    cancellation As CancellationToken) As Task(Of BootFlagsResponse) Implements INodeClient.UpdateBootFlagsAsync
+            ' Older nodes 404 here — WrapException turns that into a
+            ' NodeApiException(StatusCode=NotFound) the caller catches
+            ' and treats as "flags apply from the next start".
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/boot-flags"
+                Dim resp = Await _httpClient.PostAsJsonAsync(url, request, cancellation)
+                resp.EnsureSuccessStatusCode()
+                Return Await resp.Content.ReadFromJsonAsync(Of BootFlagsResponse)(cancellationToken:=cancellation)
+            Catch ex As Exception
+                Throw WrapException("UpdateBootFlags", ex)
+            End Try
+        End Function
+
+        Public Async Function ForgetInstanceAsync(instanceId As String,
+                                                   cancellation As CancellationToken) As Task(Of ForgetInstanceResponse) Implements INodeClient.ForgetInstanceAsync
+            ' 409 Conflict carries a ForgetInstanceResponse body with
+            ' Refused=True — surface it as a value, not an exception,
+            ' so the delete flow can tell "stop it first" apart from
+            ' "node unreachable". Other failures (incl. 404 on older
+            ' nodes) wrap as usual.
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/forget"
+                Dim resp = Await _httpClient.PostAsync(url, Nothing, cancellation)
+                If resp.StatusCode = HttpStatusCode.Conflict Then
+                    Dim refused = Await resp.Content.ReadFromJsonAsync(Of ForgetInstanceResponse)(cancellationToken:=cancellation)
+                    If refused Is Nothing Then
+                        refused = New ForgetInstanceResponse With {
+                            .Removed = False, .Refused = True,
+                            .Message = "Instance is running on the node"
+                        }
+                    End If
+                    Return refused
+                End If
+                resp.EnsureSuccessStatusCode()
+                Return Await resp.Content.ReadFromJsonAsync(Of ForgetInstanceResponse)(cancellationToken:=cancellation)
+            Catch ex As Exception
+                Throw WrapException("ForgetInstance", ex)
+            End Try
+        End Function
+
+        Public Async Function ParkInstanceAsync(request As StartInstanceRequest,
+                                                 cancellation As CancellationToken) As Task(Of ParkInstanceResponse) Implements INodeClient.ParkInstanceAsync
+            ' 409 = the node tracks the instance as running (flags go
+            ' through /boot-flags there) — surfaced as a value. 404 on
+            ' older nodes wraps as NodeApiException(NotFound) for the
+            ' caller's fall-back-to-next-start handling.
+            Try
+                Dim resp = Await _httpClient.PostAsJsonAsync("/api/instances/park", request, cancellation)
+                If resp.StatusCode = HttpStatusCode.Conflict Then
+                    Dim refused = Await resp.Content.ReadFromJsonAsync(Of ParkInstanceResponse)(cancellationToken:=cancellation)
+                    If refused Is Nothing Then
+                        refused = New ParkInstanceResponse With {
+                            .Parked = False, .Refused = True,
+                            .Message = "Instance is running on the node"
+                        }
+                    End If
+                    Return refused
+                End If
+                resp.EnsureSuccessStatusCode()
+                Return Await resp.Content.ReadFromJsonAsync(Of ParkInstanceResponse)(cancellationToken:=cancellation)
+            Catch ex As Exception
+                Throw WrapException("ParkInstance", ex)
+            End Try
+        End Function
+
+        Public Async Function GetEventSourceDiagnosticsAsync(instanceId As String,
+                                                              cancellation As CancellationToken) As Task(Of IReadOnlyList(Of EventSourceDiagnostics)) Implements INodeClient.GetEventSourceDiagnosticsAsync
+            ' Diagnostics window plumbing (2026-08-14). 404 on
+            ' pre-stream nodes wraps as NodeApiException(NotFound);
+            ' the caller renders "not supported by this node".
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/events/sources"
+                Dim result = Await _httpClient.GetFromJsonAsync(Of List(Of EventSourceDiagnostics))(url, cancellation)
+                Return If(result, New List(Of EventSourceDiagnostics))
+            Catch ex As Exception
+                Throw WrapException("GetEventSourceDiagnostics", ex)
+            End Try
+        End Function
+
+        ' ---- Diagnostics Wave 2 (2026-08-15). All 404 on older
+        '      nodes → NodeApiException(NotFound) → the Diagnostics
+        '      window renders "not supported by this node". ----
+
+        Public Async Function GetEventWatermarksAsync(instanceId As String,
+                                                       cancellation As CancellationToken) As Task(Of EventWatermarkDiagnosticsResponse) Implements INodeClient.GetEventWatermarksAsync
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/events/watermarks"
+                Return Await _httpClient.GetFromJsonAsync(Of EventWatermarkDiagnosticsResponse)(url, cancellation)
+            Catch ex As Exception
+                Throw WrapException("GetEventWatermarks", ex)
+            End Try
+        End Function
+
+        Public Async Function GetParseTraceAsync(instanceId As String,
+                                                  cancellation As CancellationToken) As Task(Of ParseTraceResponse) Implements INodeClient.GetParseTraceAsync
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/events/parsetrace"
+                Return Await _httpClient.GetFromJsonAsync(Of ParseTraceResponse)(url, cancellation)
+            Catch ex As Exception
+                Throw WrapException("GetParseTrace", ex)
+            End Try
+        End Function
+
+        Public Async Function RearmParseTraceAsync(instanceId As String,
+                                                    cancellation As CancellationToken) As Task(Of ParseTraceResponse) Implements INodeClient.RearmParseTraceAsync
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/events/parsetrace/rearm"
+                Dim resp = Await _httpClient.PostAsync(url, Nothing, cancellation)
+                resp.EnsureSuccessStatusCode()
+                Return Await resp.Content.ReadFromJsonAsync(Of ParseTraceResponse)(cancellationToken:=cancellation)
+            Catch ex As Exception
+                Throw WrapException("RearmParseTrace", ex)
+            End Try
+        End Function
+
+        Public Async Function TestParseLineAsync(instanceId As String,
+                                                  request As RuleDryRunRequest,
+                                                  cancellation As CancellationToken) As Task(Of RuleDryRunResponse) Implements INodeClient.TestParseLineAsync
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/events/test-line"
+                Dim resp = Await _httpClient.PostAsJsonAsync(url, request, cancellation)
+                resp.EnsureSuccessStatusCode()
+                Return Await resp.Content.ReadFromJsonAsync(Of RuleDryRunResponse)(cancellationToken:=cancellation)
+            Catch ex As Exception
+                Throw WrapException("TestParseLine", ex)
+            End Try
+        End Function
+
+        Public Async Function GetBootStateAsync(instanceId As String,
+                                                 cancellation As CancellationToken) As Task(Of BootStateResponse) Implements INodeClient.GetBootStateAsync
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/boot-state"
+                Return Await _httpClient.GetFromJsonAsync(Of BootStateResponse)(url, cancellation)
+            Catch ex As Exception
+                Throw WrapException("GetBootState", ex)
+            End Try
+        End Function
+
+        Public Async Function GetShimStateAsync(instanceId As String,
+                                                 cancellation As CancellationToken) As Task(Of ShimStateResponse) Implements INodeClient.GetShimStateAsync
+            Try
+                Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/shim-state"
+                Return Await _httpClient.GetFromJsonAsync(Of ShimStateResponse)(url, cancellation)
+            Catch ex As Exception
+                Throw WrapException("GetShimState", ex)
+            End Try
+        End Function
+
         ' ---- Installation ----
 
         Public Async Function StartInstallAsync(request As InstallRequest,
@@ -639,13 +866,7 @@ Namespace GSM.Manager.Core
             ' The cost is one extra TCP/TLS handshake per upload —
             ' negligible compared to file-transfer time at the sizes
             ' that motivated this design.
-            Using uploadClient As New HttpClient()
-                uploadClient.BaseAddress = _httpClient.BaseAddress
-                uploadClient.Timeout = System.Threading.Timeout.InfiniteTimeSpan
-                Dim authHeader = _httpClient.DefaultRequestHeaders.Authorization
-                If authHeader IsNot Nothing Then
-                    uploadClient.DefaultRequestHeaders.Authorization = authHeader
-                End If
+            Using uploadClient As HttpClient = CreateOneShotClient()
 
                 Try
                     Dim qs = BuildFilesQueryString(installPath, path, allowedRoots, allowedExtensions)
@@ -763,14 +984,7 @@ Namespace GSM.Manager.Core
             ' bounded only by the caller's CancellationToken.
             Dim oneShot As HttpClient = Nothing
             Try
-                oneShot = New HttpClient() With {
-                    .BaseAddress = _httpClient.BaseAddress,
-                    .Timeout = Timeout.InfiniteTimeSpan
-                }
-                If _httpClient.DefaultRequestHeaders.Authorization IsNot Nothing Then
-                    oneShot.DefaultRequestHeaders.Authorization =
-                        _httpClient.DefaultRequestHeaders.Authorization
-                End If
+                oneShot = CreateOneShotClient()
 
                 Dim url = $"/api/instances/{Uri.EscapeDataString(instanceId)}/generate-map"
                 Using resp = Await oneShot.PostAsJsonAsync(url, request, cancellation)
@@ -834,6 +1048,146 @@ Namespace GSM.Manager.Core
             End Try
         End Function
 
+        ' ---- Event stream (EventStream Slice 3) ----
+
+        Public Async Function GetEventsAsync(instanceId As String,
+                                              sinceSeq As Long,
+                                              max As Integer,
+                                              cancellation As CancellationToken) As Task(Of EventBatchResponse) Implements INodeClient.GetEventsAsync
+            Try
+                Dim result = Await _httpClient.GetFromJsonAsync(Of EventBatchResponse)(
+                    $"/api/instances/{instanceId}/events?since={sinceSeq}&max={max}", cancellation)
+                If result Is Nothing Then
+                    result = New EventBatchResponse With {
+                        .Events = New List(Of EventRecord),
+                        .LastSeq = sinceSeq
+                    }
+                End If
+                If result.Events Is Nothing Then result.Events = New List(Of EventRecord)
+                Return result
+            Catch ex As Exception
+                Throw WrapException("GetEvents", ex)
+            End Try
+        End Function
+
+        Public Async Function GetEventsHeadAsync(instanceId As String,
+                                                  cancellation As CancellationToken) As Task(Of Long) Implements INodeClient.GetEventsHeadAsync
+            Try
+                Dim result = Await _httpClient.GetFromJsonAsync(Of EventBatchResponse)(
+                    $"/api/instances/{instanceId}/events?head=1", cancellation)
+                Return If(result IsNot Nothing, result.LastSeq, 0L)
+            Catch ex As Exception
+                Throw WrapException("GetEventsHead", ex)
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' JSON options for SSE event frames — the node serializes
+        ''' each frame with JsonSerializerDefaults.Web (camelCase),
+        ''' the same shape GetFromJsonAsync uses for /events, so
+        ''' backfill-by-GET and live-by-SSE deserialize identically.
+        ''' </summary>
+        Private Shared ReadOnly _sseEventJsonOptions As New System.Text.Json.JsonSerializerOptions(
+            System.Text.Json.JsonSerializerDefaults.Web)
+
+        ''' <summary>
+        ''' Idle cutoff for the SSE event stream. The node writes a
+        ''' ": keepalive" comment every ~15s when no events flow, so
+        ''' a healthy connection never goes this long without bytes.
+        ''' A read that exceeds it means the TCP path died silently
+        ''' (no RST reached us) — treated as a stream failure so the
+        ''' caller can fall back to pull. Older stream-capable nodes
+        ''' without the keep-alive still work: their idle streams
+        ''' recycle through this timeout and the caller reconnects,
+        ''' which the cursor makes harmless.
+        ''' </summary>
+        Private Shared ReadOnly SseIdleTimeout As TimeSpan = TimeSpan.FromSeconds(45)
+
+        Public Async Function StreamEventsAsync(instanceId As String,
+                                                 sinceSeq As Long,
+                                                 onEvent As Func(Of EventRecord, Task),
+                                                 cancellation As CancellationToken) As Task Implements INodeClient.StreamEventsAsync
+            Try
+                Using requestMsg As New HttpRequestMessage(HttpMethod.Get,
+                        $"/api/instances/{instanceId}/events/stream?since={sinceSeq}")
+                    ' ResponseHeadersRead: SendAsync returns at the
+                    ' headers; subsequent body reads are bounded by
+                    ' the caller's token + the per-read idle timeout
+                    ' below, NOT by the shared client's 30s Timeout
+                    ' (same long-lived-stream pattern as
+                    ' StreamLogsAsync / DownloadFileAsync).
+                    Using response = Await _httpClient.SendAsync(requestMsg,
+                            HttpCompletionOption.ResponseHeadersRead, cancellation)
+                        response.EnsureSuccessStatusCode()
+                        Using stream = Await response.Content.ReadAsStreamAsync(cancellation)
+                            Using reader As New StreamReader(stream)
+                                While Not cancellation.IsCancellationRequested
+                                    Dim line As String = Nothing
+                                    Dim idleTimedOut = False
+                                    ' Per-read idle timeout via a linked
+                                    ' CTS — keep-alive comments count as
+                                    ' traffic, so only a dead transport
+                                    ' trips this.
+                                    Using idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellation)
+                                        idleCts.CancelAfter(SseIdleTimeout)
+                                        Try
+                                            line = Await reader.ReadLineAsync(idleCts.Token)
+                                        Catch ex As OperationCanceledException
+                                            If cancellation.IsCancellationRequested Then Throw
+                                            idleTimedOut = True
+                                        End Try
+                                    End Using
+                                    If idleTimedOut Then
+                                        Throw New TimeoutException(
+                                            $"Event stream for {instanceId} idle beyond {SseIdleTimeout.TotalSeconds:F0}s (no data or keep-alive)")
+                                    End If
+                                    If line Is Nothing Then Exit While ' server closed the stream
+
+                                    If line.StartsWith("data: ") Then
+                                        Dim rec As EventRecord = Nothing
+                                        Try
+                                            rec = System.Text.Json.JsonSerializer.Deserialize(Of EventRecord)(
+                                                line.Substring(6), _sseEventJsonOptions)
+                                        Catch
+                                            ' Malformed frame — skip it; the
+                                            ' cursor-addressed re-read on the
+                                            ' next reconnect can recover it.
+                                        End Try
+                                        If rec IsNot Nothing Then
+                                            ' Awaited: consumer exceptions
+                                            ' propagate and tear the stream
+                                            ' down by design.
+                                            Await onEvent(rec)
+                                        End If
+                                    End If
+                                    ' ": keepalive" comments and blank
+                                    ' separator lines fall through here.
+                                End While
+                            End Using
+                        End Using
+                    End Using
+                End Using
+            Catch ex As OperationCanceledException
+                ' Normal — caller cancelled; return quietly like the
+                ' other streaming methods.
+            End Try
+        End Function
+
+        Public Async Function AppendIdentityEventAsync(instanceId As String,
+                                                        request As AppendEventRequest,
+                                                        cancellation As CancellationToken) As Task(Of AppendEventResponse) Implements INodeClient.AppendIdentityEventAsync
+            Try
+                Dim resp = Await _httpClient.PostAsJsonAsync(
+                    $"/api/instances/{instanceId}/events", request, cancellation)
+                resp.EnsureSuccessStatusCode()
+                Dim body = Await resp.Content.ReadFromJsonAsync(Of AppendEventResponse)(
+                    cancellationToken:=cancellation)
+                Return If(body, New AppendEventResponse With {.Inserted = False})
+            Catch ex As Exception
+                Throw WrapException("AppendIdentityEvent", ex)
+            End Try
+        End Function
+
         ' ---- Helpers ----
 
         Private Function WrapException(operation As String, ex As Exception) As Exception
@@ -855,6 +1209,28 @@ Namespace GSM.Manager.Core
             ' both as NodeConnectionException — as we did before —
             ' makes 404 look like "the node is offline" and bypasses
             ' those graceful-handling paths.
+            ' Pin-validation failures surface as HttpRequestException
+            ' wrapping an AuthenticationException ("The remote
+            ' certificate is invalid according to the validation
+            ' procedure"). Expose them as NodeCertificateException so
+            ' the UI can say "certificate changed — re-trust required"
+            ' instead of a generic "node offline".
+            If ContainsAuthenticationFailure(ex) Then
+                ' Only a pin REJECTION is a certificate problem. Any other
+                ' handshake failure (plaintext listener on the port, node
+                ' mid-restart, protocol mismatch) is a connection problem
+                ' and must not trip the MITM/re-trust path.
+                If Threading.Interlocked.Exchange(_pinRejected, 0) <> 0 Then
+                    Return New NodeCertificateException(
+                        $"TLS certificate validation failed during {operation}: the node's certificate " &
+                        "does not match the pinned fingerprint. Possible causes: the node regenerated " &
+                        "its certificate, or the connection is being intercepted.", ex)
+                End If
+                Return New NodeConnectionException(
+                    $"TLS handshake failed during {operation}: the port did not answer as HTTPS " &
+                    "(node restarting, or plain HTTP on this port). {ex.Message}", ex)
+            End If
+
             Dim httpEx = TryCast(ex, HttpRequestException)
             If httpEx IsNot Nothing Then
                 If httpEx.StatusCode.HasValue Then
@@ -867,6 +1243,160 @@ Namespace GSM.Manager.Core
             End If
             Return New NodeApiException(
                 $"API error during {operation}: {ex.Message}", ex)
+        End Function
+
+        Private Shared Function ContainsAuthenticationFailure(ex As Exception) As Boolean
+            Dim cur = ex
+            Dim depth = 0
+            While cur IsNot Nothing AndAlso depth < 8
+                If TypeOf cur Is System.Security.Authentication.AuthenticationException Then
+                    Return True
+                End If
+                cur = cur.InnerException
+                depth += 1
+            End While
+            Return False
+        End Function
+
+        ' ---- TLS onboarding (0.7.0) ----
+
+        Public Async Function EnableTlsAsync(request As EnableTlsRequest,
+                                             cancellation As CancellationToken) As Task(Of EnableTlsResponse) Implements INodeClient.EnableTlsAsync
+            Try
+                Dim resp = Await _httpClient.PostAsJsonAsync("/api/tls/enable", request, cancellation)
+                resp.EnsureSuccessStatusCode()
+                Return Await resp.Content.ReadFromJsonAsync(Of EnableTlsResponse)(cancellationToken:=cancellation)
+            Catch ex As Exception
+                Throw WrapException("EnableTls", ex)
+            End Try
+        End Function
+
+        Public Async Function GetTlsStatusAsync(cancellation As CancellationToken) As Task(Of TlsStatusResponse) Implements INodeClient.GetTlsStatusAsync
+            Try
+                Return Await _httpClient.GetFromJsonAsync(Of TlsStatusResponse)(
+                    "/api/tls/status", cancellation)
+            Catch ex As Exception
+                Throw WrapException("GetTlsStatus", ex)
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Re-trust / adopt fallback (2026-10-10): read the SHA-256
+        ''' fingerprint of whatever certificate the node is CURRENTLY
+        ''' presenting on <paramref name="port"/>, over an UNPINNED,
+        ''' UNAUTHENTICATED HTTPS GET of /api/version. Previously the only
+        ''' way to learn a changed fingerprint was the authenticated plain-
+        ''' HTTP /api/tls/status call — which is exactly the channel the
+        ''' recommended hardening (Restrict HTTP) closes, so a cert
+        ''' regeneration on a hardened node locked the Manager out with no
+        ''' in-app recovery.
+        '''
+        ''' Safe by construction: no bearer token is attached, the only
+        ''' request is the public version endpoint, nothing is stored, and
+        ''' the value returned is the hash of the certificate actually
+        ''' presented on the wire (not a JSON field the peer could lie
+        ''' about). The TRUST decision stays with the operator's explicit
+        ''' re-trust confirmation; this merely tells them what they would
+        ''' be trusting — the same information the mismatch log line
+        ''' already prints. Shared: it deliberately bypasses the instance
+        ''' pinned handler. Returns Nothing when nothing answered TLS.
+        ''' </summary>
+        Public Shared Async Function ProbePresentedFingerprintAsync(hostAddress As String,
+                                                                    port As Integer,
+                                                                    cancellation As CancellationToken) As Task(Of String)
+            Dim presentedHex As String = Nothing
+            Dim handler As New HttpClientHandler()
+            handler.ServerCertificateCustomValidationCallback =
+                Function(request, cert, chain, errors)
+                    If cert IsNot Nothing Then
+                        presentedHex = Convert.ToHexString(
+                            cert.GetCertHash(Security.Cryptography.HashAlgorithmName.SHA256)).ToLowerInvariant()
+                    End If
+                    Return True   ' observe only — this client never carries a token
+                End Function
+            Try
+                Using http As New HttpClient(handler, disposeHandler:=True)
+                    http.Timeout = TimeSpan.FromSeconds(10)
+                    Using resp = Await http.GetAsync($"https://{hostAddress}:{port}/api/version",
+                                                     HttpCompletionOption.ResponseHeadersRead,
+                                                     cancellation).ConfigureAwait(False)
+                        ' Status is irrelevant: the handshake already ran.
+                    End Using
+                End Using
+            Catch
+                ' Not listening TLS on this port / network error — caller
+                ' decides what to tell the operator.
+            End Try
+            Return presentedHex
+        End Function
+
+        ''' <summary>
+        ''' Changes the node's plain-HTTP listener policy (0.7.0
+        ''' hardening). Concrete-class-only (not on INodeClient — it is
+        ''' an onboarding/hardening concern, always invoked through
+        ''' TlsOnboardingService with an explicit client). The node
+        ''' restarts after replying.
+        ''' </summary>
+        Public Async Function SetHttpModeAsync(httpMode As String,
+                                               cancellation As CancellationToken) As Task
+            Try
+                Dim resp = Await _httpClient.PostAsJsonAsync("/api/tls/http-mode",
+                    New SetHttpModeRequest With {.HttpMode = httpMode}, cancellation)
+                resp.EnsureSuccessStatusCode()
+            Catch ex As Exception
+                Throw WrapException("SetHttpMode", ex)
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Rotates the node's auth token (POST /api/auth/rotate). Only
+        ''' meaningful on a pinned-HTTPS client — the node refuses the call
+        ''' over plaintext (403). The node persists + restarts after replying.
+        ''' Concrete-class-only; invoked via TlsOnboardingService.
+        ''' </summary>
+        Public Async Function RotateTokenAsync(newToken As String,
+                                               cancellation As CancellationToken) As Task
+            Try
+                Dim resp = Await _httpClient.PostAsJsonAsync("/api/auth/rotate",
+                    New RotateTokenRequest With {.NewToken = newToken}, cancellation)
+                resp.EnsureSuccessStatusCode()
+            Catch ex As Exception
+                Throw WrapException("RotateToken", ex)
+            End Try
+        End Function
+
+        ' ---- Process control (2026-10-10) ----
+        ' Concrete-class-only like SetHttpModeAsync: operator actions from the
+        ' node panel, never reached by plugins. Older nodes answer 404.
+
+        ''' <summary>
+        ''' Asks the node to exit and be relaunched by its survivor
+        ''' (NodeSetup / sc start / systemd). The node replies 202 then tears
+        ''' down; the caller polls /api/version to see it come back.
+        ''' </summary>
+        Public Async Function RestartNodeAsync(cancellation As CancellationToken) As Task
+            Try
+                Using resp = Await _httpClient.PostAsync("/api/system/restart", Nothing, cancellation)
+                    resp.EnsureSuccessStatusCode()
+                End Using
+            Catch ex As Exception
+                Throw WrapException("RestartNode", ex)
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Asks the node to exit WITHOUT relaunch. It stays down until
+        ''' started by hand on that machine. Running instances keep running
+        ''' under their shims and are re-adopted when the node returns.
+        ''' </summary>
+        Public Async Function ShutdownNodeAsync(cancellation As CancellationToken) As Task
+            Try
+                Using resp = Await _httpClient.PostAsync("/api/system/shutdown", Nothing, cancellation)
+                    resp.EnsureSuccessStatusCode()
+                End Using
+            Catch ex As Exception
+                Throw WrapException("ShutdownNode", ex)
+            End Try
         End Function
 
     End Class
@@ -943,14 +1473,59 @@ Namespace GSM.Manager.Core
     '  NodeHttpClientFactory — manages client instances per node
     ' ============================================================
 
+    ''' <summary>
+    ''' Per-node TLS transport settings, resolved by the factory's
+    ''' TlsSettingsResolver (wired in ManagerProgram to a DB lookup of
+    ''' NodeEntity.UseTls / TlsPort / PinnedCertFingerprint). Kept as a
+    ''' dedicated class rather than a tuple for VB readability.
+    ''' </summary>
+    Public Class NodeTlsSettings
+        Public Property UseTls As Boolean
+        Public Property TlsPort As Integer
+        Public Property PinnedCertFingerprint As String
+
+        ''' <summary>
+        ''' Single-port (HTTPS_SinglePort_Plan slice 3): TlsPort = 0 now
+        ''' means "HTTPS on the node's listen port", so a pin alone makes
+        ''' TLS usable. Callers resolve the port via EffectivePort(listen).
+        ''' </summary>
+        Public ReadOnly Property IsUsable As Boolean
+            Get
+                Return UseTls AndAlso Not String.IsNullOrWhiteSpace(PinnedCertFingerprint)
+            End Get
+        End Property
+
+        ''' <summary>Port to dial for HTTPS: the dedicated TLS port when one
+        ''' is recorded, else the node's plain listen port (shared).</summary>
+        Public Function EffectivePort(listenPort As Integer) As Integer
+            Return If(TlsPort > 0, TlsPort, listenPort)
+        End Function
+    End Class
+
     Public Class NodeHttpClientFactory
 
         Private ReadOnly _clients As New ConcurrentDictionary(Of String, NodeHttpClient)
+        ' Transport signature each cached client was built with
+        ' (scheme|port|pin). A mismatch means settings changed since the
+        ' client was created — evict and rebuild.
+        Private ReadOnly _signatures As New ConcurrentDictionary(Of String, String)
         Private ReadOnly _logger As ILogger(Of NodeHttpClient)
 
         Public Sub New(logger As ILogger(Of NodeHttpClient))
             _logger = logger
         End Sub
+
+        ''' <summary>
+        ''' Resolves a node's CURRENT TLS settings by nodeId. Wired once
+        ''' at startup (ManagerProgram) to a GsmDbContext lookup. When
+        ''' Nothing (e.g. unit-ish contexts), all clients are plain HTTP
+        ''' — exactly the pre-0.7.0 behavior. Making the factory consult
+        ''' this on every GetClient means the MANY existing 4-argument
+        ''' call sites throughout Core/UI become TLS-aware without being
+        ''' touched, and an onboarding flip takes effect on the next
+        ''' GetClient call anywhere in the app.
+        ''' </summary>
+        Public Property TlsSettingsResolver As Func(Of String, NodeTlsSettings)
 
         ''' <summary>
         ''' Gets or creates an INodeClient for the given node.
@@ -959,8 +1534,64 @@ Namespace GSM.Manager.Core
                                   hostAddress As String,
                                   port As Integer,
                                   authToken As String) As INodeClient
-            Return _clients.GetOrAdd(nodeId,
-                Function(id) New NodeHttpClient(hostAddress, port, authToken, _logger))
+            ' Resolve the node's current transport settings. TLS wins
+            ' when fully configured: scheme flips to https and the
+            ' effective port becomes the TLS port.
+            Dim tls As NodeTlsSettings = Nothing
+            Dim resolver = TlsSettingsResolver
+            If resolver IsNot Nothing Then
+                Try
+                    tls = resolver(nodeId)
+                Catch
+                    ' DOWNGRADE GUARD: a resolver failure (transient DB
+                    ' hiccup) must not silently rebuild this node's client
+                    ' on plain HTTP when we were already on pinned HTTPS —
+                    ' that would leak the token in cleartext. Keep serving
+                    ' the existing client, whatever transport it has; only
+                    ' a node with no cached client at all falls back to
+                    ' HTTP (matching a fresh pre-TLS start).
+                    Dim cached As NodeHttpClient = Nothing
+                    If _clients.TryGetValue(nodeId, cached) Then Return cached
+                    tls = Nothing
+                End Try
+            End If
+
+            Dim wantTls As Boolean = tls IsNot Nothing AndAlso tls.IsUsable
+            Dim effectivePort As Integer = If(wantTls, tls.EffectivePort(port), port)
+            Dim pin As String = If(wantTls, tls.PinnedCertFingerprint.Trim().ToLowerInvariant(), Nothing)
+            Dim signature As String =
+                If(wantTls, "https|", "http|") & effectivePort.ToString() & "|" & If(pin, "")
+
+            ' Evict when the cached client's transport signature no
+            ' longer matches (onboarding flip, rollback, re-pin, port
+            ' change) so no caller can keep using a stale transport.
+            Dim oldSig As String = Nothing
+            If _signatures.TryGetValue(nodeId, oldSig) AndAlso
+               Not String.Equals(oldSig, signature, StringComparison.Ordinal) Then
+                RemoveClient(nodeId)
+            End If
+
+            Dim client = _clients.GetOrAdd(nodeId,
+                Function(id) New NodeHttpClient(hostAddress, effectivePort, authToken, _logger,
+                                                wantTls, pin))
+            _signatures(nodeId) = signature
+            Return client
+        End Function
+
+        ''' <summary>
+        ''' Builds a NON-cached client with explicit transport settings.
+        ''' Used by the TLS onboarding flow, which needs to talk plain
+        ''' HTTP to a node whose entity may already carry TLS settings
+        ''' (or probe HTTPS with a pin before committing it to the DB).
+        ''' Caller owns the instance; nothing is cached or evicted.
+        ''' </summary>
+        Public Function CreateExplicitClient(hostAddress As String,
+                                             port As Integer,
+                                             authToken As String,
+                                             useTls As Boolean,
+                                             pinnedCertFingerprint As String) As NodeHttpClient
+            Return New NodeHttpClient(hostAddress, port, authToken, _logger,
+                                      useTls, pinnedCertFingerprint)
         End Function
 
         ''' <summary>
@@ -970,6 +1601,8 @@ Namespace GSM.Manager.Core
         Public Sub RemoveClient(nodeId As String)
             Dim removed As NodeHttpClient = Nothing
             _clients.TryRemove(nodeId, removed)
+            Dim removedSig As String = Nothing
+            _signatures.TryRemove(nodeId, removedSig)
         End Sub
 
     End Class
@@ -1008,6 +1641,22 @@ Namespace GSM.Manager.Core
     ''' </summary>
     Public Class NodeConnectionException
         Inherits Exception
+
+        Public Sub New(message As String, Optional inner As Exception = Nothing)
+            MyBase.New(message, inner)
+        End Sub
+    End Class
+
+    ''' <summary>
+    ''' Thrown when a pinned-HTTPS connection fails certificate
+    ''' validation (0.7.0). Subclass of NodeConnectionException so
+    ''' existing catch blocks still treat it as "can't reach the
+    ''' node", while TLS-aware callers (onboarding service, NodePanel)
+    ''' catch it specifically to surface "certificate changed —
+    ''' re-trust required" and set TlsState=FingerprintMismatch.
+    ''' </summary>
+    Public Class NodeCertificateException
+        Inherits NodeConnectionException
 
         Public Sub New(message As String, Optional inner As Exception = Nothing)
             MyBase.New(message, inner)

@@ -4156,6 +4156,19 @@ Namespace GSM.Manager.UI
                 engine?.ReloadRules()
             End If
 
+            ' Push the node-boot checkboxes ("Recover state on node
+            ' restart" / "Auto start with node") to the node so the
+            ' change applies without a start/stop cycle. Fire-and-
+            ' forget by design: node offline or pre-endpoint just
+            ' means the flags apply from the instance's next start
+            ' (the wire path, unchanged) — not worth blocking the
+            ' save dialog on.
+            Dim instMgrPush = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If instMgrPush IsNot Nothing Then
+                Dim pushId = _instanceId
+                Task.Run(Function() instMgrPush.PushBootFlagsAsync(pushId))
+            End If
+
             Me.DialogResult = DialogResult.OK
             Me.Close()
         End Sub

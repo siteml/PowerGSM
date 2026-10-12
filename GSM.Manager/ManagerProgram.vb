@@ -334,6 +334,7 @@ Namespace GSM.Manager
             serviceCollection.AddSingleton(Of IdentityResolver)()
             serviceCollection.AddSingleton(Of PluginRegistry)()
             serviceCollection.AddSingleton(Of InstanceManager)()
+            serviceCollection.AddSingleton(Of EventSyncService)()   ' EventStream Slice 3 — node stream sync
             serviceCollection.AddSingleton(Of InstallationManager)()
             serviceCollection.AddSingleton(Of NotificationService)()
             serviceCollection.AddSingleton(Of AutomationEngine)()
@@ -350,9 +351,35 @@ Namespace GSM.Manager
             serviceCollection.AddSingleton(Of PortalImportService)()
             serviceCollection.AddSingleton(Of HistoryQueryService)()
             serviceCollection.AddSingleton(Of RestartCoordinator)()
+            serviceCollection.AddSingleton(Of TlsOnboardingService)()   ' 0.7.0 — HTTPS onboarding
 
             ' Build provider
             Services = serviceCollection.BuildServiceProvider()
+
+            ' ---- 0.7.0 — TLS transport resolver ----
+            ' The NodeHttpClientFactory consults this on every GetClient
+            ' call, so all existing call sites transparently switch to
+            ' pinned HTTPS when a node's entity says UseTls (and back on
+            ' rollback). A DB hiccup returns Nothing = plain HTTP — the
+            ' pre-0.7.0 behavior — rather than blocking the call.
+            Try
+                Dim clientFactory = Services.GetRequiredService(Of NodeHttpClientFactory)()
+                clientFactory.TlsSettingsResolver =
+                    Function(nodeId)
+                        Using tlsScope = Services.CreateScope()
+                            Dim tlsDb = tlsScope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                            Dim n = tlsDb.Nodes.Find(nodeId)
+                            If n Is Nothing Then Return Nothing
+                            Return New NodeTlsSettings With {
+                                .UseTls = n.UseTls,
+                                .TlsPort = n.TlsPort,
+                                .PinnedCertFingerprint = n.PinnedCertFingerprint
+                            }
+                        End Using
+                    End Function
+            Catch
+                ' Resolver wiring failure leaves all clients on HTTP.
+            End Try
 
             ' Self-identifying startup line. Reads this assembly's
             ' InformationalVersion (set indirectly via

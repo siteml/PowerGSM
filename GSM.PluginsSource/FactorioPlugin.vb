@@ -536,7 +536,25 @@ Public Class FactorioPlugin
         ' on DisplayName. PlatformPersona stays Nothing for Factorio
         ' sessions; UIs default to DisplayName ?? PlatformPersona which
         ' renders identically.
+        '
+        ' Connect-line IP capture (2026-08-15). ServerRouter logs
+        '   Replying to connectionRequest for address(IP ADDR:({10.5.1.14:59190}))
+        ' ~1-2s before the [JOIN] line (factorio-current.log). The
+        ' line carries ONLY the address — no username — which is
+        ' exactly the EventStore's addr-only buffer shape: a
+        ' PlayerJoin match with just RemoteAddress buffers the IP
+        ' (10s TTL) and the next real join claims it, filling the
+        ' Manager's IP Address column. Known limitation: a map
+        ' download slower than the 10s TTL (huge save, slow link)
+        ' loses the IP for that join — accepted, the column was
+        ' empty before this rule anyway. Port is deliberately NOT
+        ' captured (ephemeral client port, no correlation value).
         Return New LogParseRule() {
+            New LogParseRule With {
+                .Name = "Connection Request",
+                .Kind = ParsedEventKind.PlayerJoin,
+                .Pattern = "Replying to connectionRequest for address\(IP ADDR:\(\{(?<" & "RemoteAddress" & ">\d{1,3}(?:\.\d{1,3}){3}):\d+\}\)\)"
+            },
             New LogParseRule With {
                 .Name = "Player Join",
                 .Kind = ParsedEventKind.PlayerJoin,

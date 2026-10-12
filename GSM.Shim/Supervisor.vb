@@ -122,17 +122,29 @@ Friend NotInheritable Class Supervisor
     ''' </summary>
     Public Async Function ServeConnectionAsync(conn As FrameConnection, ct As CancellationToken) As Task
         Dim pid As Integer = If(_game Is Nothing, -1, _game.Pid)
-        Await ShimHandshake.AcceptAsync(conn, _shimVersion, pid, GameStateString(), _instanceId, _logFilePaths, ct).ConfigureAwait(False)
 
         ' Install this connection and replay buffered output atomically with
-        ' respect to the pumps. Holding the send semaphore across snapshot +
-        ' replay + the _conn swap means a pump iteration (which takes the same
-        ' semaphore around ring-append + live-write) can't interleave, so the
-        ' new Node sees each buffered chunk exactly once and live output picks
-        ' up cleanly after the replay.
+        ' respect to the pumps. Holding the send semaphore across the ENTIRE
+        ' handshake + snapshot + replay + _conn swap means a pump iteration
+        ' (which takes the same semaphore around ring-append + live-write)
+        ' can't interleave, so (a) the ring bounds quoted to AcceptExAsync
+        ' are exact when the replay runs — the ack's ReplayStartSeq is the
+        ' seq of the literal first frame the node receives, which is what
+        ' its consumed-cursor counting depends on — and (b) the new Node
+        ' sees each buffered chunk exactly once with live output picking up
+        ' cleanly after. The handshake round-trip under the lock stalls the
+        ' pumps for local-pipe milliseconds only.
         Await _sendSem.WaitAsync(ct).ConfigureAwait(False)
         Try
+            Dim hs = Await ShimHandshake.AcceptExAsync(conn, _shimVersion, pid, GameStateString(),
+                                                       _instanceId, _logFilePaths,
+                                                       _ring.FirstSeq, _ring.NextSeq,
+                                                       ct).ConfigureAwait(False)
+            ' Ring-cursor replay (v2 additive): only frames the node hasn't
+            ' consumed. A pre-cursor node sent ReplayAfterSeq=0 -> full ring,
+            ' the old behaviour.
             For Each it In _ring.Snapshot()
+                If it.Seq < hs.ReplayStartSeq Then Continue For
                 Try
                     Await conn.WriteFrameAsync(it.Kind, it.Data, ct).ConfigureAwait(False)
                 Catch
@@ -265,6 +277,20 @@ Friend NotInheritable Class Supervisor
                     Await g.StdIn.FlushAsync(ct).ConfigureAwait(False)
                 Catch
                 End Try
+            Case "pty-ctrlc"
+                ' ConPTY (protocol v2): 0x03 into the pty INPUT pipe —
+                ' conhost's processed input converts it to CTRL_C_EVENT for
+                ' the attached game (the graceful-stop fallback should the
+                ' Node's CtrlCSender path prove flaky against pty consoles).
+                ' Harmless no-op shape for a game without stdin.
+                Try
+                    If g.StdIn IsNot Nothing Then
+                        Dim ctrlC As Byte() = {&H3}
+                        Await g.StdIn.WriteAsync(ctrlC, 0, 1, ct).ConfigureAwait(False)
+                        Await g.StdIn.FlushAsync(ct).ConfigureAwait(False)
+                    End If
+                Catch
+                End Try
             Case Else
                 ' basic terminate. Graceful CTRL_C / SIGTERM is slice 5.
                 KillGame()
@@ -273,14 +299,25 @@ Friend NotInheritable Class Supervisor
 
     Private Async Function PumpAsync(stream As Stream, kind As FrameType, ct As CancellationToken) As Task
         Dim buf(8191) As Byte
+        ' Diagnostics (ConPTY investigation 2026-08-11): stderr lines reach
+        ' the node's log (Debug) / the conpty harness transcript. First few
+        ' reads only, so a chatty live game doesn't spam.
+        Dim reads As Integer = 0
+        Console.Error.WriteLine($"GSM.Shim: pump({kind}) started")
         Do
             Dim n As Integer
             Try
                 n = Await Task.Run(Function() stream.Read(buf, 0, buf.Length)).ConfigureAwait(False)
-            Catch
+            Catch ex As Exception
+                Console.Error.WriteLine($"GSM.Shim: pump({kind}) read failed: {ex.GetType().Name}: {ex.Message}")
                 Return   ' stream disposed / pipe broken
             End Try
-            If n <= 0 Then Return   ' EOF
+            If n <= 0 Then
+                Console.Error.WriteLine($"GSM.Shim: pump({kind}) EOF")
+                Return   ' EOF
+            End If
+            reads += 1
+            If reads <= 8 Then Console.Error.WriteLine($"GSM.Shim: pump({kind}) read #{reads}: {n} bytes")
 
             Dim chunk(n - 1) As Byte
             Array.Copy(buf, chunk, n)
@@ -296,12 +333,15 @@ Friend NotInheritable Class Supervisor
             Try
                 _ring.Append(kind, chunk)
                 Dim c = _conn
-                If c IsNot Nothing Then
+                If c Is Nothing Then
+                    If reads <= 8 Then Console.Error.WriteLine($"GSM.Shim: pump({kind}) no conn — ring only")
+                Else
                     Try
                         Await c.WriteFrameAsync(kind, chunk, ct).ConfigureAwait(False)
-                    Catch
+                    Catch ex As Exception
                         ' link dropped mid-write; the serve loop will notice and
                         ' detach. The chunk is in the ring for replay.
+                        Console.Error.WriteLine($"GSM.Shim: pump({kind}) live-write failed: {ex.GetType().Name}: {ex.Message}")
                     End Try
                 End If
             Finally
@@ -320,6 +360,16 @@ Friend NotInheritable Class Supervisor
 
         _exitCode = code
         _gameDone = True
+
+        ' ConPTY (Slice 4): release the pseudoconsole FIRST — the pty output
+        ' pipe never EOFs while conhost holds its end, so without this the
+        ' drain below always times out and the tail output is dropped.
+        ' No-op for pipe-based spawns.
+        Try
+            proc.PrepareForDrain()
+        Catch
+            ' best-effort — drain proceeds (bounded) regardless
+        End Try
 
         ' Drain the pumps to EOF before sending Exited so a *graceful* shutdown's
         ' late-stage output (world save, "shutdown complete", ...) reaches the
@@ -428,11 +478,15 @@ Friend NotInheritable Class Supervisor
 
 End Class
 
-''' <summary>Bounded ring of recent output frames, for replay to a reconnecting Node.</summary>
+''' <summary>Bounded ring of recent output frames, for replay to a reconnecting
+''' Node. Each frame carries a shim-lifetime monotonic Seq (from 1) so a
+''' reconnecting Node can say "replay after N" (ring-cursor, v2 additive) —
+''' trims move FirstSeq forward but never renumber.</summary>
 Friend NotInheritable Class OutputRing
     Private ReadOnly _cap As Integer
     Private ReadOnly _items As New Queue(Of RingItem)
     Private _bytes As Integer
+    Private _nextSeq As Long = 1
     Private ReadOnly _lock As New Object()
 
     Public Sub New(capBytes As Integer)
@@ -442,7 +496,8 @@ Friend NotInheritable Class OutputRing
     Public Sub Append(kind As FrameType, data As Byte())
         If data Is Nothing OrElse data.Length = 0 Then Return
         SyncLock _lock
-            _items.Enqueue(New RingItem With {.Kind = kind, .Data = data})
+            _items.Enqueue(New RingItem With {.Kind = kind, .Data = data, .Seq = _nextSeq})
+            _nextSeq += 1
             _bytes += data.Length
             While _bytes > _cap AndAlso _items.Count > 0
                 Dim old As RingItem = _items.Dequeue()
@@ -450,6 +505,26 @@ Friend NotInheritable Class OutputRing
             End While
         End SyncLock
     End Sub
+
+    ''' <summary>Seq of the oldest retained frame; when the ring is empty,
+    ''' the seq the NEXT appended frame will get.</summary>
+    Public ReadOnly Property FirstSeq As Long
+        Get
+            SyncLock _lock
+                If _items.Count = 0 Then Return _nextSeq
+                Return _items.Peek().Seq
+            End SyncLock
+        End Get
+    End Property
+
+    ''' <summary>Seq the next appended frame will get.</summary>
+    Public ReadOnly Property NextSeq As Long
+        Get
+            SyncLock _lock
+                Return _nextSeq
+            End SyncLock
+        End Get
+    End Property
 
     Public Function Snapshot() As List(Of RingItem)
         SyncLock _lock
@@ -461,4 +536,6 @@ End Class
 Friend NotInheritable Class RingItem
     Public Kind As FrameType
     Public Data As Byte()
+    Public Seq As Long
 End Class
+

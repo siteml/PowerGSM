@@ -9,7 +9,7 @@ Companion docs:
 
 - **`ROADMAP.md`** — where a plugin goes once it's scheduled.
 - **`reference/plugins.md`** — how the Roslyn-compiled plugin model works.
-- **`Windrose_Plugin_Plan.md`** — the worked example of a plugin plan doc.
+- **`docs/plans/Windrose_Plugin_Plan.md`** — the worked example of a plugin plan doc.
 - Shipped plugins as references: **Last Oasis**, **Factorio**, **Conan
   Exiles**, **Windrose**, **Stardew Valley** (in `GSM.PluginsSource\`).
 
@@ -89,6 +89,7 @@ For each game, the facts a plan doc needs:
 | Towers of Aghasba | `[blocked: no dedicated server]` |
 | Soulmask: Shifting Sands | `[ready]` |
 | Aloft | `[ready]` |
+| Dimraeth (Waygate host mod) | `[blocked: third-party client required]` |
 | Sunkenland | `[ready]` |
 | Starbound | `[ready]` |
 | Rust | `[ready]` |
@@ -324,7 +325,7 @@ parse rules (blocked on samples).
 
 ### Palworld
 **Status:** `[shipped]` — PowerGSM 0.6.0, plugin v0.2.0 (requires
-contracts v3), slices 1–4 of `Palworld_Plugin_Plan.md` (install / launch /
+contracts v3), slices 1–4 of `docs/plans/Palworld_Plugin_Plan.md` (install / launch /
 allocator-managed `-port=` / OptionSettings tuple editor with
 embedded-default blank-file seeding / REST announced graceful stop + live
 player list). Windows-verified incl. real-player REST list; Linux run +
@@ -693,6 +694,151 @@ games. Best treated as lower-priority than the clean `[ready]` set.
 the `create#` world-gen step (`IFileGenerationProvider`); (2) `load#` launch +
 name / ports / visibility / playercount / admins + Ctrl+C stop; (3) saves managed
 dir + backup; (4) [later] Wine for Linux nodes; (5) [later] log parse rules.
+
+### Dimraeth (Waygate host mod)
+**Status:** `[blocked: third-party client required]` — researched 2026-09-16,
+parked. The server half fits PowerGSM fine (facts below, pulled from the
+WaygateServer README / `docs/status-and-commands.md` / CHANGELOG and the strings
+in the shipped `WaygateHost.dll` 0.1.5), but **retail Dimraeth has no
+join-by-IP** — only Steam friend lobbies — so every player must run the Waygate
+app, which loads a client-side mod to patch direct-connect in. Unlike Stardew
+(native direct-IP on UDP 24642, plain clients join the SMAPI host), there is no
+way to serve unmodified clients. Two-sided mod + version lockstep on every EA
+patch = not worth it.
+
+**Revisit if:** Mudtek ships an official dedicated server or a native
+direct-connect / server browser in the retail client (then the server half
+below is ~ready as written).
+
+**There is no official dedicated server.** Dimraeth (Mudtek Studios, **Unity
+IL2CPP**, EA since **2026-09-15**, up to **8 players**) is peer-to-peer
+host-based co-op; the devs say "we don't currently support dedicated or private
+servers." The community answer, shipped on EA launch day, is **Waygate**
+(HumanGenome, MIT): a **BepInEx 6 (IL2CPP) host mod** that turns the retail game
+into a headless listen server, plus a **Waygate desktop app** players must install
+to join by `ip:port`. Same *mod-hosted* shape as Stardew/SMAPI, but far more
+turnkey — no build step, a real control surface, and the mod is *designed* to be
+driven by a panel. **Adoption caveat:** every player needs the Waygate app on top
+of retail Dimraeth (it launches the game for them; `waygate://` deep links).
+Survival Servers already hosts it, so the model is being exercised at scale.
+
+**Install — no anonymous depot (Aloft/Stardew pattern).** The server files ARE
+the game files: Dimraeth is AppID **2402680** (the game, paid, ~6 GB). Either
+**authed SteamCMD with an owning account** (PowerGSM's Steam-credential /
+Steam-Guard path) or copy a game folder from any PC. Then unzip
+`WaygateServer-<ver>.zip` (GitHub release, ~60 MB) **over** the game folder so
+`winhttp.dll` + `BepInEx\` + `doorstop_config.ini` sit beside `Dimraeth.exe`.
+The zip bundles BepInEx 6 IL2CPP *and its own .NET 6 runtime* (`bepinex\dotnet\`)
+plus pre-generated `BepInEx\interop\` assemblies for the current game build — so
+**a Dimraeth patch that changes Assembly-CSharp likely needs a new Waygate zip**
+(interop hash-pinned via `assembly-hash.txt`). Version-pin both, update
+deliberately (Stardew lesson). The mod needs **no Steam login at runtime**.
+
+**Platform:** **Windows only** (Win10/11/Server; x64). Steam Deck support on the
+client side is Proton, i.e. there is no native Linux build. BepInEx-IL2CPP under
+Wine is *possible in principle* (`WINEDLLOVERRIDES=winhttp=n,b`) but unverified
+for this game — Linux nodes are a later Wine-layer question, same as Enshrouded /
+Aloft.
+
+**Launch:** `Dimraeth.exe -batchmode -nographics` from the game folder. Optional
+Waygate flags: **`--waygate-dir=<folder>`** (per-instance control/save dir,
+default `<game>\waygate\`) and **`--waygate-config=<file>`** (alternate cfg).
+Headless, no GPU, no desktop session; **4–8 GB RAM per instance** — the world
+simulates even when empty (`IdleFrameCap` throttles it). The mod waits for the
+main menu, then auto-creates/loads the world; `ReadyTimeoutSeconds` bounds it.
+
+**Config = one BepInEx cfg** at `BepInEx\config\com.humangenome.waygate.host.cfg`
+(INI-style, generated on first run — start once to get defaults, or pre-write
+it). Keys (from the DLL; section grouping approximate):
+- `[Host]` `Enable`, `GamePort` (default **15569**), `ListenAddress`
+  (`0.0.0.0`), `MaxPlayers` (cap ≤ 8, enforced at connection approval),
+  `ServerName`, `JoinPassword` (empty = open), `HostCharacterName` (`Server`),
+  `HostRace` (Human/Elf/Minotaur), `HostClass` (Brawler/Magician/Shadow),
+  `HideHostCharacter`, `SaveRoot` (empty = `<game>\waygate\save`), `FrameCap`,
+  `IdleFrameCap`.
+- `[World]` `Name` (created on first start if missing), `Difficulty`
+  (Easy/**Moderate**/Hard — **baked in at world creation**), `FriendlyFire`,
+  `PersonalLoot`, `NewCharactersOnly`, `LockBuildingsToOwner`, `EnableChat`
+  (off = server drops all player chat) — the world-settings group is
+  re-written to the world on every start, so they're live-editable.
+- `[Query]`-ish `QueryEnable`, `QueryNoChallenge`; `[Headless]` `SilenceAudio`,
+  `SkipUiFilters`, `ReadyTimeoutSeconds`; `[Client]` keys are for the player-side
+  mod / test client — ignore.
+→ Port + name + password are **`IStartupFileProvider`** (render into the cfg at
+launch, Windrose-style); the `[World]` group is a small **`IInstanceFileEditorProvider`**
+with a "Difficulty applies at world creation only" warning (Stardew farm-creation
+gotcha). Note the host is a *listen server*, so the placeholder host character
+(`HostCharacterName`/`HostRace`/`HostClass`) must exist — leave the defaults.
+
+**Ports (2, UDP, derived from one number):** game **`GamePort`** (15569) and
+**`GamePort + 1`** for **Source A2S** query (15570). Hard-coded `+1` offset →
+allocator must reserve the pair (Conan-style adjacent-port rule). Plain UDP via
+Unity Transport, no Steam relay.
+
+**Control + graceful shutdown — file-based, and good.** No RCON, no REST, no
+stdin. Instead the mod polls **`<waygate-dir>\commands.txt`** every tick (~1 s):
+one command per line, `#` comments, file **read-then-deleted**, must be written
+**atomically (temp + rename)**; a file present at boot is discarded as stale.
+Commands: **`save`**, **`shutdown`/`stop`** (save → clean exit), **`restart`**
+(save → exit; "the supervisor relaunches" — i.e. PowerGSM's crash-restart /
+restart policy is the supervisor), **`kick <name-or-clientId>`**. So graceful
+stop = write `shutdown` to a file and wait for exit — a new node-side stop
+strategy ("command file") alongside CtrlC / SIGINT / RCON, but trivial. Ctrl+C
+on a Unity headless host is the unverified fallback.
+
+**Status — polled file, not log parsing.** **`<waygate-dir>\status.json`** is
+rewritten atomically every 5 s: `verdict` (`STARTING` / `HOSTING` /
+`WILL NOT HOST` / `WORLD DID NOT START`), `product` (`Waygate 0.1.5`),
+`game_version` (e.g. `eDev 0.107.7689` — free installed-version string for
+`IVersionAwarePlugin`), `port`, `query_port`, `players`, `max_players`, `world`,
+`server_name`, `uptime_seconds`, `written` (UTC), **`roster`** (display names;
+hidden host excluded). **`boot-report.txt`** gives the human-readable verdict +
+one-line `detail` and `save_root`. This is a **poll source** in the Palworld
+pal-rest sense: ready signal = `verdict == HOSTING`; join/leave = roster diff.
+The BepInEx console/stdout does carry `[waygate] client connected id=N` /
+`client disconnected id=N` / `join refused: server full` / `HOSTING on UDP …`
+lines (also `BepInEx\LogOutput.log`), but they're **client-id-keyed, not
+name-keyed** — usable for lifecycle/ready rules, but identity comes from the
+roster. A2S on `port+1` is a second, network-side liveness/player-count probe if
+wanted. **No chat lines by name on the server console** (chat is relayed, and
+`EnableChat=false` drops it).
+
+**Saves:** `SaveRoot` (default **`<game>\waygate\save`**) — world **and** the
+placeholder host character live there; player heroes stay on the players' own
+PCs (hero progression travels, world/story/buildings stay with the server).
+Managed-dir + backup candidate, in-install, portable between servers per the
+Waygate README. `save-root.txt` in the waygate dir records the resolved path.
+
+**Multi-instance per install — NOT safe as-is.** The README is explicit: two
+servers = **two copies of the game folder (a junction works)** + distinct ports +
+`--waygate-dir`. The cfg lives inside the install (`BepInEx\config\`), so two
+instances on one install would share port/name/password unless
+`--waygate-config=` is used per instance — feasible (`--waygate-config` +
+`--waygate-dir` both per-instance) but unverified; default to
+**one-instance-per-install** (LO/Conan-style guard) and revisit.
+
+**Known gotchas:** (1) mod age — 0.1.2→0.1.5 shipped in one day; the config
+key set and status fields may move; (2) game patches vs the interop bundle;
+(3) `Difficulty` and world identity fixed at creation (`World/Name` is the
+save key — renaming = new world); (4) `MaxPlayers` > 8 "unsupported by the
+developer"; (5) players need a third-party launcher; (6) authed-account install
++ Steam Guard, and that account's copy can't be played elsewhere simultaneously.
+
+**Fit verdict (server half only).** Would be the best-behaved *mod-hosted*
+server on the list: single exe, simple args, one INI-ish cfg, two derived UDP
+ports, in-install saves, a documented save-then-exit stop command, a 5-second
+status file with roster, and a version string for free. Parked anyway — see
+Status: the client-side requirement is the blocker, not the server.
+
+**Suggested slicing:** (1) install (authed SteamCMD 2402680 or folder copy) +
+Waygate zip overlay (GitHub-release download step, pinned version) + launch
+(`-batchmode -nographics --waygate-dir`) + cfg render (port/name/password) +
+`commands.txt` `shutdown` stop; (2) `status.json` poll source (ready signal,
+roster join/leave, version) + `boot-report.txt` failure surfacing; (3) `[World]`
+cfg editor; (4) `SaveRoot` managed dir + backup; (5) `kick` / `save` / `restart`
+as remote-control actions (`IRemoteControlProvider`, command-file transport);
+(6) [later] A2S probe, Wine on Linux, per-install multi-instance via
+`--waygate-config`.
 
 ### Sunkenland
 **Status:** `[ready]` — researched; feasible and well-documented, but a notch
@@ -1319,7 +1465,7 @@ Research notes: _TBD_
 **Status:** `[shipped]` — shipped in PowerGSM 0.5.0 as plugin v0.1.0 (Tier 0:
 install / launch / stop / farm archive-restore, Windows + Linux). Tiers 1–4
 (stdin pseudo-RCON, multi-instance via Harmony port patch, …) remain future
-work — see `StardewValley_Plugin_Plan.md` and the fork repo
+work — see `docs/plans/StardewValley_Plugin_Plan.md` and the fork repo
 `siteml/SMAPIDedicatedServerMod` (fork slices F1–F4 done). The research notes
 below are retained for history; the shipped design diverged in places (fork
 consumed as a release zip, `/bin/sh` + shared Xvfb `:97` bootstrap on Linux
@@ -1419,3 +1565,5 @@ Rough buckets, useful for batching the research:
 - **Mod-hosted / no official server (novel shape):** Stardew Valley (full game +
   SMAPI + headless bot mod; authed Steam or GOG; xvfb on Linux; clean Ctrl+C /
   SIGINT stop that fits CtrlCSender).
+- **Parked, client-side blocker:** Dimraeth (Waygate host mod is fine, but retail
+  clients can't join by IP — every player needs the Waygate app + client mod).

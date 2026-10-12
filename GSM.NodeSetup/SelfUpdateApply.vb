@@ -53,14 +53,21 @@ Public Module SelfUpdateApply
     Private Const SwapRetries As Integer = 12
     Private Const SwapRetryDelayMs As Integer = 500
 
+    ' Set from --console: the exiting node was attached to a console window
+    ' (hand-launched user-mode node). A direct relaunch then gets a NEW
+    ' console so the operator keeps a window to read and Ctrl+C. Ignored
+    ' on the service path (services have no console) and on Linux.
+    Private _relaunchWithConsole As Boolean
+
     ''' <summary>
     ''' Entry point for --apply-update. Returns a process exit code:
     ''' 0 success, 2 node didn't exit in time, 3 swap failed, 4 relaunch failed,
     ''' 5 update unhealthy and rolled back to the previous binary, 6 rollback
     ''' itself failed (node may be down — manual intervention).
     ''' </summary>
-    Public Function Run(waitPid As Integer) As Integer
-        Log($"apply-update starting (wait-pid={waitPid})")
+    Public Function Run(waitPid As Integer, Optional relaunchWithConsole As Boolean = False) As Integer
+        _relaunchWithConsole = relaunchWithConsole
+        Log($"apply-update starting (wait-pid={waitPid}, console={relaunchWithConsole})")
 
         Dim live = ServiceManager.GetNodeExecutablePath()
         Dim newPath = live & NewSuffix
@@ -185,11 +192,25 @@ Public Module SelfUpdateApply
 
     Private Function LaunchDirect(live As String) As Process
         Try
-            Dim psi As New ProcessStartInfo(live) With {
-                .UseShellExecute = False,
-                .CreateNoWindow = True,
-                .WorkingDirectory = Path.GetDirectoryName(live)
-            }
+            Dim psi As ProcessStartInfo
+            If _relaunchWithConsole AndAlso ConfigHelpers.RunningOnWindows() Then
+                ' UseShellExecute=True + CreateNoWindow=False = a fresh console
+                ' window owned by the node, exactly like double-clicking the
+                ' exe. (We are DETACHED_PROCESS ourselves, so there is no
+                ' console of ours to inherit.)
+                psi = New ProcessStartInfo(live) With {
+                    .UseShellExecute = True,
+                    .CreateNoWindow = False,
+                    .WindowStyle = ProcessWindowStyle.Normal,
+                    .WorkingDirectory = Path.GetDirectoryName(live)
+                }
+            Else
+                psi = New ProcessStartInfo(live) With {
+                    .UseShellExecute = False,
+                    .CreateNoWindow = True,
+                    .WorkingDirectory = Path.GetDirectoryName(live)
+                }
+            End If
             Return Process.Start(psi)
         Catch ex As Exception
             Log($"direct launch failed: {ex.Message}")
@@ -209,9 +230,15 @@ Public Module SelfUpdateApply
     End Class
 
     ''' <summary>
-    ''' Polls http://127.0.0.1:&lt;port&gt;/api/version (unauthenticated) until it
-    ''' answers 2xx or the timeout elapses. The node binds ListenAnyIP, so
-    ''' loopback reaches it. If the port can't be read we can't verify, so we
+    ''' Polls /api/version on loopback (unauthenticated) until it answers
+    ''' 2xx or the timeout elapses. Tries BOTH http:// and https:// every
+    ''' round: a secured node (HttpMode=Disabled, HTTPS_SinglePort_Plan)
+    ''' drops plaintext at byte 1, so an HTTP-only probe never succeeds and
+    ''' the survivor rolled a perfectly healthy update back to .old (found
+    ''' live 2026-10-11 on win-test, the first secured node to be updated).
+    ''' The HTTPS probe skips certificate validation on purpose — this is
+    ''' 127.0.0.1 and we only need "the process answers"; trust is the
+    ''' Manager's job. If the port can't be read we can't verify, so we
     ''' return True — don't roll a working node back over a config-read blip.
     ''' </summary>
     Private Function WaitForHealthy() As Boolean
@@ -220,20 +247,30 @@ Public Module SelfUpdateApply
             Log("could not determine node port; skipping health check (treating as healthy).")
             Return True
         End If
-        Dim url = $"http://127.0.0.1:{port}/api/version"
-        Log($"health check: polling {url} for up to {HealthTimeoutMs}ms...")
+        Dim urls = New String() {
+            $"http://127.0.0.1:{port}/api/version",
+            $"https://127.0.0.1:{port}/api/version"
+        }
+        Log($"health check: polling {urls(0)} and {urls(1)} for up to {HealthTimeoutMs}ms...")
         Thread.Sleep(HealthGraceMs)
         Dim deadline = Environment.TickCount64 + HealthTimeoutMs
-        Using client As New HttpClient()
+        Dim handler As New HttpClientHandler()
+        handler.ServerCertificateCustomValidationCallback = Function(req, cert, chain, errors) True
+        Using client As New HttpClient(handler, disposeHandler:=True)
             client.Timeout = TimeSpan.FromSeconds(4)
             Do
-                Try
-                    Using resp = client.GetAsync(url).GetAwaiter().GetResult()
-                        If resp.IsSuccessStatusCode Then Return True
-                    End Using
-                Catch
-                    ' Node still starting / down — keep polling.
-                End Try
+                For Each url In urls
+                    Try
+                        Using resp = client.GetAsync(url).GetAwaiter().GetResult()
+                            If resp.IsSuccessStatusCode Then
+                                Log($"health check passed via {url}.")
+                                Return True
+                            End If
+                        End Using
+                    Catch
+                        ' Node still starting / down / not speaking this scheme — keep polling.
+                    End Try
+                Next
                 If Environment.TickCount64 >= deadline Then Exit Do
                 Thread.Sleep(HealthPollIntervalMs)
             Loop

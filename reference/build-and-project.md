@@ -337,3 +337,46 @@ content — that's real work.
 | **CHANGELOG section missing for tag** | Tag pushed, workflow runs, release job fails because awk extractor finds no `## [X.Y.Z]` matching the tag | Workflow has explicit `if [ -z "$notes" ]; then exit 1` guard so it fails loud rather than producing a release with empty notes. Fix: add the section, bump to next rc tag, push again |
 | **Workflow branch trigger** | `branches: [main]` won't fire if the repo's default is `master` | Match the repo's actual default branch name. Tag-triggered workflows (`tags: ['v*.*.*']`) don't care about branch — they fire on tag push regardless |
 
+---
+
+## Hand-deploy / Update Nodes inputs (2026-10)
+
+Full procedure: `../RELEASE_PROCESS.md` → "Hand-deploying an interim
+build". The facts that keep biting:
+
+- **Build ≠ Publish.** A plain Build (Debug *or* Release) of GSM.Node
+  produces a ~150 KB framework-dependent apphost stub next to
+  `GSM.Node.dll`. Only a RID Publish profile (`winx64` / `linux64`,
+  SelfContained + PublishSingleFile) produces the deployable single-file
+  exe. The stub pushed via Update Nodes kills the node on relaunch with
+  nothing in `nodesetup-apply.log` (2026-10-10).
+- **Update Nodes takes one binary per target** (node / shim / nodesetup /
+  ctrlcsender), not a zip. Zips exist only in the GitHub release workflow.
+  CtrlCSender (0.6.6) is Windows-only: in-place swap like NodeSetup, Linux
+  rows skipped, "all components" order NodeSetup → Shim → CtrlCSender →
+  Node on Windows. It gets its `PGSMBUILD` marker from
+  `PgsmGenerateBuildMarker` like the other three.
+- **`Directory.Build.targets` collects the deployable set** after each RID
+  publish into gitignored `publish-drop\<version>\`: update binaries at the
+  root; `node-fresh-<rid>\` (adds `e_sqlite3.dll` + other loose natives,
+  CtrlCSender, `GSM.Shim\<ver>\`, `nodesettings.json`) for a new box;
+  `Manager\` (shipped set only — never `gsm.db`, logs, `.updates\`).
+  The publish **fails** if the profile wasn't SelfContained + SingleFile.
+- **Single-file bundles leave natives loose.** `e_sqlite3.dll` must sit
+  next to `GSM.Node.exe`; without it the node dies at
+  `NodeDatabase.EnsureCreated` before file logging exists. Same for the
+  Manager (`e_sqlite3`, `WebView2Loader`, `*_cor3`, and `GSM.Contracts.dll`
+  which is loose on purpose for Roslyn — it changes whenever Contracts
+  changes).
+- **Publish order:** NodeSetup → Node → Manager. Node's `PublishShim`
+  target builds + bundles the shim. `GSM.Shim.Protocol`'s publish profile
+  is only a RID-slot regenerator for after a plain Build Solution.
+- **Interim stamps:** bump `<Version>`/`<FileVersion>` per node-side build
+  (0.6.1…0.6.6 in Oct 2026), keep below the next real release, record what
+  each carried in the props TEMP comment, revert before tagging.
+- **CtrlCSender** is never published on its own: GSM.Node's
+  `PublishCtrlCSender` inner build makes the self-contained win-x64 exe,
+  and `PgsmCollectCtrlCSender` (Directory.Build.targets) copies it from
+  the Windows Node publish dir into `publish-drop\<version>\`. So a
+  stamped CtrlCSender needs a **Windows Node publish**.
+

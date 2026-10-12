@@ -34,6 +34,16 @@
     <RuntimeIdentifiers>linux-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!--
+      Referenced ONLY for the version constants the version-flag fast
+      path prints (Phase 8-2 follow-up 5b): NodeApiContract.ProtocolVersion /
+      ContractsVersion are Const Integers, inlined at compile time.
+      Contracts is dependency-free net8.0, so both TFMs can take it.
+    -->
+    <ProjectReference Include="..\GSM.Contracts\GSM.Contracts.vbproj" />
+  </ItemGroup>
+
   <!-- Exclude the Windows\ folder from non-Windows builds.                       -->
   <!-- The cross-platform (net8.0) Linux build is console-only and must not see   -->
   <!-- any WinForms-dependent source files.                                       -->
@@ -70,6 +80,15 @@
     <ItemGroup>
       <_NodeSetupPublishedFiles Include="$(PublishDir)**\*" />
     </ItemGroup>
+    <!--
+      Fail loudly instead of "Deployed 0 file(s)": an empty glob means
+      PublishDir didn't resolve to where the publish actually landed
+      (the v0.2.0 shape), and the node folder would ship without a
+      NodeSetup survivor. Copy creates the destination folder itself,
+      so publish ORDER (NodeSetup before/after Node) is not a concern.
+    -->
+    <Error Condition="'@(_NodeSetupPublishedFiles->Count())' == '0'"
+           Text="DeployToNodeFolder: nothing to deploy — $(PublishDir) is empty or wrong. Check PublishDir / the pubxml." />
     <Copy SourceFiles="@(_NodeSetupPublishedFiles)"
           DestinationFiles="@(_NodeSetupPublishedFiles->'$(NodeDeploymentDir)%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true"

@@ -152,7 +152,9 @@ Namespace GSM.Manager.Core
             ' Absent — capture if allowed. Inside one lock so two
             ' concurrent callers can't start two dialogs: the second
             ' joins the first's in-flight task.
-            Dim captureTask As Task(Of String)
+            ' Initialised so the ByRef TryGetValue pass below doesn't
+            ' trip BC42030 ("passed by reference before assignment").
+            Dim captureTask As Task(Of String) = Nothing
             SyncLock _gate
                 If Not _inflight.TryGetValue(sessionKey, captureTask) Then
                     If Not allowPrompt OrElse _promptBlocked.Contains(sessionKey) Then

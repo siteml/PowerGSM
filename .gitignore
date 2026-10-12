@@ -179,6 +179,10 @@ DocProject/Help/html
 # Click-Once directory
 publish/
 
+# Uploadable-binary drop folder written by Directory.Build.targets
+# (PgsmCollectUploadable) after each RID publish of Node/Shim/NodeSetup.
+publish-drop/
+
 # Publish Web Output
 *.[Pp]ublish.xml
 *.azurePubxml

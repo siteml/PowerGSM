@@ -32,8 +32,21 @@ Namespace GSM.Shim.Protocol
         ''' always talk to an older shim and vice-versa. Bump ONLY when
         ''' adding capabilities; never remove or repurpose a frame type
         ''' or a field.
+        '''
+        ''' v2 (ConPTY, EventStream Slice 4): the shim understands
+        ''' SpawnSpec.Strategy = "ConPty" (pseudoconsole spawn via
+        ''' CreatePseudoConsole, output pumped like stdout) and
+        ''' StopMessage.Kind = "pty-ctrlc" (write 0x03 to the pty
+        ''' input; conhost's processed-input turns it into
+        ''' CTRL_C_EVENT for the attached game). Nothing removed or
+        ''' repurposed — a v1 shim keeps working for every
+        ''' pre-existing strategy indefinitely; the Node routes a
+        ''' ConPty spawn only when the negotiated version is >= 2
+        ''' (an older shim's Strategy else-branch would silently
+        ''' fall into the redirected-stdio spawn — piped,
+        ''' console-less, capture-dark).
         ''' </summary>
-        Public Const ProtocolVersion As Integer = 1
+        Public Const ProtocolVersion As Integer = 2
 
         ''' <summary>
         ''' Sanity cap on a single frame's payload so a corrupt or
@@ -92,6 +105,12 @@ Namespace GSM.Shim.Protocol
     Public Class HelloMessage
         Public Property ProtocolVersion As Integer
         Public Property Role As String   ' "node"
+        ''' <summary>Ring-replay cursor (v2 additive, 2026-08-12): the highest
+        ''' ring frame seq this node has already consumed from this shim.
+        ''' 0 = no cursor (fresh spawn, lost node.db, or a pre-cursor node) —
+        ''' the shim replays its whole ring, which was the only behaviour
+        ''' before this field. A pre-cursor shim ignores it (JSON-additive).</summary>
+        Public Property ReplayAfterSeq As Long
     End Class
 
     ''' <summary>shim -> node, reply to Hello.</summary>
@@ -103,6 +122,13 @@ Namespace GSM.Shim.Protocol
         Public Property ShimPid As Integer           ' the shim's own PID (adoption anchor); 0 if unknown
         Public Property InstanceId As String         ' the id the shim was launched with (--instance-id); lets a Node rediscover/adopt a live shim without node.db (Phase 8-3). Null/empty from older shims.
         Public Property LogFilePaths As System.Collections.Generic.List(Of String)  ' echoed from the Spawn's SpawnSpec so a node.db-less adopt can recover where to tail (Phase 8-3); null/empty for stdout-streamed games or pre-8-3 shims
+        ''' <summary>Ring-replay cursor (v2 additive, 2026-08-12): seq of the
+        ''' FIRST ring frame the shim will replay after this ack (and, when
+        ''' nothing qualifies, the seq the next live frame will carry). The
+        ''' node counts Stdout/Stderr frames from here to track its consumed
+        ''' cursor. 0 = shim predates ring seqs — the node must treat the
+        ''' replay as uncursored (full, uncounted), exactly the old behaviour.</summary>
+        Public Property ReplayStartSeq As Long
     End Class
 
     ''' <summary>
@@ -116,7 +142,7 @@ Namespace GSM.Shim.Protocol
         Public Property Arguments As String
         Public Property WorkingDirectory As String
         Public Property Environment As System.Collections.Generic.Dictionary(Of String, String)
-        ''' <summary>"StdoutCapture" | "HiddenConsoleDirect" | "HiddenConsoleWrapped".</summary>
+        ''' <summary>"StdoutCapture" | "HiddenConsoleDirect" | "HiddenConsoleWrapped" | "ConPty" (v2 — pseudoconsole spawn; a v1 shim never receives it, see ProtocolVersion).</summary>
         Public Property Strategy As String
         ''' <summary>
         ''' Absolute log-file paths the Node tails for this game (Phase 8-3).
@@ -130,7 +156,7 @@ Namespace GSM.Shim.Protocol
 
     ''' <summary>node -> shim, stop request.</summary>
     Public Class StopMessage
-        ''' <summary>"ctrlc" | "sigterm" | "stdin-line" | "kill".</summary>
+        ''' <summary>"ctrlc" | "sigterm" | "stdin-line" | "kill" | "pty-ctrlc" (v2 — 0x03 into the pty input of a ConPty game; a v1 shim's else-branch treats unknown kinds as kill, but the Node only sends it where v2 was negotiated).</summary>
         Public Property Kind As String
         Public Property TimeoutMs As Integer
         ''' <summary>For Kind = "stdin-line": the line to write (e.g. Factorio /quit).</summary>
@@ -175,3 +201,4 @@ Namespace GSM.Shim.Protocol
     End Module
 
 End Namespace
+

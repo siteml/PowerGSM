@@ -162,7 +162,7 @@ a confusing "v0".
 | Protocol version | First Manager release | Notes |
 | ---------------- | --------------------- | ----- |
 | (none)           | pre-0.1.0             | `/api/version` returned `application`/`version`/`runtime` only. Manager treats this as "node older". |
-| 1                | 0.1.0                 | Initial named version. `/api/version` adds `build`, `protocolVersion`, `contractsVersion` fields. All endpoints documented in `NodeApiContract.vb`. |
+| 1                | 0.1.0                 | Initial named version. `/api/version` adds `build`, `protocolVersion`, `contractsVersion` fields. All endpoints documented in `NodeApiContract.vb`. Still 1 at 0.7.0: every change since (TLS, events, boot flags, park/forget, restart/shutdown, auth rotate, staged-binary targets, `SinglePort`, `BootStartDelaySeconds`) has been a new endpoint or an optional field. |
 
 ---
 
@@ -232,7 +232,9 @@ phase 5f-3.
 | Contracts version | First introduced in | Notable changes |
 | ----------------- | ------------------- | --------------- |
 | 1                 | 0.1.0               | Initial baseline. All types documented in `GSM.Contracts/*.vb`. |
-| 2                 | 0.4.0 (Phase 7)     | Adds the utility-plugin surface: `IUtilityPlugin`, `UtilityEvent`/`UtilityEventKind`, `IUtilityContext`, web-session capture DTOs, capability constants (namespace `GSM.Utility`). Purely additive — contracts-v1 game plugins load unchanged; utility plugins must declare `requiresContracts="2"`. |
+| 2                 | 0.4.0 (Phase 7)     | Adds the utility-plugin surface: `IUtilityPlugin`, `UtilityEvent`/`UtilityEventKind`, `IUtilityContext`, web-session capture DTOs, capability constants (namespace `GSM.Utility`) + startup config render (`IStartupFileProvider`). Purely additive — contracts-v1 game plugins load unchanged; utility plugins must declare `requiresContracts="2"`. |
+| 3                 | 0.6.0               | Remote-control surface (`IRemoteControlProvider`, `RemoteControlContext`). Additive; bumped so a plugin using it refuses cleanly on a v2 Manager instead of a Roslyn error. |
+| 4                 | 0.7.0               | State-poll surface (`IStatePollProvider`, `StatePollResolveContext`, `ResolvedStatePollSource` — EventStream slice 2). Same rationale as v3. `TlsCertificateService` also moved into GSM.Contracts in 0.7.0 but is Manager/Node-internal, not plugin-facing — no bump for that. |
 
 ---
 

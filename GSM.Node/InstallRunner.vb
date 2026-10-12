@@ -351,6 +351,7 @@ Namespace GSM.Node
                     If op.RunCommonRedist Then
                         Await RunCommonRedistAsync(op, cancellation)
                     Else
+                        op.RedistStatus = "disabled"
                         _logger.LogInformation("Skipping _CommonRedist (disabled in installation settings)")
                     End If
                     Return
@@ -365,6 +366,7 @@ Namespace GSM.Node
                     If op.RunCommonRedist Then
                         Await RunCommonRedistAsync(op, cancellation)
                     Else
+                        op.RedistStatus = "disabled"
                         _logger.LogInformation("Skipping _CommonRedist (disabled in installation settings)")
                     End If
                     Return
@@ -1640,11 +1642,15 @@ Namespace GSM.Node
         ''' </summary>
         Private Async Function RunCommonRedistAsync(op As ActiveOperation,
                                                      cancellation As CancellationToken) As Task
-            If Not OperatingSystem.IsWindows() Then Return
+            If Not OperatingSystem.IsWindows() Then
+                op.RedistStatus = "not-applicable"
+                Return
+            End If
 
             Dim installPath = Path.GetFullPath(op.InstallPath).TrimEnd("\"c, "/"c)
             Dim redistRoot = Path.Combine(installPath, "_CommonRedist")
             If Not Directory.Exists(redistRoot) Then
+                op.RedistStatus = "no-folder"
                 _logger.LogInformation("No _CommonRedist folder at {Path}, skipping redist install", redistRoot)
                 Return
             End If
@@ -1653,11 +1659,25 @@ Namespace GSM.Node
             op.Message = "Installing redistributables..."
             _logger.LogInformation("Running redistributables from {Path}", redistRoot)
 
+            ' Incident follow-up #6: every installer's outcome is
+            ' recorded and surfaced on InstallProgressResponse, so
+            ' "did the redists actually run for this install?" is
+            ' answerable from the Manager instead of only from
+            ' node-log spelunking (the July Palworld DirectX gap).
+            Dim results As New List(Of RedistResult)
+            op.RedistStatus = "ran"
+            op.RedistResults = results
+
             Dim installedCount = 0
             For Each exePath In Directory.EnumerateFiles(redistRoot, "*.exe", SearchOption.AllDirectories)
                 cancellation.ThrowIfCancellationRequested()
 
                 Dim name = Path.GetFileName(exePath)
+                Dim relName = name
+                Try
+                    relName = Path.GetRelativePath(redistRoot, exePath)
+                Catch
+                End Try
                 Dim nameLower = name.ToLowerInvariant()
 
                 ' DirectX setup uses /silent; most others accept /install /quiet /norestart
@@ -1703,6 +1723,9 @@ Namespace GSM.Node
 
                         If timedOut Then
                             _logger.LogWarning("Redist {Exe} timed out after 5 minutes", name)
+                            results.Add(New RedistResult With {
+                                .Installer = relName, .ExitCode = Nothing,
+                                .Outcome = "timeout", .Detail = "killed after 5-minute cap"})
                             Continue For
                         End If
 
@@ -1715,18 +1738,32 @@ Namespace GSM.Node
                             Case 0, 1638, 3010
                                 installedCount += 1
                                 _logger.LogInformation("Redist {Exe} installed (code {Code})", name, p.ExitCode)
+                                results.Add(New RedistResult With {
+                                    .Installer = relName, .ExitCode = p.ExitCode,
+                                    .Outcome = "installed", .Detail = ""})
                             Case 5100
                                 _logger.LogInformation("Redist {Exe} skipped: system requirements not met", name)
+                                results.Add(New RedistResult With {
+                                    .Installer = relName, .ExitCode = p.ExitCode,
+                                    .Outcome = "requirements-not-met", .Detail = ""})
                             Case Else
                                 _logger.LogWarning("Redist {Exe} returned code {Code}", name, p.ExitCode)
+                                results.Add(New RedistResult With {
+                                    .Installer = relName, .ExitCode = p.ExitCode,
+                                    .Outcome = "failed", .Detail = ""})
                         End Select
                     End Using
                 Catch ex As Exception
                     _logger.LogWarning(ex, "Failed to run redist {Exe}", name)
+                    results.Add(New RedistResult With {
+                        .Installer = relName, .ExitCode = Nothing,
+                        .Outcome = "error", .Detail = ex.Message})
                 End Try
             Next
 
-            _logger.LogInformation("Redistributable install complete ({Count} processed)", installedCount)
+            _logger.LogInformation(
+                "Redistributable install complete ({Count} of {Total} installed ok)",
+                installedCount, results.Count)
         End Function
 
         Private Async Function ExecuteDownloadStepAsync(op As ActiveOperation,
@@ -1999,6 +2036,19 @@ Namespace GSM.Node
                                         ' on disk as a junk file.
                                         If IsPaxHeaderEntryKey(reader.Entry.Key) Then Continue While
 
+                                        ' Zip-slip guard (CVE-2026-44788 — SharpCompress
+                                        ' has no patched release; see the NoWarn note in
+                                        ' the vbproj). Mirrors the zip branch's explicit
+                                        ' destination check, expressed as an entry-path
+                                        ' reject since WriteEntryToDirectory computes the
+                                        ' destination internally.
+                                        If IsUnsafeEntryKey(reader.Entry.Key) Then
+                                            _logger.LogWarning(
+                                                "Skipping archive entry with unsafe path: {Key}",
+                                                reader.Entry.Key)
+                                            Continue While
+                                        End If
+
                                         If extractOnly IsNot Nothing AndAlso
                                            Not extractOnly.Contains(NormalizeEntryKey(reader.Entry.Key)) Then
                                             Continue While
@@ -2047,6 +2097,12 @@ Namespace GSM.Node
                             For Each entry In fileEntries
                                 cancellation.ThrowIfCancellationRequested()
                                 If IsPaxHeaderEntryKey(entry.Key) Then Continue For
+                                ' Zip-slip guard — same rationale as the tar.xz branch.
+                                If IsUnsafeEntryKey(entry.Key) Then
+                                    _logger.LogWarning(
+                                        "Skipping archive entry with unsafe path: {Key}", entry.Key)
+                                    Continue For
+                                End If
                                 If extractOnly IsNot Nothing AndAlso
                                    Not extractOnly.Contains(NormalizeEntryKey(entry.Key)) Then
                                     Continue For
@@ -2308,6 +2364,32 @@ Namespace GSM.Node
                 If segment.Equals("@PaxHeader", StringComparison.OrdinalIgnoreCase) Then Return True
                 If segment.StartsWith("PaxHeaders", StringComparison.OrdinalIgnoreCase) Then Return True
                 If segment.StartsWith("@PaxHeader", StringComparison.OrdinalIgnoreCase) Then Return True
+            Next
+            Return False
+        End Function
+
+        ''' <summary>
+        ''' True when an archive entry's path could escape the
+        ''' extraction root: rooted paths ("/etc/...", "\...",
+        ''' "C:\...") or any ".." segment. Mitigates
+        ''' CVE-2026-44788 / GHSA-6c8g-7p36-r338 (SharpCompress
+        ''' directory traversal via directory entries in
+        ''' WriteToDirectory), which has NO patched release — so
+        ''' the fix lives here instead of in a version bump.
+        ''' Entries shaped like this are never legitimate in a
+        ''' game-server archive; callers skip them with a logged
+        ''' warning. The zip branch doesn't need this — it
+        ''' computes destinations itself and already checks them
+        ''' against the extraction root.
+        ''' </summary>
+        Private Shared Function IsUnsafeEntryKey(entryKey As String) As Boolean
+            If String.IsNullOrEmpty(entryKey) Then Return False
+            If entryKey.StartsWith("/", StringComparison.Ordinal) OrElse
+               entryKey.StartsWith("\", StringComparison.Ordinal) Then Return True
+            If entryKey.Length >= 2 AndAlso entryKey(1) = ":"c Then Return True
+            Dim segments = entryKey.Split({"/"c, "\"c}, StringSplitOptions.RemoveEmptyEntries)
+            For Each segment In segments
+                If segment = ".." Then Return True
             Next
             Return False
         End Function
@@ -3072,7 +3154,9 @@ Namespace GSM.Node
                 .SteamCmdPhase = op.SteamCmdPhase,
                 .BytesDownloaded = op.BytesDownloaded,
                 .BytesTotal = op.BytesTotal,
-                .InstalledBuildId = op.InstalledBuildId
+                .InstalledBuildId = op.InstalledBuildId,
+                .RedistStatus = op.RedistStatus,
+                .RedistResults = op.RedistResults
             }
         End Function
 
@@ -3089,6 +3173,15 @@ Namespace GSM.Node
         Public Property Steps As List(Of InstallStep)
         Public Property SteamCredentials As SteamCredential
         Public Property RunCommonRedist As Boolean
+
+        ''' <summary>Redist-pass outcome for this operation — see
+        ''' InstallProgressResponse.RedistStatus (incident
+        ''' follow-up #6).</summary>
+        Public Property RedistStatus As String
+
+        ''' <summary>Per-installer outcomes when RedistStatus is
+        ''' "ran".</summary>
+        Public Property RedistResults As List(Of RedistResult)
         Public Property State As InstallationOperationState
         Public Property StartedAt As DateTime
         Public Property CompletedAt As DateTime?

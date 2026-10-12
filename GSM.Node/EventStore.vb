@@ -43,10 +43,14 @@ Namespace GSM.Node
 
         Private ReadOnly _instances As New ConcurrentDictionary(Of String, InstanceEventState)
         Private ReadOnly _database As NodeDatabase
+        Private ReadOnly _stream As EventStreamStore
         Private ReadOnly _logger As ILogger(Of EventStore)
 
-        Public Sub New(database As NodeDatabase, logger As ILogger(Of EventStore))
+        Public Sub New(database As NodeDatabase,
+                       stream As EventStreamStore,
+                       logger As ILogger(Of EventStore))
             _database = database
+            _stream = stream
             _logger = logger
             EnsureChatTable()
             EnsureStateTables()
@@ -557,9 +561,84 @@ Namespace GSM.Node
                 Next
             End If
 
+            ' Roster hydration from the durable stream (EventStream
+            ' Slice 1 follow-up): on adoption, rebuild the current
+            ' player list — with ORIGINAL join times — from the
+            ' events table instead of depending on the log-replay
+            ' backfill window. Pre-stream, the live roster was
+            ' in-memory only; a node restart rebuilt it by
+            ' re-parsing the last 512KB of log, so join lines older
+            ' than the window were simply lost. The stream is the
+            ' node-local durable record of joins/leaves (never
+            ' auto-pruned), so folding it back is both exact and
+            ' bounded. Runs BEFORE the tailer/ring-buffer replay
+            ' kicks in; that replay then re-folds the same lines
+            ' idempotently (dedup-suppressed appends still fold).
+            If hydrateState Then
+                HydratePlayersFromStream(state)
+            End If
+
+            state.ParseTraceBudget = 20
             _instances(instanceId) = state
             _logger.LogInformation("Registered {Count} parse rule(s) for {Id}",
                                    state.CompiledRules.Count, instanceId)
+        End Sub
+
+        ''' <summary>
+        ''' Folds the instance's persisted stream back into the
+        ''' in-memory projections, from the last ProcessStarted
+        ''' event onward. The ProcessStarted bound is what makes
+        ''' this safe: sessions cannot span a game-process restart
+        ''' (everyone must rejoin), so events before it cannot
+        ''' describe anyone still online — folding from there
+        ''' converges to the exact current roster, join times
+        ''' included, without resurrecting months-old ghosts. If
+        ''' the stream holds no ProcessStarted for this instance
+        ''' (instance started under a pre-stream node binary),
+        ''' hydration is skipped and the legacy log-replay rebuild
+        ''' applies alone.
+        '''
+        ''' Purged events are absent from the table, so a hard
+        ''' purge stays purged through this path too. Chat events
+        ''' re-fold against the ux_chat_dedup INSERT OR IGNORE, so
+        ''' no duplicate chat rows are produced.
+        ''' </summary>
+        Private Sub HydratePlayersFromStream(state As InstanceEventState)
+            Try
+                Dim startSeq = _stream.GetLastSeqOfKind(state.InstanceId,
+                                                        ParsedEventKind.ProcessStarted)
+                If startSeq <= 0 Then Return
+
+                Dim cursor As Long = startSeq   ' skip ProcessStarted itself
+                Dim folded = 0
+                Do
+                    Dim batch = _stream.GetEvents(state.InstanceId, cursor, 1000)
+                    If batch.Count = 0 Then Exit Do
+                    For Each rec In batch
+                        cursor = rec.Seq
+                        Try
+                            ApplyEvent(state, rec.Kind, rec.Fields, rec.UtcAt, rec.Raw)
+                            folded += 1
+                        Catch ex As Exception
+                            _logger.LogDebug(ex,
+                                "Stream hydration: event seq {Seq} failed to fold for {Id}",
+                                rec.Seq, state.InstanceId)
+                        End Try
+                    Next
+                Loop
+
+                If folded > 0 Then
+                    SyncLock state.Lock
+                        _logger.LogInformation(
+                            "Hydrated roster for {Id} from stream: folded {Count} event(s) since seq {Start}; {Players} player(s) online",
+                            state.InstanceId, folded, startSeq, state.Players.Count)
+                    End SyncLock
+                End If
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "Stream roster hydration failed for {Id}; falling back to log-replay rebuild",
+                    state.InstanceId)
+            End Try
         End Sub
 
         ''' <summary>
@@ -635,10 +714,46 @@ Namespace GSM.Node
             SyncLock state.Lock
                 state.CompiledRules = compiled
             End SyncLock
+            state.ParseTraceBudget = 20
 
             _logger.LogInformation("Updated to {Count} parse rule(s) for {Id} (in-memory state preserved)",
                                    compiled.Count, instanceId)
         End Sub
+
+        ''' <summary>
+        ''' Ingest chokepoint for SYNTHESIZED events — no log line
+        ''' behind them (EventStream Slice 2: the REST poller's
+        ''' join/leave/status events). Appends to the canonical
+        ''' stream (purge watermarks, source authority, and replay
+        ''' dedup all enforced there) and folds into the in-memory
+        ''' projections through the same ApplyEvent the parse path
+        ''' uses — downstream cannot tell a polled event from a
+        ''' parsed one, which is the point. No-ops when the
+        ''' instance isn't registered (stop/start race: the poller
+        ''' is being torn down anyway). Returns True when the event
+        ''' actually entered the stream.
+        ''' </summary>
+        Public Function IngestSynthesizedEvent(instanceId As String,
+                                               kind As ParsedEventKind,
+                                               fields As Dictionary(Of String, String),
+                                               utcAt As DateTime,
+                                               sourceId As String) As Boolean
+            Dim state As InstanceEventState = Nothing
+            If Not _instances.TryGetValue(instanceId, state) Then Return False
+
+            Dim appended = _stream.Append(EventScopeType.Instance, instanceId,
+                                          utcAt, kind, sourceId, fields, Nothing)
+            If appended.Purged OrElse appended.Suppressed Then Return False
+
+            Try
+                ApplyEvent(state, kind, fields, utcAt, Nothing)
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "Synthesized {Kind} event from {Source} failed to fold for {Id}",
+                    kind, sourceId, instanceId)
+            End Try
+            Return appended.Inserted
+        End Function
 
         ' UE4 log lines are prefixed with `[yyyy.MM.dd-HH.mm.ss:fff]`
         ' in UTC (dedicated server default). Capture group 1 is the
@@ -664,19 +779,50 @@ Namespace GSM.Node
         ''' every replay of a given chat line. The UE4 timestamp
         ''' is stable — same line, same timestamp, every time.
         ''' </summary>
+        ' Palworld console lines carry the GAME'S own bracketed
+        ' prefix `[yyyy-MM-dd HH:mm:ss]` in the server's LOCAL time
+        ' (matches the host wall clock in live captures 2026-08-12).
+        ' Without parsing it, replayed lines (shim ring replay on
+        ' every adopt) fell back to arrival wall-clock, which made
+        ' the ux_events_replay_dedup key (…, utc_at, raw) unique per
+        ' replay — the ENTIRE history re-inserted with adopt-time
+        ' stamps on each node restart (observed live). Seconds
+        ' resolution only; parsed AssumeLocal→UTC (game and node
+        ' share the machine, hence the clock).
+        Private Shared ReadOnly _bracketLocalTimestampRegex As New Regex(
+            "^\s*\[(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\]",
+            RegexOptions.Compiled Or RegexOptions.CultureInvariant)
+
         Private Shared Function TryParseUe4Timestamp(text As String) As DateTime?
             If String.IsNullOrEmpty(text) Then Return Nothing
             Dim m = _ue4TimestampRegex.Match(text)
-            If Not m.Success Then Return Nothing
-            Dim combined = m.Groups(1).Value & "." & m.Groups(2).Value
-            Dim parsed As DateTime
-            If DateTime.TryParseExact(combined,
-                                       "yyyy.MM.dd-HH.mm.ss.fff",
-                                       System.Globalization.CultureInfo.InvariantCulture,
-                                       System.Globalization.DateTimeStyles.AssumeUniversal Or
-                                       System.Globalization.DateTimeStyles.AdjustToUniversal,
-                                       parsed) Then
-                Return parsed
+            If m.Success Then
+                Dim combined = m.Groups(1).Value & "." & m.Groups(2).Value
+                Dim parsed As DateTime
+                If DateTime.TryParseExact(combined,
+                                           "yyyy.MM.dd-HH.mm.ss.fff",
+                                           System.Globalization.CultureInfo.InvariantCulture,
+                                           System.Globalization.DateTimeStyles.AssumeUniversal Or
+                                           System.Globalization.DateTimeStyles.AdjustToUniversal,
+                                           parsed) Then
+                    Return parsed
+                End If
+                Return Nothing
+            End If
+
+            ' Fallback: game-local bracketed prefix (Palworld shape).
+            Dim m2 = _bracketLocalTimestampRegex.Match(text)
+            If m2.Success Then
+                Dim combined2 = m2.Groups(1).Value & " " & m2.Groups(2).Value
+                Dim parsed2 As DateTime
+                If DateTime.TryParseExact(combined2,
+                                           "yyyy-MM-dd HH:mm:ss",
+                                           System.Globalization.CultureInfo.InvariantCulture,
+                                           System.Globalization.DateTimeStyles.AssumeLocal Or
+                                           System.Globalization.DateTimeStyles.AdjustToUniversal,
+                                           parsed2) Then
+                    Return parsed2
+                End If
             End If
             Return Nothing
         End Function
@@ -685,7 +831,8 @@ Namespace GSM.Node
         ''' Apply all registered rules to a single log line. Called by
         ''' ProcessManager as lines flow through either stdout or tailers.
         ''' </summary>
-        Public Sub ProcessLine(instanceId As String, timestampUtc As DateTime, text As String)
+        Public Sub ProcessLine(instanceId As String, timestampUtc As DateTime, text As String,
+                               Optional sourceId As String = "stdout")
             If String.IsNullOrEmpty(text) Then Return
             Dim state As InstanceEventState = Nothing
             If Not _instances.TryGetValue(instanceId, state) Then Return
@@ -700,23 +847,188 @@ Namespace GSM.Node
             ' nothing regresses there.
             Dim eventTime = If(TryParseUe4Timestamp(text), timestampUtc)
 
+            Dim traceMatched As String = Nothing
+            Dim traceOutcome As String = Nothing
+
             For Each rule In state.CompiledRules
                 Dim m = rule.Regex.Match(text)
                 If Not m.Success Then Continue For
+                If traceMatched Is Nothing Then
+                    traceMatched = If(rule.Name, rule.Kind.ToString())
+                End If
                 Try
-                    ApplyMatch(state, rule, m, eventTime, text)
+                    ' EventStream Slice 1 reroute: a rule hit APPENDS an
+                    ' EventRecord to the canonical stream first; the
+                    ' in-memory player/state/chat updates in ApplyEvent
+                    ' are folds applied over that record's field set.
+                    ' Append handles replay dedup internally (adoption
+                    ' ring-buffer replays and tailer backfills re-fold
+                    ' in-memory state but persist/notify nothing) — see
+                    ' EventStreamStore.
+                    Dim fields = ExtractFields(m)
+                    Dim appended = _stream.Append(EventScopeType.Instance, instanceId,
+                                                  eventTime, rule.Kind, sourceId, fields, text)
+                    ' Purge-watermark drops are NOT folded: purged
+                    ' history must stay gone — folding it would
+                    ' re-persist chat rows / re-materialise sessions
+                    ' from purged lines on the next replay (the exact
+                    ' "purged chat comes back" bug the watermark
+                    ' exists to kill). Authority-suppressed drops are
+                    ' not folded either — authority IS the dedupe, so
+                    ' the non-owning source's copy must not reach
+                    ' projections (Slice 2). Replay-dedup suppressions
+                    ' (Inserted=False, neither flag) DO still fold,
+                    ' so adoption rebuilds in-memory state as before.
+                    traceOutcome = $"inserted={appended.Inserted} suppressed={appended.Suppressed} purged={appended.Purged}"
+                    If appended.Purged OrElse appended.Suppressed Then Continue For
+                    ApplyEvent(state, rule.Kind, fields, eventTime, text)
                 Catch ex As Exception
                     _logger.LogWarning(ex, "Rule {Name} threw while applying", rule.Name)
                 End Try
             Next
+
+            ' Bounded parse-path trace (see ParseTraceBudget doc).
+            If state.ParseTraceBudget > 0 Then
+                state.ParseTraceBudget -= 1
+                _logger.LogInformation(
+                    "ParseTrace {Id} [{Src}] rules={Rules} match={Match} {Outcome}: {Text}",
+                    instanceId, sourceId, state.CompiledRules.Count,
+                    If(traceMatched, "none"), If(traceOutcome, ""), text)
+            End If
+
+            ' Always-on parse-trace RING (Diagnostics Wave 2,
+            ' 2026-08-15): last ParseTraceRingCap lines with their
+            ' match verdict + append outcome, served by
+            ' GET /events/parsetrace so "console line visible,
+            ' event nowhere" is a Manager click instead of log
+            ' archaeology. Small fixed cap, trimmed in place.
+            SyncLock state.Lock
+                state.ParseTraceRing.Add(New ParseTraceEntry With {
+                    .AtUtc = DateTime.UtcNow,
+                    .SourceId = sourceId,
+                    .RuleName = traceMatched,
+                    .Outcome = traceOutcome,
+                    .Line = If(text.Length > 300, text.Substring(0, 300), text)
+                })
+                If state.ParseTraceRing.Count > ParseTraceRingCap Then
+                    state.ParseTraceRing.RemoveRange(0, state.ParseTraceRing.Count - ParseTraceRingCap)
+                End If
+            End SyncLock
         End Sub
 
-        Private Sub ApplyMatch(state As InstanceEventState,
-                               rule As CompiledRule,
-                               m As Match,
+        ''' <summary>Ring cap for the always-on parse trace.</summary>
+        Private Const ParseTraceRingCap As Integer = 100
+
+        ''' <summary>
+        ''' Diagnostics Wave 2: snapshot of the parse-trace ring +
+        ''' remaining log-side budget. Empty response for untracked
+        ''' instances (no rules registered).
+        ''' </summary>
+        Public Function GetParseTrace(instanceId As String) As ParseTraceResponse
+            Dim resp As New ParseTraceResponse With {
+                .Entries = New List(Of ParseTraceEntry),
+                .LogBudgetRemaining = 0
+            }
+            Dim state As InstanceEventState = Nothing
+            If Not _instances.TryGetValue(instanceId, state) Then Return resp
+            SyncLock state.Lock
+                resp.Entries.AddRange(state.ParseTraceRing)
+                resp.LogBudgetRemaining = state.ParseTraceBudget
+            End SyncLock
+            Return resp
+        End Function
+
+        ''' <summary>
+        ''' Diagnostics Wave 2: re-arm the 20-line log-side trace
+        ''' (the ring is always on). Returns the post-rearm state.
+        ''' </summary>
+        Public Function RearmParseTrace(instanceId As String) As ParseTraceResponse
+            Dim state As InstanceEventState = Nothing
+            If _instances.TryGetValue(instanceId, state) Then
+                SyncLock state.Lock
+                    state.ParseTraceBudget = 20
+                End SyncLock
+            End If
+            Return GetParseTrace(instanceId)
+        End Function
+
+        ''' <summary>
+        ''' Diagnostics Wave 2: dry-run one line through the
+        ''' instance's REGISTERED rules — pure regex verdicts +
+        ''' named captures. No append, no fold, no trace-ring entry.
+        ''' </summary>
+        Public Function TestLine(instanceId As String, line As String) As RuleDryRunResponse
+            Dim resp As New RuleDryRunResponse With {.Results = New List(Of RuleDryRunResult)}
+            If String.IsNullOrEmpty(line) Then Return resp
+            Dim state As InstanceEventState = Nothing
+            If Not _instances.TryGetValue(instanceId, state) Then Return resp
+            Dim rules As List(Of CompiledRule)
+            SyncLock state.Lock
+                rules = New List(Of CompiledRule)(state.CompiledRules)
+            End SyncLock
+            For Each rule In rules
+                Dim result As New RuleDryRunResult With {
+                    .RuleName = If(rule.Name, rule.Kind.ToString()),
+                    .KindName = rule.Kind.ToString(),
+                    .Matched = False
+                }
+                Try
+                    Dim m = rule.Regex.Match(line)
+                    If m.Success Then
+                        result.Matched = True
+                        result.Captures = New Dictionary(Of String, String)(StringComparer.Ordinal)
+                        Dim fs = ExtractFields(m)
+                        If fs IsNot Nothing Then
+                            For Each f In fs
+                                result.Captures(f.Key) = f.Value
+                            Next
+                        End If
+                    End If
+                Catch ex As Exception
+                    result.Captures = New Dictionary(Of String, String) From {
+                        {"error", ex.Message}
+                    }
+                End Try
+                resp.Results.Add(result)
+            Next
+            Return resp
+        End Function
+
+        ''' <summary>
+        ''' Diagnostics Wave 2: distinct kind names the instance's
+        ''' registered rules parse — the informational ParsesKinds
+        ''' surface for /events/sources (distinct from the
+        ''' authority-enforced OwnedKinds).
+        ''' </summary>
+        Public Function GetRuleKindNames(instanceId As String) As List(Of String)
+            Dim result As New List(Of String)
+            Dim state As InstanceEventState = Nothing
+            If Not _instances.TryGetValue(instanceId, state) Then Return result
+            Dim seen As New HashSet(Of String)(StringComparer.Ordinal)
+            SyncLock state.Lock
+                For Each rule In state.CompiledRules
+                    If seen.Add(rule.Kind.ToString()) Then result.Add(rule.Kind.ToString())
+                Next
+            End SyncLock
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Folds one event into the instance's in-memory
+        ''' projections (player list, server state) and the
+        ''' projection-written tables (chat_messages, players,
+        ''' instance_state). Formerly ApplyMatch(Match); now
+        ''' consumes the same field set the appended EventRecord
+        ''' carries, so the fold is a pure function of the stream
+        ''' (EventStream Slice 1). Behaviour is intentionally
+        ''' identical — GetField has GetGroup's exact semantics.
+        ''' </summary>
+        Private Sub ApplyEvent(state As InstanceEventState,
+                               kind As ParsedEventKind,
+                               fields As Dictionary(Of String, String),
                                timestampUtc As DateTime,
                                rawText As String)
-            Select Case rule.Kind
+            Select Case kind
 
                 Case ParsedEventKind.PlayerJoin
                     ' Join events can fire with any of these keys available:
@@ -728,12 +1040,12 @@ Namespace GSM.Node
                     '     via PlayerIdentity)
                     ' The session is created once (first sighting) and then
                     ' progressively enriched by later matches.
-                    Dim persona = GetGroup(m, "PlatformPersona")
-                    Dim display = GetGroup(m, "DisplayName")
-                    Dim cid = GetGroup(m, "CharacterId")
-                    Dim addr = GetGroup(m, "RemoteAddress")
-                    Dim pid = GetGroup(m, "PlatformUserId")
-                    Dim platform = GetGroup(m, "Platform")
+                    Dim persona = GetField(fields, "PlatformPersona")
+                    Dim display = GetField(fields, "DisplayName")
+                    Dim cid = GetField(fields, "CharacterId")
+                    Dim addr = GetField(fields, "RemoteAddress")
+                    Dim pid = GetField(fields, "PlatformUserId")
+                    Dim platform = GetField(fields, "Platform")
 
                     ' A connection-accept line arrives with JUST RemoteAddress
                     ' and nothing else — don't create a session for it, just
@@ -873,12 +1185,12 @@ Namespace GSM.Node
                     '          players on busy servers (concurrent
                     '          joins, no later chat) stay on the FLS
                     '          handle. Bounded edge case.
-                    Dim persona = GetGroup(m, "PlatformPersona")
-                    Dim display = GetGroup(m, "DisplayName")
-                    Dim cid = GetGroup(m, "CharacterId")
-                    Dim pid = GetGroup(m, "PlatformUserId")
-                    Dim platform = GetGroup(m, "Platform")
-                    Dim addr = GetGroup(m, "RemoteAddress")
+                    Dim persona = GetField(fields, "PlatformPersona")
+                    Dim display = GetField(fields, "DisplayName")
+                    Dim cid = GetField(fields, "CharacterId")
+                    Dim pid = GetField(fields, "PlatformUserId")
+                    Dim platform = GetField(fields, "Platform")
+                    Dim addr = GetField(fields, "RemoteAddress")
 
                     Dim sess As PlayerSession = Nothing
                     SyncLock state.Lock
@@ -903,9 +1215,38 @@ Namespace GSM.Node
                                Not String.Equals(pid, "UNKNOWN", StringComparison.OrdinalIgnoreCase) AndAlso
                                Not String.IsNullOrEmpty(display) Then
                             ' Stash path 1: Persisting-before-Login.
+                            ' Also carries persona/addr when present so a
+                            ' connect-style identity line that happens to
+                            ' include a display name loses nothing.
                             state.PendingIdentitiesByPlatformUserId(pid) = New PendingIdentity With {
                                 .DisplayName = display,
                                 .Platform = platform,
+                                .PlatformPersona = persona,
+                                .RemoteAddress = addr,
+                                .StampUtc = timestampUtc
+                            }
+                        ElseIf Not String.IsNullOrEmpty(pid) AndAlso
+                               Not String.Equals(pid, "UNKNOWN", StringComparison.OrdinalIgnoreCase) AndAlso
+                               String.IsNullOrEmpty(cid) AndAlso
+                               (Not String.IsNullOrEmpty(persona) OrElse
+                                Not String.IsNullOrEmpty(addr)) Then
+                            ' Stash path 1b: connect-before-join (double-Join
+                            ' fix, 2026-08-13). Palworld's "connected the
+                            ' server" line is PlayerIdentity (persona + IP +
+                            ' pid, no display, no cid) and fires BEFORE the
+                            ' session-creating "joined the server" PlayerJoin.
+                            ' Stash by pid; DrainPendingIdentity applies
+                            ' persona/addr/platform when pal-join creates the
+                            ' session. cid must be empty so CharacterUpdate-
+                            ' style lines (cid+pid) keep taking stash path 2.
+                            ' No session materialises here — a client that
+                            ' connects but never completes join leaves only
+                            ' this stash entry (dropped on leave or replaced
+                            ' by the next connect).
+                            state.PendingIdentitiesByPlatformUserId(pid) = New PendingIdentity With {
+                                .Platform = platform,
+                                .PlatformPersona = persona,
+                                .RemoteAddress = addr,
                                 .StampUtc = timestampUtc
                             }
                         ElseIf Not String.IsNullOrEmpty(cid) AndAlso
@@ -951,11 +1292,11 @@ Namespace GSM.Node
                     ' Correlate by any key available: CharacterId (strongest),
                     ' then PlatformUserId, then RemoteAddress, then DisplayName,
                     ' then PlatformPersona.
-                    Dim persona = GetGroup(m, "PlatformPersona")
-                    Dim display = GetGroup(m, "DisplayName")
-                    Dim cid = GetGroup(m, "CharacterId")
-                    Dim addr = GetGroup(m, "RemoteAddress")
-                    Dim pid = GetGroup(m, "PlatformUserId")
+                    Dim persona = GetField(fields, "PlatformPersona")
+                    Dim display = GetField(fields, "DisplayName")
+                    Dim cid = GetField(fields, "CharacterId")
+                    Dim addr = GetField(fields, "RemoteAddress")
+                    Dim pid = GetField(fields, "PlatformUserId")
 
                     ' target hoisted to outer scope for the post-
                     ' SyncLock PersistPlayer call — the last upsert
@@ -1007,8 +1348,8 @@ Namespace GSM.Node
                     PersistPlayer(state, target, timestampUtc)
 
                 Case ParsedEventKind.ChatMessage
-                    Dim speaker = GetGroup(m, "DisplayName")
-                    Dim msg = GetGroup(m, "Message")
+                    Dim speaker = GetField(fields, "DisplayName")
+                    Dim msg = GetField(fields, "Message")
                     If String.IsNullOrEmpty(speaker) OrElse String.IsNullOrEmpty(msg) Then Return
 
                     ' Pull the stronger correlation keys from the chat
@@ -1027,8 +1368,8 @@ Namespace GSM.Node
                     ' empty strings here; FindExistingSession ignores
                     ' empty keys and falls through to display/persona
                     ' lookup as before.
-                    Dim chatCid = GetGroup(m, "CharacterId")
-                    Dim chatPid = GetGroup(m, "PlatformUserId")
+                    Dim chatCid = GetField(fields, "CharacterId")
+                    Dim chatPid = GetField(fields, "PlatformUserId")
 
                     ' Two-purpose handler: enrich the chat row's
                     ' identity columns (CharacterId, PlatformUserId)
@@ -1105,7 +1446,7 @@ Namespace GSM.Node
 
                 Case ParsedEventKind.ServerStateChange
                     SyncLock state.Lock
-                        Dim ms = GetGroup(m, "MatchState")
+                        Dim ms = GetField(fields, "MatchState")
                         If Not String.IsNullOrEmpty(ms) Then
                             state.ServerState.MatchState = ms
                             ' Tile fields are only meaningful while the
@@ -1124,7 +1465,7 @@ Namespace GSM.Node
                                 state.ServerState.CurrentMapPath = Nothing
                             End If
                         End If
-                        Dim reg = GetGroup(m, "Registered")
+                        Dim reg = GetField(fields, "Registered")
                         If Not String.IsNullOrEmpty(reg) Then state.ServerState.BackendRegistered = True
                         state.ServerState.LastUpdatedUtc = timestampUtc
                     End SyncLock
@@ -1137,11 +1478,11 @@ Namespace GSM.Node
 
                 Case ParsedEventKind.TileLoaded
                     SyncLock state.Lock
-                        Dim tid = GetGroup(m, "TileId")
+                        Dim tid = GetField(fields, "TileId")
                         If Not String.IsNullOrEmpty(tid) Then state.ServerState.TileId = tid
-                        Dim tname = GetGroup(m, "TileName")
+                        Dim tname = GetField(fields, "TileName")
                         If Not String.IsNullOrEmpty(tname) Then state.ServerState.TileName = tname
-                        Dim mpath = GetGroup(m, "MapPath")
+                        Dim mpath = GetField(fields, "MapPath")
                         If Not String.IsNullOrEmpty(mpath) Then state.ServerState.CurrentMapPath = mpath
                         state.ServerState.LastUpdatedUtc = timestampUtc
                     End SyncLock
@@ -1152,10 +1493,10 @@ Namespace GSM.Node
 
             End Select
 
-            ' Harvest any "Custom_*" capture groups regardless of rule.Kind —
+            ' Harvest any "Custom_*" fields regardless of kind —
             ' lets plugins surface game-specific state alongside (or instead of)
             ' the well-known fields driven by the Select Case above.
-            HarvestCustomFields(state, m, timestampUtc)
+            HarvestCustomFields(state, fields, timestampUtc)
         End Sub
 
         ''' <summary>
@@ -1202,39 +1543,71 @@ Namespace GSM.Node
             End Try
         End Sub
 
-        Private Shared Function GetGroup(m As Match, name As String) As String
-            If m Is Nothing Then Return Nothing
-            Dim g = m.Groups(name)
-            If g Is Nothing OrElse Not g.Success Then Return Nothing
-            Return g.Value
+        ''' <summary>
+        ''' Extracts every successful NAMED capture group from a
+        ''' rule match into the field dictionary that becomes both
+        ''' the appended EventRecord.Fields and the fold's input.
+        ''' Numeric group names (the regex engine's positional
+        ''' groups "0", "1", ...) are skipped — only named groups
+        ''' are contract-meaningful. Returns Nothing when the match
+        ''' produced no named captures.
+        ''' </summary>
+        Private Shared Function ExtractFields(m As Match) As Dictionary(Of String, String)
+            If m Is Nothing OrElse Not m.Success Then Return Nothing
+            Dim fields As Dictionary(Of String, String) = Nothing
+            For Each groupName In m.Groups.Keys
+                If String.IsNullOrEmpty(groupName) Then Continue For
+                Dim numeric As Integer
+                If Integer.TryParse(groupName, numeric) Then Continue For
+                Dim grp = m.Groups(groupName)
+                If grp Is Nothing OrElse Not grp.Success Then Continue For
+                If fields Is Nothing Then
+                    fields = New Dictionary(Of String, String)(StringComparer.Ordinal)
+                End If
+                fields(groupName) = grp.Value
+            Next
+            Return fields
         End Function
 
         ''' <summary>
-        ''' Scans named capture groups whose names start with "Custom_"
-        ''' and writes the captured values into ServerState.CustomFields
+        ''' Field accessor with the retired GetGroup's exact
+        ''' semantics: Nothing when the field wasn't captured
+        ''' (group missing or unsuccessful in the source match),
+        ''' the raw captured value otherwise.
+        ''' </summary>
+        Private Shared Function GetField(fields As Dictionary(Of String, String),
+                                          name As String) As String
+            If fields Is Nothing Then Return Nothing
+            Dim v As String = Nothing
+            If fields.TryGetValue(name, v) Then Return v
+            Return Nothing
+        End Function
+
+        ''' <summary>
+        ''' Scans event fields whose names start with "Custom_"
+        ''' and writes the values into ServerState.CustomFields
         ''' (with the prefix stripped). Runs after the main Select Case in
-        ''' ApplyMatch regardless of rule.Kind, so a single regex can both
+        ''' ApplyEvent regardless of kind, so a single regex can both
         ''' drive a known event kind AND harvest custom state in one pass.
         ''' Plugins that just want to scrape state can use Kind=Custom and
         ''' rely entirely on this method.
         ''' </summary>
         Private Shared Sub HarvestCustomFields(state As InstanceEventState,
-                                                m As Match,
+                                                fields As Dictionary(Of String, String),
                                                 timestampUtc As DateTime)
-            If m Is Nothing OrElse Not m.Success Then Return
+            If fields Is Nothing OrElse fields.Count = 0 Then Return
 
             Dim updates As Dictionary(Of String, String) = Nothing
-            For Each groupName In m.Groups.Keys
+            For Each kvp In fields
+                Dim groupName = kvp.Key
                 If String.IsNullOrEmpty(groupName) Then Continue For
                 If Not groupName.StartsWith("Custom_", StringComparison.Ordinal) Then Continue For
-                Dim grp = m.Groups(groupName)
-                If grp Is Nothing OrElse Not grp.Success Then Continue For
                 Dim fieldName = groupName.Substring("Custom_".Length)
                 If String.IsNullOrEmpty(fieldName) Then Continue For
                 If updates Is Nothing Then
                     updates = New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
                 End If
-                updates(fieldName) = grp.Value
+                updates(fieldName) = kvp.Value
             Next
 
             If updates Is Nothing Then Return
@@ -1397,6 +1770,16 @@ Namespace GSM.Node
             If Not String.IsNullOrEmpty(pending.Platform) Then
                 sess.Platform = pending.Platform
             End If
+            ' Connect-before-join stash (path 1b) fields: fill-only —
+            ' a live event's values always beat a stashed one's.
+            If Not String.IsNullOrEmpty(pending.PlatformPersona) AndAlso
+               String.IsNullOrEmpty(sess.PlatformPersona) Then
+                sess.PlatformPersona = pending.PlatformPersona
+            End If
+            If Not String.IsNullOrEmpty(pending.RemoteAddress) AndAlso
+               String.IsNullOrEmpty(sess.RemoteAddress) Then
+                sess.RemoteAddress = pending.RemoteAddress
+            End If
 
             state.PendingIdentitiesByPlatformUserId.Remove(sess.PlatformUserId)
         End Sub
@@ -1543,6 +1926,38 @@ Namespace GSM.Node
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Hard-purge companion for the chat projection: deletes
+        ''' chat_messages rows for an instance up to and including
+        ''' throughUtc. Called by the events purge endpoint when
+        ''' the purged kind is ChatMessage, alongside
+        ''' EventStreamStore.PurgeKind (which sets the append-time
+        ''' watermark that stops the purged lines from re-entering
+        ''' the stream — and therefore this table — on replay).
+        ''' Returns the number of rows deleted.
+        ''' </summary>
+        Public Function PurgeChatMessages(instanceId As String,
+                                          throughUtc As DateTime) As Integer
+            If String.IsNullOrEmpty(instanceId) Then Return 0
+            Try
+                Using conn = _database.OpenConnection()
+                    Using cmd = conn.CreateCommand()
+                        cmd.CommandText = "
+                            DELETE FROM chat_messages
+                            WHERE instance_id = $id AND timestamp_utc <= $cutoff
+                        "
+                        cmd.Parameters.AddWithValue("$id", instanceId)
+                        cmd.Parameters.AddWithValue("$cutoff", throughUtc.ToString("o"))
+                        Return cmd.ExecuteNonQuery()
+                    End Using
+                End Using
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "Failed to purge chat_messages for {Id}", instanceId)
+                Return 0
+            End Try
+        End Function
+
         Public Function GetChatHistory(instanceId As String,
                                         sinceUtc As DateTime?,
                                         limit As Integer) As IReadOnlyList(Of ChatMessage)
@@ -1605,6 +2020,19 @@ Namespace GSM.Node
     Friend Class InstanceEventState
         Public Property InstanceId As String
         Public Property CompiledRules As List(Of CompiledRule)
+
+        ''' <summary>Parse-path trace budget (diagnostics, 2026-08-12):
+        ''' ProcessLine logs its first N lines after every rules
+        ''' (re)registration — line text, rule matched (or none), and the
+        ''' append outcome — so "console line visible, event nowhere"
+        ''' is diagnosable from the node log instead of archaeology.</summary>
+        Public ParseTraceBudget As Integer
+
+        ''' <summary>Always-on parse-trace ring (Diagnostics Wave 2):
+        ''' last N processed lines with match verdict + append
+        ''' outcome, served by GET /events/parsetrace. Guarded by
+        ''' Lock; trimmed to EventStore.ParseTraceRingCap.</summary>
+        Public ReadOnly Property ParseTraceRing As New List(Of ParseTraceEntry)
         Public ReadOnly Property Players As New Dictionary(Of String, PlayerSession)(StringComparer.OrdinalIgnoreCase)
         Public ReadOnly Property ServerState As New ServerStateResponse()
         Public ReadOnly Property Lock As New Object()
@@ -1685,6 +2113,13 @@ Namespace GSM.Node
         ' pid-keyed entries since the dict key IS the
         ' PlatformUserId there.
         Public Property PlatformUserId As String
+        ' Connect-before-join stash (path 1b, 2026-08-13): a
+        ' PlayerIdentity connect line (e.g. Palworld "connected the
+        ' server") carries persona + IP before any session exists.
+        ' Drained fill-only into the session the subsequent
+        ' PlayerJoin creates.
+        Public Property PlatformPersona As String
+        Public Property RemoteAddress As String
         Public Property StampUtc As DateTime
     End Class
 

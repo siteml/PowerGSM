@@ -712,6 +712,28 @@ Namespace GSM.Manager.Core
                     .Platform = identity.Platform,
                     .ObservedAtUtc = DateTime.UtcNow
                 })
+
+            ' EventStream Slice 3 — manager:identity push. Plugin
+            ' contributions (LoMyrealm's myrealm-resolved names are
+            ' the motivating case) also become stream facts on the
+            ' stream-capable node(s) currently serving this scope,
+            ' so node folds / Discord / any consumer see the name
+            ' without waiting for a log line. ONLY plugin
+            ' contributions push — resolver observations that
+            ' originated from node data must not boomerang back.
+            ' Fire-and-forget: enrichment must never break the
+            ' contribution path.
+            Try
+                Dim sync = _serviceProvider.GetService(Of EventSyncService)()
+                If sync IsNot Nothing Then
+                    Dim _pushTask = sync.PushIdentityContributionAsync(
+                        identity.GameId, If(identity.SessionScope, ""),
+                        identity.CharacterId, identity.PlatformUserId,
+                        identity.CharacterName, identity.Platform)
+                End If
+            Catch ex As Exception
+                _logger.LogDebug(ex, "[{Plugin}] identity push scheduling failed", _pluginId)
+            End Try
         End Sub
 
         ' --- config ---

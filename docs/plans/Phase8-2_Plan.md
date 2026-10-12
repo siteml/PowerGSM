@@ -1,4 +1,4 @@
-# Phase 8-2 — Node self-update `[in progress]`
+# Phase 8-2 — Node self-update `[done]`
 
 > Seed doc for the 8-2 sub-phase. Expands the 8-2 summary in
 > `Phase8_Plan.md` into locked decisions + open sub-questions + slices, so a
@@ -20,7 +20,10 @@ alive across a node bounce.
 
 ## Status
 
-`[in progress]` — designed/confirmed with Site 2026-06-24. **8-1 is complete and
+`[done 2026-08-02]` — mechanism shipped in 0.4.0, rollback runtime-verified on
+both platforms, hardening follow-ups settled (1/5a/5b/6 implemented, 2/3/4
+dropped), full dev-box build passed — see the closeout at the bottom.
+Originally: designed/confirmed with Site 2026-06-24. **8-1 is complete and
 Linux-proven** (shim survives `systemctl stop` via `KillMode=process`,
 graceful SIGINT stop, re-adopt on restart all verified on the node), which is
 the precondition 8-2 was waiting on. Decisions D1–D5 below are confirmed; the
@@ -40,8 +43,17 @@ skips the exit cascade when detaching). **All four survivor paths — Linux
 (systemd + bare) and Windows (service + bare) — now verified, game PID unchanged
 across the bounce.** Slice 7a (Manager push + Update Nodes UI), **7-source (feed
 sourcing + Latest column)**, **7b/7c (shim + NodeSetup co-update)**, and slice 8
-(health-gate + rollback) are all built clean; the only remaining 8-2 work is the
-runtime verification of slice 8's auto-rollback on a live node.
+(health-gate + rollback) are all built clean.
+
+**Runtime verify — accidentally executed, late July 2026 (see closeout at the
+bottom):** a mistaken push of the ancient 0.2.0 binary to 2 Windows + 1 Linux
+node exercised the rollback path for real. Windows nodes recovered; the Linux
+node did NOT — its `gsmnode.service` was the slice-6 swap-only generation
+(`Type=simple`, no marker check, no revert branch), confirming this plan's own
+deployment caveat. Remaining 8-2 work: regenerate units on ALL existing systemd
+nodes (now a REQUIRED deployment step, not a caveat), then a deliberate re-drill
+of the Linux revert path; verify the Windows nodes reverted to the intended
+build rather than running 0.2.0.
 
 ---
 
@@ -430,13 +442,183 @@ this once its unit is regenerated (re-run NodeSetup install / rewrite
 `gsmnode.service` + `daemon-reload`); the marker-clear ships with the next node
 binary — both halves needed.
 
-**Runtime verify (todo):** push a deliberately-broken-but-correct-platform
-binary, confirm auto-revert to N-1 with instances still adopted and healthy — on
-a systemd node (8b-2) and a Windows/bare node (8b-1). The `Type=notify` switch
-is the one behavior change to watch (the node must reach ready within systemd's
-`TimeoutStartSec`; adoption of many instances runs before ready). Docs closeout
-done (CHANGELOG + this plan); flip `Phase8_Plan.md` 8-2 status to done once the
-slice-7 remainder lands.
+**Runtime verify — CLOSEOUT (accidental July 2026 push + deliberate
+2026-08-02 re-drill), stated PER NODE because outcomes diverged:**
+
+- Windows node A (long-lived install; companion files from the ancient
+  multi-file era still on disk): the pushed old/non-bundled exe found those
+  stray dependencies and RAN. Start-based gate satisfied -> NO revert. As a
+  running 0.2.0-era node it then rejected all further update attempts with
+  API call errors (pre-self-update build; the endpoints don't exist).
+  Recovery manual. The weak-gate exemplar: "started" is not "correct."
+- Windows node B (clean recent install): same push, no stray files to lean
+  on -> the exe NEVER STARTED -> auto-revert restored the former version,
+  no intervention. **Windows auto-revert path VERIFIED.**
+- Linux (systemd): failed in July solely because the unit was never
+  regenerated after 8-2 (slice-6 swap-only unit: `.new` -> live swap, no
+  marker handling, no `.failed` quarantine, no revert branch, `Type=simple`);
+  0.2.0 swapped in, failed, `Restart=on-failure` looped; manual `.old`
+  restore. After unit regeneration, the 2026-08-02 re-drill auto-reverted
+  cleanly. **Linux auto-revert path VERIFIED.**
+
+Net: the revert MECHANISM is verified on both platforms; no further drill
+owed. Nodes A and B are a natural controlled experiment — identical push,
+and directory hygiene alone decided clean-revert vs zombie. That elevates
+follow-up 3 from precaution to demonstrated-decisive, and the remaining gap
+is entirely the GATE (follow-ups 1-5 below).
+
+Consequences, promoted from caveat to REQUIRED:
+1. Regenerate `gsmnode.service` (re-run NodeSetup install + `daemon-reload`) on
+   EVERY existing systemd node before the rollback mechanism can be considered
+   deployed. A node without the regenerated unit has swap-without-rollback.
+2. Sweep incident debris on the affected node: stale `.update-pending` /
+   `.failed` / `.old` files are landmines for the next legitimate update.
+3. The deliberate drill (push broken-but-correct-platform binary, confirm
+   auto-revert to N-1 with instances adopted) is still OWED on the Linux path
+   post-regeneration; the Windows path is provisionally verified by the
+   accident. `Type=notify` timing (ready within `TimeoutStartSec` with many
+   instances adopting) remains the behavior to watch during that drill.
+
+**Re-drill result (2026-08-02): PASS where it counted.** Units regenerated,
+deliberate broken push repeated; the Linux node — July's casualty —
+auto-reverted and re-adopted cleanly. Combined with Windows node B's clean
+revert, both platforms' revert paths are verified; see the per-node closeout
+below. The open work is the gate, not the mechanism.
+
+**New finding from the drill — health gate granularity (WINDOWS node):** one
+pushed exe was from a NON-self-contained build, and it RAN — because ancient
+companion files from a long-superseded deployment were still present in that
+Windows node's dir and satisfied its loader. The gate read "healthy"; no revert fired. So the failure
+mode is not "started but incomplete" — it is "running on stale,
+version-mismatched dependencies while reporting fine," the subtly-wrong class
+rather than the dead class. This is the concrete mechanism behind the standing
+warning about unknown exe files: leftover files convert would-fail-loudly into
+runs-quietly-on-the-wrong-parts. Hardening follow-ups:
+1. Self-test-gated readiness: with `Type=notify`, withhold ready until a
+   startup self-check passes (config bind, DB open, endpoint self-probe, shim
+   dir reachable). Catches gross breakage; NOTE it may not catch stale-deps
+   execution that limps convincingly.
+   **IMPLEMENTED (2026-08-02).** New `GSM.Node\StartupSelfTest.vb`:
+   `GatedSystemdNotifier` (ISystemdNotifier wrapper — registered AFTER
+   `UseSystemd()` so it wins DI resolution and SystemdLifetime's automatic
+   READY on ApplicationStarted goes through the gate; STOPPING etc. pass
+   through untouched) + the check module (config sanity, `node.db` opens and
+   answers `SELECT 1` via new `NodeDatabase.VerifyReadable()`, shim binary
+   resolvable via `ShimSession.ResolveShimExePath` — promoted Private→Friend
+   so the probe uses the SAME resolution spawn uses — and a loopback
+   `/api/version` probe: plain HTTP, or HTTPS with the self-signed cert
+   accepted when HttpMode=Disabled; ~30 s retry budget, well inside the
+   default TimeoutStartSec 90 s). Driver in `NodeProgram`: pass → gate opens
+   (READY out) THEN the 8b-2 marker-clear grace starts — so "healthy" is now
+   "self-checked, then up 15 s", and a slow/failed check can no longer clear
+   the marker before systemd gives up; fail → graceful stop (shims detach,
+   games survive) + exit code 12, a failed start to systemd → 8b-2
+   marker/revert handles it. systemd-only by design (Windows/bare nodes keep
+   the NodeSetup survivor gate); scaffolding errors fail OPEN (the checks
+   decide health, the watchdog must never brick startup). No unit change
+   needed — 8b-2's regenerated `Type=notify` unit is exactly what this keys
+   into. Verified: gate hold/release/dedup + STOPPING passthrough exercised
+   in a sandbox harness; file compiles clean against stubbed hosting surface;
+   full dev-box build PASSED (2026-08-02, Site). OPTIONAL live drill, if ever
+   wanted: temporarily rename `GSM.Shim\` on the node → start → expect no
+   READY, exit 12, journal line, and (post-update) marker revert.
+2. ~~Bundle self-attestation~~ — DROPPED (2026-08-02, Site): YAGNI. The
+   enabling condition was a one-off local edge case (pre-self-contained-era
+   companion files on one long-lived install) that can't recur now that every
+   release ships self-contained single-file. Someone hand-compiling and
+   deploying a non-bundled binary is unsupported behavior and on them —
+   including Site.
+3. ~~Deployment-dir hygiene~~ — DROPPED (2026-08-02, Site): same YAGNI
+   rationale as 2 — the archaeological strata were a never-again local
+   condition, not a supported deployment shape.
+4. ~~Downgrade guard~~ — DROPPED (2026-08-02, Site): the manual-update flow
+   already pops a warning; the July push was an unread warning, not a
+   missing one.
+5. Binary version visibility, two complementary halves — **IMPLEMENTED
+   (2026-08-02)**:
+   a. EMBEDDED BUILD MARKER (the accident-preventer): MSBuild-generated
+      constant compiled into every binary — `PGSMBUILD|<component>|<version>|
+      <rid>|` — so the version/component/platform are readable from the file's
+      BYTES with no execution. The Manager's update file picker scans the
+      selected file for the marker (UTF-16 + UTF-8) and shows what was picked
+      BEFORE upload; the existing manual-update warning becomes
+      version-aware ("Selected GSM.Node 0.2.0 linux-x64 — node runs 0.7.1").
+      Also catches wrong-platform picks. This is the fix for the July
+      failure mode: a Linux ELF on a Windows disk is version-anonymous and
+      cannot be executed to ask.
+      **As built:** `Directory.Build.targets` (new, solution root) generates
+      `obj\...\PgsmBuildMarker.g.vb` into GSM.Node / GSM.Shim / GSM.NodeSetup
+      only — a `Global.PowerGSM.BuildInfo.PgsmBuildMarker` module of Const
+      Strings from `$(MSBuildProjectName)` + `$(Version)` +
+      `$(RuntimeIdentifier)` (falling back to the SDK host RID on plain dev
+      builds). Note the shape gained a TRAILING `|` as the parse terminator:
+      .NET metadata packs the next heap entry directly behind the constant
+      (verified in a built binary — garbage bytes start immediately after),
+      so `<rid>` needs a definite end. Consumer is
+      `GSM.Manager\Core\BuildMarkerScanner.vb`: UTF-16LE scan first (where
+      metadata puts constants — confirmed present in the built shim,
+      uncompressed; no single-file compression anywhere in the solution),
+      UTF-8 fallback; parse-validated per occurrence so stray prefix text
+      (e.g. the scanner's own constant in the Manager binary) is skipped.
+   b. `--version` flag on all three binaries (Node, Shim, NodeSetup):
+      fast-path arg check at the top of Main — print build/protocol/
+      contracts and exit 0, before host construction. On-box diagnostics
+      ("what is this node actually running" over SSH); Linux-native answer
+      to ELF having no VERSIONINFO equivalent.
+      **As built:** all three Mains print component/build/rid straight off
+      the 5a marker constants (printed identity and byte-scannable identity
+      can never drift) plus `NodeApiContract.ProtocolVersion` /
+      `ContractsVersion`; the shim adds its own wire-protocol version line.
+      GSM.Shim and GSM.NodeSetup gained a `GSM.Contracts` ProjectReference
+      for those Const Integers (inlined at compile time, but deps.json still
+      demands the DLL beside a framework-dependent shim, so
+      `CopyShimToOutput` in GSM.Node.vbproj now also copies
+      GSM.Contracts.dll into the dev shim folder).
+6. Update-all checkbox on the update screen: "Update all components" next to
+   the component combobox, DEFAULT CHECKED, combobox disabled while checked.
+   Sequence NodeSetup -> Shim -> Node (node last — it owns the service
+   bounce, and the earlier two updating first means the bounce's relaunch
+   path is already-new). Abort the whole sequence on any step failure rather
+   than continuing with a mixed set. Builds on slice 7b/7c co-update
+   machinery. Implement together with 5a — the marker-scan preview lives on
+   the same screen and the two changes share the file-selection code path.
+   **IMPLEMENTED (2026-08-02).** `NodeUpdatesForm` runs per-node step
+   sequences (`RunStagingAsync` generalised to a step list; single-target
+   pushes are a one-step sequence): a failed step skips that node's
+   remaining steps ("Failed at Shim: … — 1 remaining step(s) skipped") but
+   never blocks other nodes, preserving the per-node-independence decision
+   from 7a. Works in both sourcing modes — manual pops three pickers per
+   platform in apply order (cancelling any one aborts the whole op); feed
+   mode sources all three targets from the one release download and refuses
+   to push a platform whose component set sourced incompletely. The Version
+   box is single-target-manual only (marker/ProductVersion resolution is
+   authoritative per file in update-all); pick-time marker checks block
+   cross-component picks (a shim exe in the node slot is a definite
+   mismatch — the node itself cannot tell them apart at commit time).
+
+**Follow-up 5/6 implementation notes (2026-08-02):**
+- Learned the hard way that `NodePlatform` lives in namespace `GSM.Plugin`
+  (IGamePlugin.vb), not `GSM.Node.Api` — caught by compile.
+- Dev builds stamp the HOST RID into the marker (e.g. `win-x64`, or
+  `ubuntu.24.04-x64` on a distro SDK). Distro RIDs map to Platform=Unknown
+  in the scanner, which is informational-only — Unknown never triggers the
+  mismatch gate. Release publishes pin `win-x64`/`linux-x64`, so shipped
+  markers are always exact.
+- Verified in a Linux sandbox against a clean clone + these changes:
+  GSM.Shim and GSM.NodeSetup (net8.0) build clean; `--version` prints and
+  exits 0 on both; the scanner finds the marker in the built shim binary
+  (UTF-16LE, terminator doing its job), returns nothing for markerless
+  files, and skips the bare-prefix constant inside its own binary.
+  `NodeUpdatesForm.vb` + `BuildMarkerScanner.vb` compile clean against the
+  real GSM.Contracts (WinForms/Manager internals stubbed — NuGet and the
+  WindowsDesktop packs are unreachable from that sandbox). Full solution
+  build on the dev box: PASSED (2026-08-02, Site) — GSM.Node + GSM.Manager
+  covered end to end; runtime spot-check confirmed working as intended.
+
+**8-2 CLOSED OUT CLEAN (2026-08-02).** All follow-ups settled (1/5a/5b/6
+implemented, 2/3/4 dropped), full solution build passed on the dev box, and
+`Phase8_Plan.md`'s status carries the 8-2 DONE closeout. Nothing owed; the
+follow-up-1 live drill noted above is strictly optional.
 
 ---
 

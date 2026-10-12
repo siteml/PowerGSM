@@ -102,6 +102,12 @@ Public Module ServiceManager
     ''' (the operator can still chmod manually). Caller guarantees Linux.
     ''' </summary>
     Private Sub EnsureExecutable(path As String)
+        ' Callers already gate on RunningOnWindows(), but CA1416's
+        ' flow analysis only recognises OperatingSystem.* guards —
+        ' this in-body check is what convinces the analyzer the
+        ' Get/SetUnixFileMode calls below can't run on Windows
+        ' (and it makes the method independently safe).
+        If OperatingSystem.IsWindows() Then Return
         If Not File.Exists(path) Then Return
         Try
             Dim currentMode = File.GetUnixFileMode(path)

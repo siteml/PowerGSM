@@ -6,7 +6,7 @@ automation, notifications, and Discord integration. This guide walks through
 installing it and using each feature.
 
 Before you start, have at least one [Node running](node.md) with its auth token
-handy.
+and certificate fingerprint handy.
 
 ---
 
@@ -69,27 +69,38 @@ Menu map:
 | Menu | Items |
 |---|---|
 | **File** | Restart Normally / Restart in Safe Mode, Re-enable Features (safe mode only), Exit |
-| **Nodes** | Add Node…, New Installation…, Update Nodes… |
-| **Tools** | History…, Purge & Rebuild History…, Reload Plugins, Manage Plugins…, Open Plugins Folder, Steam Credentials…, Shared Resources…, Automation Rules…, Notifications…, Discord Bot…, Settings… |
+| **Nodes** | Add Node…, New Installation…, Update Nodes…, Secure All Nodes (HTTPS)… |
+| **Tools** | History…, Purge & Rebuild History…, Reload Plugins, Manage Plugins…, Open Plugins Folder, Steam Credentials…, Shared Resources…, Automation Rules…, Notifications…, Discord Bot…, Diagnostics…, Settings… |
 | **Help** | Check for updates…, Update History…, About PowerGSM… |
 
 The status bar along the bottom shows update availability, read-only-install
 warnings, and a safe-mode banner when relevant.
 
+In the tree, a **green person glyph with a number** after an instance is its
+current online player count (installations show the sum), so you can see
+where the activity is without opening anything. Everything under a
+**[detached]** Node is grey — the Manager isn't talking to it.
+
 ---
 
 ## Adding a Node
 
-**Nodes → Add Node…** (or right-click the tree root). You need three things
-from the Node you set up:
+**Nodes → Add Node…** (or right-click the tree root). You need four things
+from the Node you set up (the setup wizard printed the last two together):
 
 - **Address** — the Node's hostname or IP.
 - **Port** — its listen port (default `8765`).
-- **Auth token** — the token from the Node's `nodesettings.json` (the setup
-  wizard printed it).
+- **Auth token** — the shared secret.
+- **Cert SHA-256** — the fingerprint of the Node's certificate. With it, the
+  Manager's first contact is pinned HTTPS and the token never crosses the
+  wire in the clear. Leave it blank only for a Node that was set up without
+  HTTPS — the Manager then connects over plain HTTP, and you secure it
+  afterwards (below).
 
-Give the Node a friendly name and save. The Manager connects and the Node
-appears in the tree. Selecting it shows a **protocol compatibility indicator**:
+**Test Connection** proves the address/port/token (and fingerprint) before
+you save. Give the Node a friendly name and save. The Manager connects and
+the Node appears in the tree. Selecting it shows a **protocol compatibility
+indicator**:
 
 - **green** — Manager and Node speak the same protocol version.
 - **orange** — one side is newer. Everything the older side understands still
@@ -98,12 +109,49 @@ appears in the tree. Selecting it shows a **protocol compatibility indicator**:
 - **red** — the Node couldn't be contacted. Check the address, port, token,
   and firewall.
 
-**Attach / Detach.** Right-click a Node to *Detach* it — the Manager stops
-polling it but keeps its configuration, useful when a host is temporarily
-offline. *Attach* re-enables it. **Delete Node** removes it entirely (the games
-on the host are untouched on disk).
+### Securing a Node (HTTPS)
 
-**Edit Node…** changes the saved address, port, token, or name.
+The Node panel has an **HTTPS** line. For a Node added over plain HTTP it
+offers **Secure this node…**, which in one pass: turns HTTPS on (the Node
+mints its certificate), verifies the certificate over a pinned connection,
+switches plain HTTP **off**, and **rotates the auth token** over the new
+encrypted channel. Nothing on the Node's machine is touched by hand and
+running games are unaffected (the Node bounces once; its shims keep the
+games up). *Advanced* exposes the enable-only step if you want to keep plain
+HTTP for a while.
+
+**Nodes → Secure All Nodes (HTTPS)…** lists every Node that isn't fully
+secured yet (with its running-instance count), runs the same sequence on
+each ticked Node one at a time, and reports per row. Untick *rotate token*
+if another Manager also uses these Nodes and you'd rather re-enter tokens
+later.
+
+On a secured Node the panel reads *HTTPS: active on shared port N (pinned
+…)* and *HTTP: off*, with links to **Turn HTTP off / on**, **Rotate auth
+token…**, **Switch back to HTTP** and — for Nodes onboarded on a separate
+HTTPS port before 0.7 — **Move HTTPS to shared port…**.
+
+**Certificate mismatch.** If a Node ever presents a certificate other than
+the pinned one, the Manager **blocks it** and the panel turns red with
+**Re-trust certificate…**. Expect this after NodeSetup's *Regenerate TLS
+certificate* or a reinstall with a fresh data directory; otherwise treat it
+as suspicious. The dialog shows the fingerprint actually presented — compare
+it with what NodeSetup reports on the Node before accepting.
+
+### Node process control
+
+The panel's status row offers **Restart node…** (the Node relaunches itself
+via NodeSetup; games stay up) and **Shut down node…** (double-confirmed:
+the Node stays down until someone starts it on that machine).
+
+**Attach / Detach.** Right-click a Node to *Detach* it — the Manager stops
+polling it and stops probing it altogether, but keeps its configuration;
+useful when a host is deliberately offline. Its installations and instances
+show grey (unknown) in the tree. *Attach* re-enables it. **Delete Node**
+removes it entirely (the games on the host are untouched on disk).
+
+**Edit Node…** changes the saved address, port, token, or name (the pinned
+fingerprint is shown read-only; use *Re-trust* to change it).
 
 ---
 
@@ -198,6 +246,23 @@ prompt) about likely-fatal misconfigurations before launching.
 Stopping is graceful where the game supports it; a force-kill fallback applies
 after a timeout. Because each instance is supervised by its own shim on the
 Node, restarting or updating the Node does **not** stop your instances.
+
+**Surviving a host reboot.** Every instance's configuration ends with a
+lifecycle group the Node acts on **without the Manager**:
+
+- **Recover state on node restart** — if the instance was running when the
+  host (or Node) went down, the Node restarts it from its last launch settings
+  at the next boot.
+- **Auto start with node** — start it whenever the Node starts, even if it
+  was stopped on purpose (like a Windows service set to Automatic).
+- **Node-boot start delay (seconds)** — stagger: at boot the Node launches
+  instances in ascending delay (0 / 30 / 60 brings three servers up a minute
+  apart instead of all at once). Manager-initiated starts ignore it.
+
+Changes apply to the Node immediately on save. A boot-time restart loop is
+suppressed after three rapid attempts. The same group holds the crash policy
+knobs (max crashes, window, reset-after, minimum restart delay, graceful
+shutdown timeout).
 
 **Delete Instance** removes it (with a confirmation).
 
@@ -432,16 +497,25 @@ You don't update Nodes by hand. **Nodes → Update Nodes…** opens a fleet view
 one row per Node with its installed build, platform, and whether a newer
 release exists. Tick the Nodes you want and update them:
 
-- **Target** — Node, Shim, or NodeSetup (they all come from the same Node
-  release archive).
-- **Source** — the **latest release** from the feed (one click), or a **binary
-  you pick** (your own build; the Node verifies size + SHA-256 on commit).
+- **Update all components** (the default) — pushes NodeSetup, the Shim,
+  CtrlCSender (Windows Nodes) and the Node itself in that order, Node last
+  so its relaunch already uses the new survivor and shim. If a step fails,
+  that Node's remaining steps are skipped so it's never left on a mixed set.
+- **Single target** — untick *Update all components* and pick Node, Shim,
+  NodeSetup or CtrlCSender.
+- **Source** — the **latest release** from the feed (one click; each binary
+  is checksum-verified against the release before it's pushed), or a **binary
+  you pick** (your own build). Picked files are identified from their bytes
+  — the dialog tells you what you picked and warns about a wrong component,
+  wrong platform, or a downgrade before anything is uploaded; the Node
+  verifies size + SHA-256 again on commit.
 
-The Manager stages the binary on each Node, applies it, and (for the Node
+The Manager stages each binary on the Node, applies it, and (for the Node
 target) waits for it to come back. **Running games stay up** throughout — the
 per-instance shims keep them alive and the Node re-adopts them after the swap.
 If a Node update comes up unhealthy, the Node rolls back automatically. One
-Node failing never aborts the batch.
+Node failing never aborts the batch. The dialog can't be closed while a push
+is running.
 
 ---
 
@@ -476,6 +550,12 @@ the Manager warns you up front that self-update can't swap the binaries there.
 - **Paths** — read-only display of where `gsm.db` and `Plugins\` resolve.
 - **Updates** — how often to check for Manager updates, and whether to include
   pre-releases.
+- **Startup** — register the watchdog logon task so the Manager starts (and
+  is supervised) at sign-in.
+
+**Tools → Diagnostics…** is the fleet health view: one row per Node with
+build / protocol / platform / event-stream / TLS state, plus per-instance
+event sources, parse traces and boot-recovery state for troubleshooting.
 
 ---
 

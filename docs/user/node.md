@@ -2,7 +2,9 @@
 
 A **Node** is the agent that actually runs your game servers. You install one
 on every host machine. It's a small headless service that the Manager
-controls over HTTP. Nodes run on **Windows or Linux**.
+controls over **HTTPS** on a single port (the Manager pins the Node's
+self-signed certificate; plain HTTP is optional and off by default on a
+new Node). Nodes run on **Windows or Linux**.
 
 This guide covers installing, configuring, running, and updating a Node.
 Before you start, skim the [prerequisites](prerequisites.md) for your
@@ -31,6 +33,7 @@ Inside you'll find, among others:
 - `GSM.NodeSetup[.exe]` — the configuration and service-install utility (see next).
 - `nodesettings.json` — the Node's configuration file.
 - `GSM.Shim/` — per-instance supervisor binaries the Node launches.
+- `GSM.CtrlCSender.exe` (Windows only) — clean-shutdown helper.
 
 The release is **self-contained** — there's no .NET runtime to install.
 
@@ -44,8 +47,8 @@ The release is **self-contained** — there's no .NET runtime to install.
 ## 2. Configure the Node with GSM.NodeSetup
 
 `GSM.NodeSetup` is the companion tool that reads and writes `nodesettings.json`,
-generates the auth token, and installs the Node as a service. It sits right
-next to `GSM.Node`.
+generates the auth token **and the TLS certificate**, and installs the Node
+as a service. It sits right next to `GSM.Node`.
 
 - On **Windows**, running it with no arguments opens a **graphical** setup window.
 - On **Linux**, running it with no arguments opens an **interactive console
@@ -57,7 +60,7 @@ with `--config <path>`.
 ### The setup wizard
 
 On a fresh Node (auth token still the placeholder), the tool drops straight
-into a 5-step wizard. Press Enter to accept the value shown in `[brackets]`.
+into a 6-step wizard. Press Enter to accept the value shown in `[brackets]`.
 
 1. **Node identity** — a **Node ID** (defaults to the machine name; how the
    Node labels itself to the Manager) and the **listen port** (default `8765`).
@@ -68,12 +71,31 @@ into a 5-step wizard. Press Enter to accept the value shown in `[brackets]`.
 3. **Operations** — **max concurrent installs** (default `2`) and **log
    retention in days** (default `30`).
 4. **Authentication** — generates a strong **auth token**. This is the shared
-   secret the Manager uses to connect. **The wizard prints it once at the end
-   — copy it into the Manager when you add the Node.**
-5. **Review and save** — confirms and writes the file (backing up any existing
-   one to `nodesettings.json.bak`).
+   secret the Manager uses to connect.
+5. **Transport** — **Use HTTPS** (default yes) and whether to also allow
+   **plain HTTP** (`None` = HTTPS only, recommended; `Localhost` = plain
+   HTTP from the Node's own machine only; `Open` = plain HTTP from anywhere,
+   the pre-0.7 behaviour). HTTPS shares the listen port; an *Advanced*
+   prompt lets you put it on a separate port instead.
+6. **Review and save** — confirms and writes the file (backing up any existing
+   one to `nodesettings.json.bak`). With HTTPS on, the tool then **creates
+   the Node's self-signed certificate** and prints a hand-off block:
+
+   ```
+   Auth token:                 <token>
+   TLS fingerprint (SHA-256):  ab12cd34…   (paste into Manager -> Add Node -> Cert SHA-256)
+   Listens on:                 https://<host>:8765  (plain HTTP: disabled)
+   ```
+
+   **Copy both values into the Manager when you add the Node.** With the
+   fingerprint, the Manager's very first contact is already pinned HTTPS
+   and the token never travels in the clear.
 
 After saving, it offers to install the Node as a system service right away.
+
+The Windows GUI has the same fields on its **Transport** tab (with *Create /
+show certificate*, *Copy* and *Regenerate* buttons); Save shows the
+fingerprint in the confirmation.
 
 ### The main menu
 
@@ -90,6 +112,8 @@ wizard:
 | 6 Install as system service | Register + start the Node service. |
 | 7 Uninstall system service | Remove the service. |
 | 8 Show service status | Report whether the service is running. |
+| 9 Show TLS certificate fingerprint | Print the SHA-256 the Manager pins (offers to create the certificate if none exists yet). |
+| 10 Regenerate TLS certificate | Mint a new certificate. Every Manager pinned to this Node will report a **mismatch** until you *Re-trust* it there; stop the Node first. |
 
 ### Editing nodesettings.json by hand
 
@@ -185,26 +209,36 @@ commands for foreground, backgrounded, and shell access.
 
 ## 4. Verify it's running
 
-The Node exposes an **unauthenticated** version endpoint. Once it's up, open
-this in a browser (or `curl` it) from the Node itself, replacing the port if
-you changed it:
+The Node exposes an **unauthenticated** version endpoint. Once it's up, `curl`
+it from the Node itself, replacing the port if you changed it:
 
 ```
-http://localhost:8765/api/version
+curl -k https://localhost:8765/api/version
 ```
 
-You should get a small JSON response with the application name, build, and
-protocol version. From another machine, use the Node's address instead of
-`localhost` to confirm the port is reachable across the network — that's the
-same reachability the Manager needs.
+(`-k` because the certificate is self-signed; a browser will show a
+certificate warning for the same reason — that's expected, the Manager
+verifies by fingerprint, not by a certificate authority.) You should get a
+small JSON response with the application name, build, protocol version and
+`tlsEnabled: true`. If you allowed plain HTTP, `http://localhost:8765/api/version`
+works too; with plain HTTP off the connection is simply dropped. From another
+machine, use the Node's address instead of `localhost` to confirm the port is
+reachable across the network — that's the same reachability the Manager needs.
 
 ---
 
 ## 5. Add it to the Manager
 
-With the Node running and its auth token in hand, switch to the Manager and
-add the Node using its address, port, and token. See the
+With the Node running and its auth token **and certificate fingerprint** in
+hand, switch to the Manager and add the Node using its address, port, token
+and the fingerprint (*Cert SHA-256*). See the
 [Manager guide](manager.md#adding-a-node).
+
+If you set a Node up without HTTPS (or are adopting one from before 0.7),
+add it over plain HTTP and then click **Secure this node…** on its panel:
+the Manager turns HTTPS on, pins the certificate, switches plain HTTP off
+and rotates the auth token over the now-encrypted channel in one pass.
+**Nodes → Secure All Nodes (HTTPS)…** does the same for a whole fleet.
 
 ---
 
@@ -225,6 +259,9 @@ only touch the `Node` section.
 | `MaxConcurrentInstalls` | `2` | How many installs/updates run at once. |
 | `LogRetentionDays` | `30` | How long the Node keeps its logs. |
 | `MetricsIntervalSeconds` | `5` | How often the Node samples host/instance metrics. |
+| `EnableTls` | `true` (new setups) | Serve HTTPS with the Node's self-signed certificate (`<DataDirectory>/tls/node.pfx`). |
+| `TlsPort` | `0` | `0` = HTTPS shares `ListenPort` (recommended). A different port opens a separate HTTPS listener. |
+| `HttpMode` | `Disabled` (new setups) | Plain-HTTP policy: `Disabled`, `LoopbackOnly` or `Open`. Ignored (treated as `Open`) when `EnableTls` is false. |
 
 > Directory paths are written as **absolute** paths by the setup tool on
 > purpose: a service's working directory isn't the install folder, so a
@@ -286,10 +323,12 @@ For scripted or container deployments, skip the interactive tool:
 GSM.NodeSetup --auto-init
 ```
 
-This writes a fresh `nodesettings.json` with a freshly generated auth token
-and **prints the token to stdout** so your provisioning script can capture it
-and hand it to the Manager. Combine with `--config <path>` to target a specific
-file. On Linux you can then install the systemd unit with the standard
+This writes a fresh `nodesettings.json` with a freshly generated auth token,
+**creates the TLS certificate** (HTTPS on, plain HTTP off) and **prints the
+token and the certificate fingerprint to stdout** so your provisioning script
+can capture both and hand them to the Manager. Flags: `--no-tls` for the
+plain-HTTP shape, `--http-mode Disabled|LoopbackOnly|Open` to allow plain HTTP
+alongside HTTPS. Combine with `--config <path>` to target a specific file. On Linux you can then install the systemd unit with the standard
 `systemctl` commands, running the Node as your chosen service user.
 
 ---
@@ -298,7 +337,9 @@ file. On Linux you can then install the systemd unit with the standard
 
 | Symptom | Likely cause / fix |
 |---|---|
-| Manager can't connect | The token entered in the Manager doesn't match `AuthToken` on the Node, wrong port, or the port isn't open between them. Verify `/api/version` is reachable from the Manager's machine. |
+| Manager can't connect | The token entered in the Manager doesn't match `AuthToken` on the Node, wrong port, or the port isn't open between them. Verify `/api/version` is reachable from the Manager's machine (`curl -k https://host:port/api/version`). |
+| Manager shows **CERTIFICATE MISMATCH** | The Node is presenting a different certificate than the one pinned — you regenerated it (NodeSetup option 10), reinstalled the Node with a fresh data directory, or something is intercepting the connection. If you expect the change, click **Re-trust certificate…** on the Node panel and compare the fingerprint it shows with NodeSetup option 9 before accepting. |
+| `/api/version` works over HTTPS but the Manager says the node is on plain HTTP | Reopen the Node panel — the HTTP-mode line is fetched live; or run **Secure this node…** to turn plain HTTP off. |
 | A Steam game crashes instantly on Windows (exit `-1073741515`, no log) | Visual C++ runtime missing. Run the Node with Administrator rights so it can install the game's bundled redistributables. |
 | Steam install fails on Linux with a 32-bit library error | Install the 32-bit runtime: `sudo apt install lib32gcc-s1` (Debian/Ubuntu) or enable multilib + `sudo pacman -Sy lib32-gcc-libs` (Arch). |
 | Linux Node won't launch / "shim spawn failed" | Execute bit missing on `GSM.Node`/shim binaries after a Windows copy. Run `GSM.NodeSetup` once (it fixes `+x`), or `chmod +x` them. |

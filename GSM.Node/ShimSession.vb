@@ -55,6 +55,30 @@ Namespace GSM.Node
 
         Private ReadOnly _stdoutSplit As New LineSplitter()
         Private ReadOnly _stderrSplit As New LineSplitter()
+        Private ReadOnly _vtFilter As VtConsoleFilter   ' non-Nothing only for ConPty sessions
+        Private ReadOnly _repaintGate As RepaintLineGate ' non-Nothing only for ConPty sessions
+
+        ' Ring-cursor (protocol v2 additive, 2026-08-12): seq of the NEXT
+        ' Stdout/Stderr frame this session will receive (from the ack's
+        ' ReplayStartSeq), and the highest seq fully received. 0 = the shim
+        ' predates ring seqs — replay is uncursored and nothing is counted.
+        ' Written only on the read-loop thread; read cross-thread via the
+        ' ConsumedRingSeq property (Interlocked).
+        Private _ringNextSeq As Long
+        Private _consumedRingSeq As Long
+
+        ''' <summary>Diagnostic hook: raw Stdout frame payloads BEFORE the VT
+        ''' filter/splitter. Used by --shim-conpty-test to record the exact
+        ''' pty byte stream; Nothing in production.</summary>
+        Friend Property StdoutTap As Action(Of Byte())
+
+        ' Serializes splitter access (ReadLoop vs FlushPartials callers).
+        ' NOTE: an idle-flush loop briefly lived here (flush a quiet partial
+        ' line after 400ms) — removed 2026-08-11 by operator decision: its
+        ' only visible effect post-root-cause-fix was cosmetic partial-line
+        ' artifacts ("R" then the full line), and real game output is
+        ' newline-terminated. FlushPartials still runs at exit/link-drop.
+        Private ReadOnly _splitSync As New Object()
 
         ''' <param name="socketDir">Directory for the Unix socket on Linux (ignored on Windows pipes).</param>
         ''' <param name="onLine">(timestampUtc, line, isError) — one call per complete game output line.</param>
@@ -63,12 +87,27 @@ Namespace GSM.Node
                        socketDir As String,
                        onLine As Action(Of DateTime, String, Boolean),
                        onExited As Action(Of Integer),
-                       logger As ILogger)
+                       logger As ILogger,
+                       Optional filterVt As Boolean = False)
             _instanceId = instanceId
             _socketDir = socketDir
             _onLine = onLine
             _onExited = onExited
             _logger = If(logger, CType(NullLogger.Instance, ILogger))
+            ' ConPTY (EventStream Slice 4): the shim relays the pty's RAW VT
+            ' stream; the node strips it — stateful across frames, applied to
+            ' Stdout payloads BEFORE the LineSplitter so clean text lines
+            ' reach the buffer/EventStore. Node-side by design: stripping
+            ' fixes ride a node redeploy, never a shim generation.
+            If filterVt Then
+                _vtFilter = New VtConsoleFilter()
+                ' conhost can flush a paint MID-WRITE, so a repaint fragment
+                ' (a prefix of the row, e.g. a lone "[") can arrive as its
+                ' own "line" just before the full row is re-sent. The gate
+                ' holds each complete stdout line briefly and drops it when
+                ' the NEXT line supersedes it (held is a proper prefix).
+                _repaintGate = New RepaintLineGate(Sub(line) InvokeLine(line, isError:=False))
+            End If
         End Sub
 
         Public ReadOnly Property GamePid As Integer
@@ -120,6 +159,19 @@ Namespace GSM.Node
             End Get
         End Property
 
+        ''' <summary>
+        ''' Highest shim ring-frame seq this session has consumed (0 when the
+        ''' shim predates ring seqs or nothing has arrived). ProcessManager
+        ''' persists this on the instance snapshot and hands it back on the
+        ''' next adopt as the Hello's ReplayAfterSeq so the shim replays only
+        ''' the gap — the fix for full-history replay on every node restart.
+        ''' </summary>
+        Public ReadOnly Property ConsumedRingSeq As Long
+            Get
+                Return Interlocked.Read(_consumedRingSeq)
+            End Get
+        End Property
+
         ''' <summary>Completes with the game's exit code (or -1 if the link dropped first).</summary>
         Public ReadOnly Property ExitedTask As Task(Of Integer)
             Get
@@ -147,7 +199,15 @@ Namespace GSM.Node
         ''' read loop is running). On any failure returns False and the shim
         ''' process is torn down.
         ''' </summary>
-        Public Async Function StartAsync(spec As SpawnSpec, launchTimeoutMs As Integer, ct As CancellationToken) As Task(Of Boolean)
+        ''' <param name="requireProtocolVersion">When > 0, the NEGOTIATED
+        ''' protocol version (min of node and shim) must be at least this or
+        ''' the start fails BEFORE Spawn is sent — the ConPTY gate (Slice 4):
+        ''' a v1 shim's Strategy else-branch would silently spawn a ConPty
+        ''' spec as redirected stdio (piped, console-less, capture-dark).
+        ''' LastError then starts with "shim protocol" so the caller can
+        ''' recognise the mismatch and downgrade.</param>
+        Public Async Function StartAsync(spec As SpawnSpec, launchTimeoutMs As Integer, ct As CancellationToken,
+                                         Optional requireProtocolVersion As Integer = 0) As Task(Of Boolean)
             Try
                 _ownsShim = True   ' we are launching the shim; Dispose may kill it
                 _endpoint = MakeEndpoint(_instanceId, _socketDir)
@@ -166,6 +226,14 @@ Namespace GSM.Node
                     .RedirectStandardOutput = True,
                     .RedirectStandardError = True
                 }
+                ' ConPTY diagnostic (2026-08-11): PGSM_SHIM_CONSOLE=1 launches
+                ' the shim WITH a console window. The shim self-test (shim
+                ' attached to a console) sees the pty deliver the app's text;
+                ' under the node (console-less shim) the pty delivered only
+                ' conhost's initial paint. This toggle isolates that variable.
+                If Environment.GetEnvironmentVariable("PGSM_SHIM_CONSOLE") = "1" Then
+                    psi.CreateNoWindow = False
+                End If
                 psi.ArgumentList.Add("--instance-id")
                 psi.ArgumentList.Add(_instanceId)
                 psi.ArgumentList.Add("--endpoint")
@@ -187,6 +255,16 @@ Namespace GSM.Node
 
                 Dim ack As HelloAckMessage = Await ShimHandshake.ConnectAsync(_conn, ct).ConfigureAwait(False)
                 _protocolVersion = ack.ProtocolVersion
+                _ringNextSeq = ack.ReplayStartSeq   ' 0 = pre-cursor shim
+
+                If requireProtocolVersion > 0 AndAlso _protocolVersion < requireProtocolVersion Then
+                    _lastError = $"shim protocol v{_protocolVersion} < required v{requireProtocolVersion} for strategy {spec.Strategy}"
+                    _logger.LogWarning(
+                        "Shim {Id}: negotiated protocol v{Have} but strategy {Strategy} needs v{Need} — not spawning",
+                        _instanceId, _protocolVersion, spec.Strategy, requireProtocolVersion)
+                    TryKillShim()
+                    Return False
+                End If
 
                 Await _conn.WriteFrameAsync(FrameType.Spawn, ProtocolCodec.Encode(spec), ct).ConfigureAwait(False)
 
@@ -260,7 +338,8 @@ Namespace GSM.Node
         ''' Exited. Sends no Spawn (the game is already running). Returns True
         ''' on success. This is the Node-restart reconnect path (slice 3).
         ''' </summary>
-        Public Async Function AdoptAsync(endpoint As String, connectTimeoutMs As Integer, ct As CancellationToken) As Task(Of Boolean)
+        Public Async Function AdoptAsync(endpoint As String, connectTimeoutMs As Integer, ct As CancellationToken,
+                                         Optional replayAfterSeq As Long = 0) As Task(Of Boolean)
             Try
                 _ownsShim = False   ' we did not launch this shim; never kill it
                 _endpoint = endpoint
@@ -268,8 +347,9 @@ Namespace GSM.Node
                 Dim stream As Stream = Await ConnectWithRetryAsync(endpoint, connectTimeoutMs, ct).ConfigureAwait(False)
                 _conn = New FrameConnection(stream)
 
-                Dim ack As HelloAckMessage = Await ShimHandshake.ConnectAsync(_conn, ct).ConfigureAwait(False)
+                Dim ack As HelloAckMessage = Await ShimHandshake.ConnectAsync(_conn, ct, replayAfterSeq).ConfigureAwait(False)
                 _protocolVersion = ack.ProtocolVersion
+                _ringNextSeq = ack.ReplayStartSeq   ' 0 = pre-cursor shim (full, uncounted replay)
                 _shimVersion = ack.ShimVersion
                 _adoptedShimPid = ack.ShimPid
                 _adoptedLogFilePaths = ack.LogFilePaths
@@ -379,9 +459,29 @@ Namespace GSM.Node
                         Exit Do   ' link closed / dropped
                     End Try
 
+                    ' Ring-cursor accounting: every Stdout/Stderr frame is a
+                    ' ring frame (replayed or live) and seqs are contiguous
+                    ' from the ack's ReplayStartSeq — count it BEFORE
+                    ' processing so the persisted cursor never claims a frame
+                    ' the fold hasn't at least received.
+                    If _ringNextSeq > 0 AndAlso
+                       (f.Kind = FrameType.Stdout OrElse f.Kind = FrameType.Stderr) Then
+                        Interlocked.Exchange(_consumedRingSeq, _ringNextSeq)
+                        _ringNextSeq += 1
+                    End If
+
                     Select Case f.Kind
                         Case FrameType.Stdout
-                            EmitLines(_stdoutSplit, f.Payload, isError:=False)
+                            Dim tap = StdoutTap
+                            If tap IsNot Nothing Then
+                                Try
+                                    tap(f.Payload)
+                                Catch
+                                End Try
+                            End If
+                            Dim payload As Byte() = f.Payload
+                            If _vtFilter IsNot Nothing Then payload = _vtFilter.Filter(payload)
+                            EmitLines(_stdoutSplit, payload, isError:=False)
                         Case FrameType.Stderr
                             EmitLines(_stderrSplit, f.Payload, isError:=True)
                         Case FrameType.Exited
@@ -401,15 +501,30 @@ Namespace GSM.Node
         End Function
 
         Private Sub EmitLines(splitter As LineSplitter, payload As Byte(), isError As Boolean)
-            For Each line In splitter.Push(payload)
-                InvokeLine(line, isError)
+            Dim lines As IEnumerable(Of String)
+            SyncLock _splitSync
+                lines = splitter.Push(payload)
+            End SyncLock
+            For Each line In lines
+                If Not isError AndAlso _repaintGate IsNot Nothing Then
+                    _repaintGate.Push(line)     ' ConPty stdout: fragment-suppression gate
+                Else
+                    InvokeLine(line, isError)
+                End If
             Next
         End Sub
 
         Private Sub FlushPartials()
-            Dim a As String = _stdoutSplit.Flush()
+            Dim a As String
+            Dim b As String
+            SyncLock _splitSync
+                a = _stdoutSplit.Flush()
+                b = _stderrSplit.Flush()
+            End SyncLock
+            ' Release any gate-held complete line FIRST — it predates the
+            ' splitter partials being flushed below.
+            If _repaintGate IsNot Nothing Then _repaintGate.Flush()
             If a IsNot Nothing Then InvokeLine(a, False)
-            Dim b As String = _stderrSplit.Flush()
             If b IsNot Nothing Then InvokeLine(b, True)
         End Sub
 
@@ -499,6 +614,10 @@ Namespace GSM.Node
             If _disposed Then Return
             _disposed = True
             Try
+                If _repaintGate IsNot Nothing Then _repaintGate.Dispose()
+            Catch
+            End Try
+            Try
                 If _conn IsNot Nothing Then _conn.Dispose()
             Catch
             End Try
@@ -544,8 +663,10 @@ Namespace GSM.Node
         ''' {BaseDir}\GSM.Shim\<version>\GSM.Shim[.exe], falling back to a
         ''' flat GSM.Shim[.exe] next to the node. Sets versionOut to the
         ''' chosen version folder name (or "" for the flat fallback).
+        ''' Friend (was Private) so the startup self-test (8-2 follow-up 1)
+        ''' probes shim reachability with the SAME resolution spawn uses.
         ''' </summary>
-        Private Shared Function ResolveShimExePath(ByRef versionOut As String) As String
+        Friend Shared Function ResolveShimExePath(ByRef versionOut As String) As String
             versionOut = ""
             Dim baseDir As String = AppContext.BaseDirectory
             Dim exeName As String = If(OperatingSystem.IsWindows(), "GSM.Shim.exe", "GSM.Shim")
@@ -597,6 +718,82 @@ Namespace GSM.Node
     End Class
 
     ''' <summary>
+    ''' ConPty-only fragment suppressor (conhost delta-render artifact #2).
+    ''' conhost's delta renderer can flush a paint MID-WRITE of a console
+    ''' row: the flush ends with a cursor reposition, which the VT filter
+    ''' correctly renders as a line break — so the half-written row arrives
+    ''' as its own "line" (observed live: a lone "["), immediately followed
+    ''' by the repaint of the FULL row. The gate holds the most recent
+    ''' complete stdout line for up to HoldMs; when the next line arrives,
+    ''' a held line that is a PROPER PREFIX of it was such a fragment and
+    ''' is dropped. Anything else is released in order — worst case HoldMs
+    ''' late (invisible in the log view). Unlike the removed idle flush,
+    ''' this only ever delays or drops COMPLETE lines; it never synthesizes
+    ''' a partial. Exact-duplicate boundary repaints are NOT suppressed
+    ''' here (a legit repeated game line is indistinguishable).
+    ''' </summary>
+    Friend NotInheritable Class RepaintLineGate
+        Implements IDisposable
+
+        Private Const HoldMs As Integer = 250
+
+        Private ReadOnly _sink As Action(Of String)
+        Private ReadOnly _sync As New Object()
+        Private ReadOnly _timer As Threading.Timer
+        Private _held As String
+        Private _disposed As Boolean
+
+        Public Sub New(sink As Action(Of String))
+            _sink = sink
+            _timer = New Threading.Timer(AddressOf OnTimer, Nothing, Timeout.Infinite, Timeout.Infinite)
+        End Sub
+
+        ' Emission happens INSIDE the lock: the sink (InvokeLine) never
+        ' re-enters the gate, and releasing the lock first would let a
+        ' timer-thread release race a Push into out-of-order lines.
+        Public Sub Push(line As String)
+            SyncLock _sync
+                If _disposed Then Return
+                If _held IsNot Nothing Then
+                    Dim isFragment As Boolean =
+                        _held.Length < line.Length AndAlso
+                        line.StartsWith(_held, StringComparison.Ordinal)
+                    If Not isFragment Then _sink(_held)
+                End If
+                _held = line
+                _timer.Change(HoldMs, Timeout.Infinite)
+            End SyncLock
+        End Sub
+
+        ''' <summary>Release the held line immediately (timer / exit / link-drop).</summary>
+        Public Sub Flush()
+            SyncLock _sync
+                If _held IsNot Nothing Then
+                    _sink(_held)
+                    _held = Nothing
+                End If
+                If Not _disposed Then _timer.Change(Timeout.Infinite, Timeout.Infinite)
+            End SyncLock
+        End Sub
+
+        Private Sub OnTimer(state As Object)
+            Flush()
+        End Sub
+
+        Public Sub Dispose() Implements IDisposable.Dispose
+            SyncLock _sync
+                If _disposed Then Return
+                _disposed = True
+            End SyncLock
+            Try
+                _timer.Dispose()
+            Catch
+            End Try
+            Flush()   ' don't swallow a held line on teardown
+        End Sub
+    End Class
+
+    ''' <summary>
     ''' Splits a byte stream into UTF-8 lines on LF, stripping a trailing CR.
     ''' Buffers across chunks at the byte level so a multi-byte UTF-8 char
     ''' split across two frames is never decoded mid-character.
@@ -617,6 +814,13 @@ Namespace GSM.Node
             Next
             Return lines
         End Function
+
+        ''' <summary>Whether an unflushed partial line is buffered.</summary>
+        Public ReadOnly Property HasBuffered As Boolean
+            Get
+                Return _buf.Count > 0
+            End Get
+        End Property
 
         ''' <summary>Decode and clear any buffered tail that has no trailing LF.</summary>
         Public Function Flush() As String

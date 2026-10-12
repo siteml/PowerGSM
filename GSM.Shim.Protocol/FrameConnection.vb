@@ -141,13 +141,66 @@ Namespace GSM.Shim.Protocol
         End Function
 
         ''' <summary>
+        ''' Shim side, ring-cursor aware (v2 additive). Same handshake as
+        ''' AcceptAsync, but negotiates the ring replay window: the node's
+        ''' Hello.ReplayAfterSeq is clamped into the ring's available range
+        ''' [ringFirstSeq, ringNextSeq] and the resulting ReplayStartSeq is
+        ''' both sent in the ack and returned so the caller replays exactly
+        ''' the frames the node has not consumed. Callers pass the ring's
+        ''' CURRENT bounds (hold the send lock so they can't move before
+        ''' the replay).
+        ''' </summary>
+        Public Async Function AcceptExAsync(conn As FrameConnection,
+                                            shimVersion As String,
+                                            gamePid As Integer,
+                                            gameState As String,
+                                            instanceId As String,
+                                            logFilePaths As System.Collections.Generic.List(Of String),
+                                            ringFirstSeq As Long,
+                                            ringNextSeq As Long,
+                                            ct As CancellationToken) As Task(Of HandshakeAccept)
+            Dim f As Frame = Await conn.ReadFrameAsync(ct).ConfigureAwait(False)
+            If f.Kind <> FrameType.Hello Then
+                Throw New ProtocolException($"Expected Hello, got {f.Kind}")
+            End If
+
+            Dim hello As HelloMessage = ProtocolCodec.Decode(Of HelloMessage)(f.Payload)
+            Dim peerVersion As Integer = If(hello Is Nothing, ProtocolConstants.ProtocolVersion, hello.ProtocolVersion)
+            Dim negotiated As Integer = Math.Min(ProtocolConstants.ProtocolVersion, peerVersion)
+
+            Dim replayAfter As Long = If(hello Is Nothing, 0L, hello.ReplayAfterSeq)
+            ' First frame to replay: everything after the node's cursor that
+            ' is still in the ring. Cursor behind the ring (trimmed while the
+            ' node was away) -> ringFirstSeq (partial history, as today).
+            ' Cursor at/past the end (or empty ring) -> ringNextSeq
+            ' (nothing to replay; live frames start there).
+            Dim replayStart As Long = Math.Max(ringFirstSeq, replayAfter + 1L)
+            If replayStart > ringNextSeq Then replayStart = ringNextSeq
+
+            Dim ack As New HelloAckMessage With {
+                .ProtocolVersion = negotiated,
+                .ShimVersion = shimVersion,
+                .GamePid = gamePid,
+                .GameState = gameState,
+                .ShimPid = Environment.ProcessId,
+                .InstanceId = instanceId,
+                .LogFilePaths = logFilePaths,
+                .ReplayStartSeq = replayStart
+            }
+            Await conn.WriteFrameAsync(FrameType.HelloAck, ProtocolCodec.Encode(ack), ct).ConfigureAwait(False)
+            Return New HandshakeAccept With {.NegotiatedVersion = negotiated, .ReplayStartSeq = replayStart}
+        End Function
+
+        ''' <summary>
         ''' Node side. Sends Hello and reads the shim's HelloAck. Returns
         ''' the ack (negotiated version + reported game state).
         ''' </summary>
-        Public Async Function ConnectAsync(conn As FrameConnection, ct As CancellationToken) As Task(Of HelloAckMessage)
+        Public Async Function ConnectAsync(conn As FrameConnection, ct As CancellationToken,
+                                           Optional replayAfterSeq As Long = 0) As Task(Of HelloAckMessage)
             Dim hello As New HelloMessage With {
                 .ProtocolVersion = ProtocolConstants.ProtocolVersion,
-                .Role = "node"
+                .Role = "node",
+                .ReplayAfterSeq = replayAfterSeq
             }
             Await conn.WriteFrameAsync(FrameType.Hello, ProtocolCodec.Encode(hello), ct).ConfigureAwait(False)
 
@@ -159,5 +212,13 @@ Namespace GSM.Shim.Protocol
         End Function
 
     End Module
+
+    ''' <summary>Result of ShimHandshake.AcceptExAsync.</summary>
+    Public Class HandshakeAccept
+        Public Property NegotiatedVersion As Integer
+        ''' <summary>Seq of the first ring frame to replay to this node
+        ''' (= what the ack's ReplayStartSeq told it).</summary>
+        Public Property ReplayStartSeq As Long
+    End Class
 
 End Namespace

@@ -1,4 +1,4 @@
-# PowerGSM Roadmap
+﻿# PowerGSM Roadmap
 
 Forward-looking, ordered, statused view of where the project is
 going. Companion to:
@@ -9,7 +9,7 @@ going. Companion to:
 - **Backlog.md** — deferred items with technical repro notes,
   organised by category. Items get pulled from Backlog into this
   roadmap when prioritised.
-- **PhaseXX_Plan.md** files — design specs for individual
+- **docs/plans/PhaseXX_Plan.md** files — design specs for individual
   phases. The roadmap links to them; it does not duplicate.
 
 If you want to know **what's coming next**, this is the file. If
@@ -31,6 +31,84 @@ PowerGSM_Reference is the file.
 
 ## Current focus
 
+> Updated 2026-10-11. Everything below this box through "Next: Phase 9" is
+> the June/July-2026 state and is kept for history; the live picture is here.
+
+**0.7.0 — cut 2026-10-11 evening** (stamps reverted from the interim
+`0.6.1`…`0.6.6` hand-deploys; CHANGELOG `[0.7.0]` written; first commit
+since `3abd03e` 2026-08-01 carries the whole August–October tree). Release
+gate was the HTTPS single-port plan: **all five slices live-validated
+2026-10-11**. Next: watch the `v0.7.0` Actions run, then roll the fleet
+forward from the release feed (Update Nodes, feed mode) so every node
+reports 0.7.0 instead of a 0.6.x stamp.
+
+- **Small follow-ups after 0.7.0** `[queued]` — Manager-side cert
+  rotation UX (today: NodeSetup "Regenerate" + Re-trust); user-supplied
+  certs; `PowerGSM_Reference.md` project copy is the old monolith.
+
+- **HTTPS single-port / HTTP-off-by-default / cert-at-setup** `[shipped in main]` —
+  slices 0, 1 (sniffing listener), 3 (Add-Node fingerprint, `IsUsable`
+  relax) and 4 (guided "Secure this node" = enable → verify → HTTP off →
+  rotate token; fleet form; port move; Diagnostics column) **live-validated
+  2026-10-10/11** on Windows service, Windows user-mode and Linux nodes.
+  Slice 2 (cert service → Contracts, NodeSetup wizard/GUI Transport step
+  mints the cert + prints the fingerprint, `--auto-init --tls` default)
+  **live-validated 2026-10-11 21:32** — new node added pinned-first-contact
+  with HTTP off, no Secure step. Plan complete. →
+  `docs/plans/HTTPS_SinglePort_Plan.md`
+- **Node process control** `[shipped in main]` — `/api/system/restart` +
+  `/api/system/shutdown`, panel links, console-preserving relaunch for
+  hand-launched nodes (`NodeSetup --console`).
+- **Publish ergonomics** `[shipped in main]` — `publish-drop\<version>\`
+  (update binaries, hard error on a non-single-file publish),
+  `node-fresh-<rid>\` (fresh-box set incl. `e_sqlite3.dll`), `Manager\`
+  (shipped set only, no live state). `Directory.Build.targets`.
+- **Snapshot crash-knob persistence + boot stagger** `[shipped in main,
+  0.6.6]` — `CrashCountResetAfterSeconds` / `MinRestartDelayMs` on the
+  snapshot row (RCON triple skipped: node never reads it from the start
+  request); new per-instance `BootStartDelaySeconds` lifecycle field,
+  resurrect pass launches in ascending offset, live-pushed via
+  `/boot-flags`.
+- **CtrlCSender Update Nodes target** `[shipped in main, 0.6.6]` — 4th
+  entry, in-place swap, Windows-only (Linux rows skipped / sequence
+  NodeSetup → Shim → CtrlCSender → Node), build marker, publish-drop copy.
+- **HTTPS onboarding (two-port, TOFU)** `[shipped in main]` — Kestrel HTTPS
+  on `TlsPort`, SHA-256 pin via `CreateHandler()`, `TlsOnboardingService`
+  (probe/enable/verify/adopt/rollback/re-trust/HttpMode), NodePanel HTTPS
+  row, `AddNodeTls` migration. → `docs/plans/HTTPS_Onboarding_Plan.md`
+- **EventStream unification** `[shipped in main]` — node-side durable event
+  stream (Slice 1: store, replay dedup, purge watermarks, roster hydration),
+  generic REST poller host + `IStatePollProvider` (Slice 2, ContractsVersion
+  → 4), Manager cursor sync + projection + `manager:identity` push (Slice 3),
+  SSE live phase + orphan reaper + redist verification + lifecycle rows in
+  History (post-slice batch). → `docs/plans/EventStream_Unification_Plan.md`
+- **ConPTY (EventStream Slice 4)** `[shipped in main]` — shim protocol v2,
+  pty-backed console capture for UE/Windows servers, VT filter + repaint
+  gate, ring-cursor replay; G1–G4 + reconnect self-test all passed live
+  2026-08-11..17. → `docs/plans/ConPTY_Plan.md`
+- **Node-boot resurrection** `[shipped in main]` — "Recover state on node
+  restart" + "Auto start with node" flags, PARK, boot-flags/forget
+  endpoints, persisted flap guard; GR1–GR6 passed live. →
+  `docs/plans/NodeBoot_Resurrection_Plan.md`
+- **Manager Diagnostics window** `[shipped in main]` — Tools → Diagnostics:
+  fleet probe grid, event sources, stream health, watermarks, parse trace,
+  rule test, boot state, shim link (Waves 1+2 live-validated). →
+  `docs/plans/Diagnostics_Plan.md`
+- **Palworld plugin 0.3.0** — console-first join/leave (pal-rest poller
+  demoted), World Settings editor tab, double-Join/persona fixes;
+  History-wedge fix in Manager (`UpsertPlayerSession` change-tracker
+  lookup + `ApplyBatchResilientAsync` poison-event skip).
+- Crash-restart fix: shim-mode `RestartInstanceAsync` Boolean/String
+  coercion (orphaned shim on every shim crash-restart in ≤0.6.0).
+
+**Queued after 0.7.0:** NodeTransfer (export/import bundle, observer mode,
+ownership lease) → `docs/plans/NodeTransfer_Plan.md`; Diagnostics post-wave
+backlog (session-filter lifecycle UX, Windrose farewell rule, RCON extras);
+`ICredentialProtector` DPAPI wrapper (prereq for any Linux Manager path —
+assessment tabled 2026-08-29, web-fronted Manager favoured long-term).
+
+---
+
 **Phase 5m — Manager resilience** is functionally complete: 5m-1 (tray
 + window-state persistence), 5m-2 safe mode (a/b core + 2c in-safe-mode
 feature re-enable + 2d plugin enable/disable), 5m-2e (missing-plugin
@@ -39,7 +117,7 @@ pluginless instance was found startable via a persisted `ExeOverride`),
 and 5m-3 (watchdog auto-restart + start-at-sign-in via a per-user Task
 Scheduler logon task). 5m-4 (true Windows-service install) stays parked
 — the watchdog + logon task already deliver auto-restart and
-start-on-sign-in without it. → `Phase5m_Plan.md`
+start-on-sign-in without it. → `docs/plans/Phase5m_Plan.md`
 
 **Phase 5l — Manager self-update** is now complete: 5l-1 (detect +
 notify), 5l-2 (download + stage), and 5l-3 (apply) have all shipped.
@@ -50,7 +128,7 @@ staged-contracts compat report), the `apply.cmd` binary swap +
 an update-history table viewable under Help → Update History. The
 end-to-end swap is proven against a real published install; the
 from→to history row will validate naturally on the first apply between
-two builds that both carry the recording code. → `Phase5l_Plan.md`
+two builds that both carry the recording code. → `docs/plans/Phase5l_Plan.md`
 
 **Phase 6 — Plugin GitHub source + manifest + updates** is now
 complete: all four sub-phases (manifest model + parsing, source
@@ -61,7 +139,7 @@ source is seeded and browsable, and the whole acquire → stage →
 consent → install → hot-reload pipeline works without a Manager
 restart. The three plugin dialogs were consolidated into a single
 tabbed **Tools → Manage Plugins** window (Status / Sources /
-Updates). → `Phase6_Plan.md`
+Updates). → `docs/plans/Phase6_Plan.md`
 
 **Phase 7 — Manager-side utility plugins** shipped (June 2026):
 the `IUtilityPlugin` surface, event subscriptions, and the
@@ -69,7 +147,7 @@ declared-capability permission model landed, validated end-to-end
 by the lo-myrealm utility plugin across sub-phases 7-5b (Web
 Sessions UI), 7-6 (multi-realm discovery / import), and 7-7
 (multiple myrealm accounts + per-realm session failover). →
-`Phase7_Plan.md`, `Phase7-7_Plan.md`
+`docs/plans/Phase7_Plan.md`, `docs/plans/Phase7-7_Plan.md`
 
 **Phase 8 — Node self-update + restart-survivable instances** is
 complete and ships in **0.4.0** (the release gate). 8-1 (per-instance
@@ -81,11 +159,11 @@ swap/relaunch, with shim + NodeSetup co-update and a health-gate
 auto-rollback), and 8-3 (shim rediscovery / `node.db` hardening) all
 landed. Two runtime verifications ride along code-complete-but-unproven
 into 0.4.0 — the slice-8 auto-rollback and the 8-3 rediscovery path —
-flagged for a post-release live check. → `Phase8_Plan.md`,
-`Phase8-2_Plan.md`, `Phase8-3_Plan.md`
+flagged for a post-release live check. → `docs/plans/Phase8_Plan.md`,
+`docs/plans/Phase8-2_Plan.md`, `docs/plans/Phase8-3_Plan.md`
 
 **Next: Phase 9 — Node-side utility installations** (`[design]`) —
-reuses 8-1's shim + 8-2's staged-binary channel. → `Phase9_Plan.md`
+reuses 8-1's shim + 8-2's staged-binary channel. → `docs/plans/Phase9_Plan.md`
 
 ---
 
@@ -106,7 +184,7 @@ Scheduler logon task). 5m-4 (true service install) is parked — the
 watchdog + logon task cover auto-restart and start-on-sign-in. See
 the CHANGELOG for specifics.
 
-→ `Phase5m_Plan.md`
+→ `docs/plans/Phase5m_Plan.md`
 
 ### Phase 5l — Manager self-update `[shipped]`
 
@@ -132,7 +210,7 @@ Three-stage rollout, each independently shippable:
   apply attempt (success on post-update startup, failure when an
   `apply-error.log` is found).
 
-→ `Phase5l_Plan.md`
+→ `docs/plans/Phase5l_Plan.md`
 
 ### Phase 6 — Plugin GitHub source + manifest + updates `[shipped]`
 
@@ -165,7 +243,7 @@ Out of scope, tracked for later: plugin signing (HTTPS-only for
 now), curated marketplace, transitive cross-source dependency
 pulls, Node-side distribution.
 
-→ `Phase6_Plan.md`
+→ `docs/plans/Phase6_Plan.md`
 
 ### Phase 7 — Manager-side utility plugins `[shipped]`
 
@@ -184,7 +262,7 @@ through 7-7 shipped — Web Sessions UI (7-5b), multi-realm
 discovery + import (7-6), and multiple myrealm accounts with
 in-memory per-realm session failover (7-7).
 
-→ `Phase7_Plan.md`, `Phase7-7_Plan.md`
+→ `docs/plans/Phase7_Plan.md`, `docs/plans/Phase7-7_Plan.md`
 
 ### Phase 5n — Notification scope rework (+ panel ID surfacing) `[shipped]`
 
@@ -211,7 +289,7 @@ their instances so instance/set-scoped destinations catch them.
 Back-compat settled: pre-rework dual-filter rows are left as-is and
 reconfigured once.
 
-→ `Phase5n_Plan.md`
+→ `docs/plans/Phase5n_Plan.md`
 
 ### Phase 8 — Node self-update + restart-survivable instances `[shipped]`
 
@@ -254,7 +332,7 @@ shipping node-side iterations painless. Landed as three sub-phases
   (well-known pipe/socket names) and the shim echoes its id + log paths
   on adopt, so a wiped/corrupt `node.db` can't orphan running games.
 
-→ `Phase8_Plan.md`, `Phase8-2_Plan.md`, `Phase8-3_Plan.md`
+→ `docs/plans/Phase8_Plan.md`, `docs/plans/Phase8-2_Plan.md`, `docs/plans/Phase8-3_Plan.md`
 
 ### Phase 9 — Node-side utility installations `[design]`
 
@@ -274,7 +352,7 @@ alert when the Manager stops checking in (the one outage neither side
 can self-report). Distinct gear icon in the tree; no player / chat
 surfaces.
 
-→ `Phase9_Plan.md`
+→ `docs/plans/Phase9_Plan.md`
 
 ---
 
@@ -298,7 +376,7 @@ finally justifies the **persisted session→realm access map**
 deferred from 7-7 — a durable map earns its keep once writes must
 target a specific authoritative account rather than "whichever
 live session can read the page". Scope is loose and idea-rich; a
-dedicated `Phase10_Plan.md` pins it down last, after the Phase
+dedicated `docs/plans/Phase10_Plan.md` pins it down last, after the Phase
 8/9 plan docs are written.
 
 ### Container spawn strategy (Linux nodes) `[future]`
@@ -435,7 +513,7 @@ CHANGELOG.md.
   (display format, command-model surfacing, `/lastseen`).
   Retained here past the usual prune horizon specifically to
   document the numbering, since the follow-on items briefly
-  collided onto 5d-2/5d-3/5d-4. → `Phase5d_Plan.md`
+  collided onto 5d-2/5d-3/5d-4. → `docs/plans/Phase5d_Plan.md`
 
 ### 0.4.0 — 2026-07-01
 
@@ -445,17 +523,17 @@ CHANGELOG.md.
   self-update (chunked push → apply → survivor swap/relaunch, shim +
   NodeSetup co-update, health-gate auto-rollback), 8-3 shim rediscovery
   / `node.db` hardening. Slice-8 rollback + 8-3 rediscovery ship
-  code-complete pending a post-release live check. → `Phase8_Plan.md`,
-  `Phase8-2_Plan.md`, `Phase8-3_Plan.md`
+  code-complete pending a post-release live check. → `docs/plans/Phase8_Plan.md`,
+  `docs/plans/Phase8-2_Plan.md`, `docs/plans/Phase8-3_Plan.md`
 - **Phase 7 — Manager-side utility plugins.** `IUtilityPlugin` surface
   + event subscriptions + declared-capability permission model;
   reference plugin lo-myrealm (characterID → name), through 7-7
   (multi-account + per-realm session failover). ContractsVersion → 2.
-  → `Phase7_Plan.md`, `Phase7-7_Plan.md`
+  → `docs/plans/Phase7_Plan.md`, `docs/plans/Phase7-7_Plan.md`
 - **Phase 6 — Plugin GitHub source + manifest + updates.** Inline
   `' <plugin …>` manifests, seeded official source, acquire → stage →
   consent → install → hot-reload with no Manager restart; tabbed
-  **Manage Plugins** window. → `Phase6_Plan.md`
+  **Manage Plugins** window. → `docs/plans/Phase6_Plan.md`
 - **Startup config render (`IStartupFileProvider`)** — new field→runtime
   bridge that renders instance-config values into a game's own config file
   just before launch (preserving the rest of the file), so file-only games
@@ -469,7 +547,7 @@ CHANGELOG.md.
   live) and **Conan** (ServerName off the launch URL + ServerPassword off
   the Engine.ini editor → both Configuration fields rendered into
   `Engine.ini` `[OnlineSubsystem]`, with a set/keep/clear password checkbox
-  and the Network editor tab removed). → `StartupConfigRender_Plan.md`
+  and the Network editor tab removed). → `docs/plans/StartupConfigRender_Plan.md`
 - **Phase 5n** — Notification scope rework. Scope is now a four-
   dimension **union-of-includes** (Node / Installation / Instance /
   Instance-set; only the all-empty state means "all") with a
@@ -481,7 +559,7 @@ CHANGELOG.md.
   catch them; `{InstanceSetTag}` is a new template token. Bundled 5n-3:
   Node / Installation / Instance panels show their ID with right-click
   Copy. Back-compat: pre-rework dual-filter rows are left as-is and
-  reconfigured once. → `Phase5n_Plan.md`
+  reconfigured once. → `docs/plans/Phase5n_Plan.md`
 - **Phase 5l-3** — Apply updates. Live Apply button: staged-contracts
   plugin-compat pre-flight (Roslyn dry-run compile, soft-warn +
   acknowledge) + Tools → Test Plugin Compatibility, downgrade guard,
@@ -491,20 +569,20 @@ CHANGELOG.md.
   down. Failed swaps log to `.updates\apply-error.log` and surface on
   next launch. Also fixes the 5m-3 `PublishWatchdog` target leaking
   `net8.0-windows` onto the watchdog. Automation/instance pre-flight
-  prompts + Help → Update history still to come. → `Phase5l_Plan.md`
+  prompts + Help → Update history still to come. → `docs/plans/Phase5l_Plan.md`
 - **Phase 5l-2** — Download + stage updates. Download button +
   cancellable progress dialog; resolve release assets, fetch zip +
   SHA256SUMS, verify SHA-256, extract to `.updates\{version}\
   extracted\`; Update-ready / Discard state (Apply disabled pending
   5l-3). Also: `release.yml` now writes BUILD-INFO.json into the
-  Manager zip + a SHA256SUMS release asset. → `Phase5l_Plan.md`
+  Manager zip + a SHA256SUMS release asset. → `docs/plans/Phase5l_Plan.md`
 - **Phase 5l-1** — Manager update notifications (detect + notify
   only): background GitHub release check, status-bar indicator +
   Help → Check for updates, skip-version, Settings → Updates
   (pre-release opt-in + interval), install-writeability probe, and
   GitHub-style rendered release notes via HtmlRenderer + an in-house
   Markdown→HTML converter with a RichTextBox fallback. No download or
-  apply yet. → `Phase5l_Plan.md`
+  apply yet. → `docs/plans/Phase5l_Plan.md`
 - **Phase 5m** — Manager resilience. 5m-1 tray + window-state
   persistence; 5m-2 safe mode (CLI flag, crash-marker recovery, gated
   startup, banner, restart-into/out-of-mode, 2c in-safe-mode feature
@@ -515,25 +593,25 @@ CHANGELOG.md.
   pluginless instance, plus 5m-3 (watchdog auto-restart +
   start-at-sign-in via a per-user Task Scheduler logon task). Phase
   5m is complete.
-  → `Phase5m_Plan.md`
+  → `docs/plans/Phase5m_Plan.md`
 - **Phase 5k** — Player-list Discord panel. New `PlayerList` panel kind
   (online players grouped by instance in the 5d-6 format, hide-empty
   toggle), reusing the existing panel scope + refresh + editor; schema
   adds `PanelKind` + `ShowEmptyGroups`. 5k-2 added grouping for player
   panels (with a three-level node/game/instance header scheme that also
   fixed a by-node-then-game bleed in the instance panel) plus
-  `ShowJoinTime` / `ShowTotalInTitle` toggles. → `Phase5k_Plan.md`
+  `ShowJoinTime` / `ShowTotalInTitle` toggles. → `docs/plans/Phase5k_Plan.md`
 - **Phase 5d-8** — `/lastseen` slash command: player lookup (presence —
   active-now / offline — from the most-recent join/leave, rendered with
   the History SourceLabel),
   optional instance/game/installation scope filters, and a scope-only
   roster mode. Identity-aware (resolver-translated name match,
   identity-grouped disambiguation); gated ServerOperator via the 5d-7
-  command catalogue. → `Phase5d-8_Plan.md`
+  command catalogue. → `docs/plans/Phase5d-8_Plan.md`
 - **Phase 5d-7** — Discord command-model surfacing in the Manager:
   command catalogue as single source of truth, awareness labels in
   the panel/role editors, and a Commands surface in `DiscordBotForm`
-  with a per-guild effective-access preview. → `Phase5d-7_Plan.md`
+  with a per-guild effective-access preview. → `docs/plans/Phase5d-7_Plan.md`
 - **LO player-leave attribution across Manager reconnect/restart.**
   Connection bindings externalised via the new
   `IConnectionBindingAware` contract interface (Manager owns the
@@ -567,7 +645,7 @@ CHANGELOG.md.
   `UNetConnection::Close` only; the dual-match bug producing
   ghost leaves is closed.
 - **Phase 5j-1 / 5j-2** — Purge & Rebuild History from Current
-  State. → `Phase5j_Plan.md`
+  State. → `docs/plans/Phase5j_Plan.md`
 - **Phase 5j-3** — Stream-restart resync (`ResyncActivePlayers
   FromNodeAsync` in InstanceManager). Two-pass: synthesise
   Join rows for currently-online players whose join was

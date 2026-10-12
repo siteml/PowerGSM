@@ -88,6 +88,8 @@ Public Module ConsoleUi
         Console.WriteLine("  6) Install as system service")
         Console.WriteLine("  7) Uninstall system service")
         Console.WriteLine("  8) Show service status")
+        Console.WriteLine("  9) Show TLS certificate fingerprint")
+        Console.WriteLine(" 10) Regenerate TLS certificate")
         Console.WriteLine("  Q) Quit")
         Console.WriteLine()
 
@@ -111,10 +113,14 @@ Public Module ConsoleUi
                 UninstallServiceFlow()
             Case "8"
                 ShowServiceStatus()
+            Case "9"
+                ShowTlsFingerprint(cfg)
+            Case "10"
+                RegenerateTlsCertificateFlow(cfg)
             Case "q", "quit", "exit"
                 Return True
             Case Else
-                WriteLineColored("Unknown choice. Try 1-8 or Q.", ConsoleColor.Yellow)
+                WriteLineColored("Unknown choice. Try 1-10 or Q.", ConsoleColor.Yellow)
         End Select
 
         Return False
@@ -132,7 +138,7 @@ Public Module ConsoleUi
         Console.WriteLine()
 
         ' --- Step 1: identity ---
-        WriteLineColored("Step 1 of 5: Node identity", ConsoleColor.Cyan)
+        WriteLineColored("Step 1 of 6: Node identity", ConsoleColor.Cyan)
         Console.WriteLine("  This name identifies the node when the Manager connects.")
         Dim defaultId = If(String.IsNullOrEmpty(cfg.Node.NodeId), Environment.MachineName, cfg.Node.NodeId)
         cfg.Node.NodeId = PromptWithDefault("Node ID", defaultId,
@@ -142,7 +148,7 @@ Public Module ConsoleUi
 
         ' --- Step 2: storage ---
         Console.WriteLine()
-        WriteLineColored("Step 2 of 5: Storage", ConsoleColor.Cyan)
+        WriteLineColored("Step 2 of 6: Storage", ConsoleColor.Cyan)
         Console.WriteLine("  Where the node stores its data, and where new game-server")
         Console.WriteLine("  installations live by default.")
         cfg.Node.DataDirectory = PromptWithDefault("Data directory",
@@ -154,7 +160,7 @@ Public Module ConsoleUi
 
         ' --- Step 3: operations ---
         Console.WriteLine()
-        WriteLineColored("Step 3 of 5: Operations", ConsoleColor.Cyan)
+        WriteLineColored("Step 3 of 6: Operations", ConsoleColor.Cyan)
         cfg.Node.MaxConcurrentInstalls = PromptInt("Max concurrent installs",
                                                    cfg.Node.MaxConcurrentInstalls,
                                                    AddressOf ConfigHelpers.ValidateConcurrentInstalls)
@@ -164,7 +170,7 @@ Public Module ConsoleUi
 
         ' --- Step 4: token ---
         Console.WriteLine()
-        WriteLineColored("Step 4 of 5: Authentication", ConsoleColor.Cyan)
+        WriteLineColored("Step 4 of 6: Authentication", ConsoleColor.Cyan)
         Console.WriteLine("  The Manager needs an auth token to connect to this node.")
         Dim regen = True
         If Not cfg.NeedsAuthTokenSetup Then
@@ -177,9 +183,16 @@ Public Module ConsoleUi
             Console.WriteLine("  Keeping the existing token.")
         End If
 
-        ' --- Step 5: review and save ---
+        ' --- Step 5: transport (HTTPS_SinglePort_Plan slice 2) ---
         Console.WriteLine()
-        WriteLineColored("Step 5 of 5: Review", ConsoleColor.Cyan)
+        WriteLineColored("Step 5 of 6: Transport", ConsoleColor.Cyan)
+        Console.WriteLine("  HTTPS uses a self-signed certificate minted here; the Manager pins its")
+        Console.WriteLine("  fingerprint (shown after save). Plain HTTP is normally left off.")
+        PromptTransport(cfg)
+
+        ' --- Step 6: review and save ---
+        Console.WriteLine()
+        WriteLineColored("Step 6 of 6: Review", ConsoleColor.Cyan)
         Console.WriteLine()
         PrintConfigSummary(cfg, includeToken:=False)
 
@@ -191,6 +204,7 @@ Public Module ConsoleUi
         End If
 
         Try
+            ConfigHelpers.NormalizeTransport(cfg.Node)
             cfg.Save(_configPath, backupExisting:=True)
             WriteLineColored("Configuration saved to: " & _configPath, ConsoleColor.Green)
         Catch ex As Exception
@@ -198,17 +212,23 @@ Public Module ConsoleUi
             Return cfg
         End Try
 
-        ' Show the token prominently after save so the user can copy it
-        ' into the Manager. This is the only place we display it in full
-        ' during the wizard flow.
-        Console.WriteLine()
-        WriteLineColored("============================================================", ConsoleColor.Yellow)
-        WriteLineColored("   Copy this auth token into the Manager:", ConsoleColor.Yellow)
-        WriteLineColored("============================================================", ConsoleColor.Yellow)
-        Console.WriteLine()
-        Console.WriteLine("   " & cfg.Node.AuthToken)
-        Console.WriteLine()
-        WriteLineColored("============================================================", ConsoleColor.Yellow)
+        ' Mint the certificate NOW (same service the node uses) so the
+        ' fingerprint can be handed to the Manager together with the token
+        ' and the node's very first contact is pinned HTTPS.
+        Dim fingerprint As String = Nothing
+        If cfg.Node.EnableTls Then
+            Dim certErr As String = Nothing
+            fingerprint = ConfigHelpers.EnsureTlsCertificate(cfg, certErr)
+            If fingerprint Is Nothing Then
+                WriteLineColored("Could not create the TLS certificate: " & certErr, ConsoleColor.Red)
+                Console.WriteLine("The node will try again at startup; use menu option 9 afterwards to read the fingerprint.")
+            End If
+        End If
+
+        ' Show the token (+ fingerprint) prominently after save so the user
+        ' can copy them into the Manager. This is the only place we display
+        ' the token in full during the wizard flow.
+        PrintManagerHandoff(cfg, fingerprint)
 
         Console.WriteLine()
         Dim doInstall = PromptYesNo("Install GSM.Node as a system service now?", defaultYes:=False)
@@ -241,6 +261,16 @@ Public Module ConsoleUi
         Console.WriteLine($"  Max concurrent installs: {cfg.Node.MaxConcurrentInstalls}")
         Console.WriteLine($"  Log retention (days):    {cfg.Node.LogRetentionDays}")
         Console.WriteLine($"  Metrics interval (s):    {cfg.Node.MetricsIntervalSeconds}")
+        Dim tlsDesc = If(cfg.Node.EnableTls,
+                         "enabled" & If(cfg.Node.TlsPort > 0 AndAlso cfg.Node.TlsPort <> cfg.Node.ListenPort,
+                                        $" (separate port {cfg.Node.TlsPort})", $" (shared port {cfg.Node.ListenPort})"),
+                         "disabled")
+        Console.WriteLine($"  HTTPS:                   {tlsDesc}")
+        Console.WriteLine($"  Plain HTTP:              {If(ConfigHelpers.NormalizeHttpMode(cfg.Node.HttpMode), cfg.Node.HttpMode)}")
+        If includeToken AndAlso cfg.Node.EnableTls Then
+            Dim fp = ConfigHelpers.ReadTlsFingerprint(cfg)
+            Console.WriteLine($"  TLS fingerprint:         {If(fp, "(no certificate on disk yet - minted at first node start)")}")
+        End If
         If includeToken Then
             Dim tok = If(cfg.NeedsAuthTokenSetup,
                          "*** NOT SET (placeholder) ***",
@@ -273,6 +303,7 @@ Public Module ConsoleUi
             Console.WriteLine($"  6) Log retention (days)     [{cfg.Node.LogRetentionDays}]")
             Console.WriteLine($"  7) Metrics interval (s)     [{cfg.Node.MetricsIntervalSeconds}]")
             Console.WriteLine($"  8) Security settings (advanced)")
+            Console.WriteLine($"  9) Transport (HTTPS / plain HTTP / HTTPS port)  [HTTPS {If(cfg.Node.EnableTls, "on", "off")}, HTTP {cfg.Node.HttpMode}]")
             Console.WriteLine($"  S) Save and return")
             Console.WriteLine($"  B) Discard changes and return")
             Console.WriteLine()
@@ -297,10 +328,22 @@ Public Module ConsoleUi
                     cfg.Node.MetricsIntervalSeconds = PromptInt("Metrics interval (seconds)", cfg.Node.MetricsIntervalSeconds, AddressOf ConfigHelpers.ValidateMetricsInterval)
                 Case "8"
                     EditSecurityMenu(cfg)
+                Case "9"
+                    PromptTransport(cfg)
                 Case "s", "save"
                     Try
+                        ConfigHelpers.NormalizeTransport(cfg.Node)
                         cfg.Save(_configPath, backupExisting:=True)
                         WriteLineColored("Configuration saved to: " & _configPath, ConsoleColor.Green)
+                        If cfg.Node.EnableTls Then
+                            Dim certErr As String = Nothing
+                            Dim fp = ConfigHelpers.EnsureTlsCertificate(cfg, certErr)
+                            If fp IsNot Nothing Then
+                                Console.WriteLine("  TLS fingerprint (SHA-256): " & fp)
+                            Else
+                                WriteLineColored("  Could not create the TLS certificate: " & certErr, ConsoleColor.Yellow)
+                            End If
+                        End If
                     Catch ex As Exception
                         WriteLineColored("Failed to save: " & ex.Message, ConsoleColor.Red)
                     End Try
@@ -351,6 +394,116 @@ Public Module ConsoleUi
                     WriteLineColored("Unknown choice.", ConsoleColor.Yellow)
             End Select
         Loop
+    End Sub
+
+    ' --------------------------------------------------------
+    ' Transport (HTTPS_SinglePort_Plan slice 2)
+    ' --------------------------------------------------------
+
+    ''' <summary>
+    ''' Shared by wizard step 5 and the edit menu: HTTPS on/off, plain-HTTP
+    ''' policy (default None = Disabled when HTTPS is on), optional separate
+    ''' HTTPS port (blank/0 = shared listen port).
+    ''' </summary>
+    Private Sub PromptTransport(cfg As NodeSetupConfig)
+        ' Default HTTPS ON for a fresh file; keep the current choice otherwise.
+        Dim defaultTls = If(File.Exists(_configPath), cfg.Node.EnableTls, True)
+        cfg.Node.EnableTls = PromptYesNo("Use HTTPS (recommended)?", defaultYes:=defaultTls)
+
+        If cfg.Node.EnableTls Then
+            Console.WriteLine("  Allow plain HTTP alongside HTTPS?")
+            Console.WriteLine("    None      - HTTPS only (recommended; the Manager pins the certificate)")
+            Console.WriteLine("    Localhost - plain HTTP from this machine only")
+            Console.WriteLine("    Open      - plain HTTP from anywhere (legacy)")
+            Dim currentMode = ConfigHelpers.NormalizeHttpMode(cfg.Node.HttpMode)
+            ' A freshly-defaulted "Open" (never saved) should not steer the
+            ' operator to a plaintext node: default None when HTTPS is new.
+            Dim defaultMode = If(currentMode Is Nothing OrElse (currentMode = "Open" AndAlso Not File.Exists(_configPath)),
+                                 "None", If(currentMode = "Disabled", "None", If(currentMode = "LoopbackOnly", "Localhost", "Open")))
+            Dim answer = PromptWithDefault("Plain HTTP (None / Localhost / Open)", defaultMode,
+                                           Function(v) If(ConfigHelpers.NormalizeHttpMode(v) Is Nothing,
+                                                          "Answer None, Localhost or Open.", Nothing))
+            cfg.Node.HttpMode = ConfigHelpers.NormalizeHttpMode(answer)
+
+            Dim advanced = PromptYesNo("Advanced: serve HTTPS on a separate port instead of the listen port?", defaultYes:=False)
+            If advanced Then
+                Dim suggested = If(cfg.Node.TlsPort > 0 AndAlso cfg.Node.TlsPort <> cfg.Node.ListenPort,
+                                   cfg.Node.TlsPort, cfg.Node.ListenPort + 1)
+                cfg.Node.TlsPort = PromptInt("HTTPS port", suggested,
+                                             Function(p) ConfigHelpers.ValidateTlsPort(p, cfg.Node.ListenPort))
+            Else
+                cfg.Node.TlsPort = 0
+            End If
+        Else
+            cfg.Node.HttpMode = "Open"
+            cfg.Node.TlsPort = 0
+            WriteLineColored("  HTTPS off: the node will be plain HTTP until secured from the Manager.", ConsoleColor.Yellow)
+        End If
+        ConfigHelpers.NormalizeTransport(cfg.Node)
+    End Sub
+
+    Private Sub PrintManagerHandoff(cfg As NodeSetupConfig, fingerprint As String)
+        Console.WriteLine()
+        WriteLineColored("============================================================", ConsoleColor.Yellow)
+        WriteLineColored("   Copy these into the Manager (Nodes -> Add Node):", ConsoleColor.Yellow)
+        WriteLineColored("============================================================", ConsoleColor.Yellow)
+        Console.WriteLine()
+        For Each line In ConfigHelpers.BuildManagerHandoffLines(cfg, fingerprint)
+            Console.WriteLine("   " & line)
+        Next
+        Console.WriteLine()
+        WriteLineColored("============================================================", ConsoleColor.Yellow)
+    End Sub
+
+    Private Sub ShowTlsFingerprint(cfg As NodeSetupConfig)
+        Console.WriteLine()
+        PrintHeader("TLS Certificate Fingerprint")
+        Console.WriteLine()
+        Dim fp = ConfigHelpers.ReadTlsFingerprint(cfg)
+        If fp Is Nothing Then
+            WriteLineColored("No certificate on disk yet.", ConsoleColor.Yellow)
+            If cfg.Node.EnableTls Then
+                Console.WriteLine("HTTPS is enabled, so the node mints one at its next start. You can mint it now instead:")
+                If PromptYesNo("Create the certificate now?", defaultYes:=True) Then
+                    Dim certErr As String = Nothing
+                    fp = ConfigHelpers.EnsureTlsCertificate(cfg, certErr)
+                    If fp Is Nothing Then
+                        WriteLineColored("Failed: " & certErr, ConsoleColor.Red)
+                    End If
+                End If
+            Else
+                Console.WriteLine("HTTPS is off (Edit configuration -> Transport to enable it).")
+            End If
+        End If
+        If fp IsNot Nothing Then
+            Console.WriteLine("SHA-256: " & fp)
+            Console.WriteLine("         " & GSM.Node.Security.TlsCertificateService.FormatFingerprintForDisplay(fp))
+            Console.WriteLine()
+            Console.WriteLine("Paste the bare hex form into Manager -> Add Node -> Cert SHA-256, or compare it with")
+            Console.WriteLine("what the Manager shows when it asks you to trust this node.")
+        End If
+        PressAnyKey()
+    End Sub
+
+    Private Sub RegenerateTlsCertificateFlow(cfg As NodeSetupConfig)
+        Console.WriteLine()
+        PrintHeader("Regenerate TLS Certificate")
+        Console.WriteLine()
+        WriteLineColored("Warning: every Manager pinned to this node will report a certificate MISMATCH", ConsoleColor.Yellow)
+        WriteLineColored("and must re-trust it (node panel -> Re-trust certificate). Stop the node first;", ConsoleColor.Yellow)
+        WriteLineColored("a running node keeps serving the old certificate until it restarts.", ConsoleColor.Yellow)
+        Console.WriteLine()
+        If Not PromptYesNo("Regenerate the certificate now?", defaultYes:=False) Then Return
+
+        Dim certErr As String = Nothing
+        Dim fp = ConfigHelpers.RegenerateTlsCertificate(cfg, certErr)
+        If fp Is Nothing Then
+            WriteLineColored("Failed: " & certErr, ConsoleColor.Red)
+        Else
+            WriteLineColored("New certificate created.", ConsoleColor.Green)
+            Console.WriteLine("SHA-256: " & fp)
+        End If
+        PressAnyKey()
     End Sub
 
     ' --------------------------------------------------------

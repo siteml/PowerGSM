@@ -84,6 +84,39 @@ Namespace GSM.Manager.Data
         ''' </summary>
         Public Property LastSeenProtocolVersion As Integer?
 
+        ' ---- TLS / HTTPS (0.7.0) ----
+
+        ''' <summary>
+        ''' When True, the Manager talks to this node over HTTPS on
+        ''' TlsPort with certificate pinning. Flipped by the onboarding
+        ''' flow only after a successful pinned HTTPS probe; flipping it
+        ''' back False is the rollback path (the node keeps its HTTP
+        ''' listener during transition).
+        ''' </summary>
+        Public Property UseTls As Boolean = False
+
+        ''' <summary>HTTPS port reported by the node's enable call. 0 = unknown.</summary>
+        Public Property TlsPort As Integer = 0
+
+        ''' <summary>
+        ''' Lowercase hex SHA-256 fingerprint of the node certificate the
+        ''' Manager trusts (the pin). Obtained over the authenticated HTTP
+        ''' channel during onboarding (TOFU) or explicit user re-trust.
+        ''' Nothing = no pin stored.
+        ''' </summary>
+        Public Property PinnedCertFingerprint As String
+
+        ''' <summary>
+        ''' Onboarding state machine: "None" (no TLS / not probed),
+        ''' "Available" (node supports TLS but it isn't enabled),
+        ''' "Enabling" (enable call sent, waiting for the node to come
+        ''' back over HTTPS), "Active" (pinned HTTPS in use),
+        ''' "FingerprintMismatch" (presented cert no longer matches the
+        ''' pin — calls stopped, explicit user re-trust required).
+        ''' Stored as string to avoid enum-conversion migrations.
+        ''' </summary>
+        Public Property TlsState As String = "None"
+
         Public Overridable Property Installations As ICollection(Of InstallationEntity)
     End Class
 
@@ -1099,6 +1132,10 @@ Namespace GSM.Manager.Data
             builder.HasKey(Function(n) n.NodeId)
             builder.Property(Function(n) n.DisplayName).IsRequired().HasMaxLength(200)
             builder.Property(Function(n) n.HostAddress).IsRequired().HasMaxLength(500)
+            ' TLS (0.7.0). Fingerprint is 64 hex chars; 128 leaves room
+            ' for a future algorithm prefix. TlsState is a short keyword.
+            builder.Property(Function(n) n.PinnedCertFingerprint).HasMaxLength(128)
+            builder.Property(Function(n) n.TlsState).HasMaxLength(32)
         End Sub
     End Class
 

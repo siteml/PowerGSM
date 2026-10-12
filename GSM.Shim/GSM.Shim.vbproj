@@ -45,6 +45,16 @@
   <ItemGroup>
     <!-- Normal managed reference: the shim uses the protocol types directly. -->
     <ProjectReference Include="..\GSM.Shim.Protocol\GSM.Shim.Protocol.vbproj" />
+
+    <!--
+      Referenced ONLY for the version constants the version-flag fast
+      path prints (Phase 8-2 follow-up 5b): NodeApiContract.ProtocolVersion /
+      ContractsVersion are Const Integers, inlined at compile time.
+      Contracts is dependency-free, so this adds one small DLL to the
+      dev layout (copied by GSM.Node's CopyShimToOutput) and is absorbed
+      by the self-contained single-file publish.
+    -->
+    <ProjectReference Include="..\GSM.Contracts\GSM.Contracts.vbproj" />
   </ItemGroup>
 
 </Project>

@@ -78,8 +78,18 @@ Namespace GSM.Node.Api
         ''' consuming the new surface CAN land on an older (v2 = 0.5.0)
         ''' Manager — the version gate turns that from a raw Roslyn
         ''' compile failure into a clean ContractsVersionTooNew refusal.
+        ''' v4 = state-poll surface (IStatePollProvider +
+        ''' StatePollResolveContext + ResolvedStatePollSource;
+        ''' EventStream Slice 2). Same rationale as v3: additive, but
+        ''' a plugin consuming it on an older Manager should get a
+        ''' clean refusal, not a Roslyn error.
+        ''' (EventStream Slice 3 added INodeClient members +
+        ''' AppendEventRequest/Response with NO bump: INodeClient is
+        ''' the Manager's own client surface — plugins neither
+        ''' implement nor consume it — and this constant governs
+        ''' plugin-facing types only.)
         ''' </summary>
-        Public Const ContractsVersion As Integer = 3
+        Public Const ContractsVersion As Integer = 4
 
     End Module
 
@@ -105,6 +115,9 @@ Namespace GSM.Node.Api
         InvalidRequest
         DiskSpaceInsufficient
         ProcessStartFailed
+        TlsNotSupported
+        TlsAlreadyEnabled
+        CertGenerationFailed
     End Enum
 
     ''' <summary>
@@ -199,6 +212,147 @@ Namespace GSM.Node.Api
         ''' round trip.
         ''' </summary>
         Public Property Platform As NodePlatform
+
+        ' ---- TLS capability advertisement (Phase 7 / 0.7.0) ----
+        ' All additive. Pre-TLS nodes omit these fields entirely:
+        ' JSON deserialization leaves them False/0/Nothing, which the
+        ' Manager reads as "no TLS support". The fingerprint here is
+        ' public information by design — the *pin* is only trusted
+        ' when obtained over the authenticated channel during
+        ' onboarding (POST /api/tls/enable) or explicitly confirmed
+        ' by the user (TOFU dialog).
+
+        ''' <summary>Whether this node build can serve HTTPS at all.</summary>
+        Public Property TlsSupported As Boolean
+
+        ''' <summary>Whether an HTTPS listener is currently active.</summary>
+        Public Property TlsEnabled As Boolean
+
+        ''' <summary>
+        ''' Port of the HTTPS listener when TlsEnabled. 0 otherwise.
+        ''' Equals the plain listen port on single-port nodes.
+        ''' </summary>
+        Public Property TlsPort As Integer
+
+        ''' <summary>
+        ''' True when HTTPS is served on the same port as plain HTTP via
+        ''' the node's sniffing listener (HTTPS_SinglePort_Plan). Absent
+        ''' (False) on two-port nodes and on nodes older than this field.
+        ''' Informational — the Manager always connects to TlsPort.
+        ''' </summary>
+        Public Property SinglePort As Boolean
+
+        ''' <summary>
+        ''' Lowercase hex SHA-256 fingerprint of the node's current
+        ''' certificate. Nothing when TLS is not enabled.
+        ''' </summary>
+        Public Property CertFingerprintSha256 As String
+
+        ' ---- Event stream capability (EventStream Slice 1) ----
+        ' Additive, same pattern as the TLS fields above: pre-
+        ' stream nodes omit the field entirely and JSON
+        ' deserialization leaves it False, which the Manager reads
+        ' as "consume this node via the legacy /players,
+        ' /server-state, /chat projections" (the mixed-fleet rule
+        ' in the EventStream plan).
+
+        ''' <summary>
+        ''' True when this node exposes the per-instance canonical
+        ''' event stream (GET /api/instances/{id}/events + the SSE
+        ''' stream variant). Slice 3's Manager-side sync probes
+        ''' this before switching a node to cursor sync.
+        ''' </summary>
+        Public Property EventStreamSupported As Boolean
+    End Class
+
+    ' ============================================================
+    '  TLS onboarding (Phase 7 / 0.7.0)
+    ' ============================================================
+
+    ''' <summary>
+    ''' Request body for POST /api/tls/enable. Sent over the existing
+    ''' authenticated HTTP channel. The node generates (or reuses) a
+    ''' self-signed certificate, persists EnableTls + TlsPort into
+    ''' nodesettings.json, replies, then restarts itself so Kestrel
+    ''' picks up the new listener.
+    ''' </summary>
+    Public Class EnableTlsRequest
+        ''' <summary>
+        ''' Desired HTTPS port. 0, omitted, or equal to the listen port =
+        ''' share the listen port (single-port node; pre-single-port
+        ''' nodes resolved this to ListenPort + 1). Any other value =
+        ''' dedicated HTTPS listener on that port.
+        ''' </summary>
+        Public Property TlsPort As Integer
+    End Class
+
+    Public Class EnableTlsResponse
+        ''' <summary>Port the Manager must connect to for HTTPS (= listen port when SinglePort).</summary>
+        Public Property TlsPort As Integer
+
+        ''' <summary>True when HTTPS will share the plain listen port.</summary>
+        Public Property SinglePort As Boolean
+
+        ''' <summary>
+        ''' Lowercase hex SHA-256 fingerprint of the certificate the
+        ''' HTTPS listener will present. This is the value the Manager
+        ''' pins. Obtained over the authenticated HTTP channel, which
+        ''' is the trust-on-first-use step.
+        ''' </summary>
+        Public Property CertFingerprintSha256 As String
+
+        ''' <summary>Certificate expiry (UTC), for diagnostics.</summary>
+        Public Property CertNotAfterUtc As DateTime
+
+        ''' <summary>
+        ''' True when the node must restart before the HTTPS listener
+        ''' is live (always true in the current implementation —
+        ''' Kestrel cannot add a listener at runtime).
+        ''' </summary>
+        Public Property RestartRequired As Boolean
+    End Class
+
+    ''' <summary>Response shape for GET /api/tls/status (authenticated).</summary>
+    Public Class TlsStatusResponse
+        Public Property TlsSupported As Boolean
+        Public Property TlsEnabled As Boolean
+        Public Property TlsPort As Integer
+        ''' <summary>True when HTTPS shares the plain listen port (see NodeVersionResponse.SinglePort).</summary>
+        Public Property SinglePort As Boolean
+        Public Property CertFingerprintSha256 As String
+        Public Property CertNotAfterUtc As DateTime
+
+        ''' <summary>
+        ''' Current plain-HTTP listener policy: "Open", "LoopbackOnly",
+        ''' or "Disabled". Empty on nodes older than this field.
+        ''' </summary>
+        Public Property HttpMode As String
+    End Class
+
+    ''' <summary>
+    ''' Request body for POST /api/tls/http-mode (authenticated).
+    ''' Changes the plain-HTTP listener policy; the node persists it
+    ''' to nodesettings.json and restarts. "Disabled" is only accepted
+    ''' while TLS is enabled — the node must never end up unreachable.
+    ''' </summary>
+    Public Class SetHttpModeRequest
+        Public Property HttpMode As String
+    End Class
+
+    ''' <summary>
+    ''' Request body for POST /api/auth/rotate (authenticated, HTTPS ONLY —
+    ''' the node refuses it over plaintext, since the whole point is that
+    ''' the new token never travels in the clear). The Manager generates
+    ''' the token; the node persists it to nodesettings.json and restarts.
+    ''' The current token stays valid until the restart.
+    ''' </summary>
+    Public Class RotateTokenRequest
+        Public Property NewToken As String
+    End Class
+
+    Public Class RotateTokenResponse
+        Public Property Accepted As Boolean
+        Public Property RestartRequired As Boolean
     End Class
 
     Public Class NodeStatusResponse
@@ -322,6 +476,22 @@ Namespace GSM.Node.Api
         Public Property RequiresConsoleIsolation As Boolean = False
 
         ''' <summary>
+        ''' True when the game writes only via the Windows console
+        ''' API and the node should spawn it under a pseudoconsole
+        ''' (CreatePseudoConsole) whose output is captured — the
+        ''' ConPTY strategy (EventStream Slice 4 / ConPTY_Plan). Set
+        ''' by the manager from LaunchOptions.NeedsPseudoConsole.
+        ''' Windows-only; ignored off-Windows. StdoutIsLog wins if
+        ''' both are set. Additive: old nodes deserialize-ignore it
+        ''' (they resolve strategy as before). NOTE (D7, decided
+        ''' 2026-08-09): ContractsVersion stays 4 for this member —
+        ''' routine additive property per the constant's base rule;
+        ''' the bundled-distribution reality means the v3/v4
+        ''' independent-skew rationale doesn't apply.
+        ''' </summary>
+        Public Property NeedsPseudoConsole As Boolean = False
+
+        ''' <summary>
         ''' Per-instance override for the file-tailer's startup
         ''' delay (the wait after a tailed log file first appears
         ''' on disk before the node opens it for reading). Set by
@@ -333,11 +503,137 @@ Namespace GSM.Node.Api
         ''' legacy delay would tolerate).
         ''' </summary>
         Public Property LogTailerStartDelayMs As Integer = -1
+
+        ''' <summary>
+        ''' State-poll sources for the node's generic REST poller
+        ''' (EventStream Slice 2). Resolved by the game plugin via
+        ''' IStatePollProvider at start time (final URL against the
+        ''' node's loopback, literal credentials); the node polls,
+        ''' diffs snapshots, and synthesizes PlayerJoin/PlayerLeave
+        ''' into the canonical event stream. Nothing/empty = no
+        ''' poller (every pre-Slice-2 Manager, and every game whose
+        ''' plugin doesn't opt in). Additive: old nodes
+        ''' deserialize-ignore it.
+        ''' </summary>
+        Public Property PollSources As List(Of ResolvedStatePollSource)
+
+        ''' <summary>
+        ''' Opt-in node-boot resurrection: when True, an instance
+        ''' that was RUNNING with no stop intent when the node last
+        ''' wrote its snapshot is automatically restarted when the
+        ''' node starts and finds the process/shim dead (host
+        ''' reboot, node+game killed together). Node-side and
+        ''' Manager-independent by design (node autonomy) — the
+        ''' node persists this on the snapshot and acts on it at
+        ''' startup. Distinct from the Manager's AutoStart flag
+        ''' (Manager-START-scoped). Sourced from the instance's
+        ''' "ResurrectOnNodeBoot" custom field. Additive: old nodes
+        ''' deserialize-ignore it; absent deserializes False.
+        ''' </summary>
+        Public Property ResurrectOnNodeBoot As Boolean = False
+
+        ''' <summary>
+        ''' Unconditional node-boot autostart ("Auto start with
+        ''' node"): when True the node starts this instance whenever
+        ''' the node itself starts — even if the instance was
+        ''' cleanly STOPPED beforehand. The node PARKS the snapshot
+        ''' on stop (State=Stopped, PID cleared) instead of deleting
+        ''' it, so the recovery payload survives stops; the
+        ''' boot-resurrection pass then starts parked rows through
+        ''' the normal start path, sharing the same persisted flap
+        ''' guard. Behaviourally a superset of ResurrectOnNodeBoot.
+        ''' Manager-independent (node autonomy); distinct from the
+        ''' Manager's AutoStart flag (Manager-START-scoped). Sourced
+        ''' from the instance's "AutoStartOnNodeBoot" custom field.
+        ''' Additive: old nodes deserialize-ignore it; absent
+        ''' deserializes False.
+        ''' </summary>
+        Public Property AutoStartOnNodeBoot As Boolean = False
+
+        ''' <summary>
+        ''' Boot stagger (seconds) for the node-boot resurrection /
+        ''' autostart pass: instances launch in ascending delay, each
+        ''' waiting until this many seconds have elapsed since the
+        ''' pass began (so three instances at 0/30/60 come up a
+        ''' minute apart instead of all at once). Does NOT delay a
+        ''' Manager-driven start. Sourced from the instance's
+        ''' "BootStartDelaySeconds" custom field; 0 = no wait.
+        ''' Additive (2026-10-11): old nodes deserialize-ignore it.
+        ''' </summary>
+        Public Property BootStartDelaySeconds As Integer = 0
     End Class
 
     Public Class StopInstanceRequest
         Public Property InstanceId As String
         Public Property GracefulTimeoutMs As Integer = 10000
+    End Class
+
+    ''' <summary>
+    ''' Live update of an instance's node-boot flags, applied WITHOUT
+    ''' a start/stop cycle (POST /api/instances/{id}/boot-flags —
+    ''' additive endpoint, 2026-08-10). The node updates its
+    ''' in-memory ManagedInstance (if tracked) and the persisted
+    ''' snapshot row (if one exists), so a checkbox change on the
+    ''' Edit Instance form takes effect at the NEXT node boot without
+    ''' the instance having to be started first. Turning autostart
+    ''' OFF on a parked (stopped-but-kept) snapshot deletes the
+    ''' parked row. If the instance is stopped and has NO snapshot,
+    ''' there is no payload to park — autostart then still arms at
+    ''' the instance's next start (the wire path).
+    ''' </summary>
+    Public Class BootFlagsRequest
+        Public Property ResurrectOnNodeBoot As Boolean = False
+        Public Property AutoStartOnNodeBoot As Boolean = False
+        ''' <summary>Optional (2026-10-11): when present, also updates
+        ''' the snapshot's boot stagger. Nothing = leave as-is (old
+        ''' Managers never send it).</summary>
+        Public Property BootStartDelaySeconds As Integer? = Nothing
+    End Class
+
+    Public Class BootFlagsResponse
+        ''' <summary>The in-memory tracked instance was updated.</summary>
+        Public Property InstanceTracked As Boolean
+        ''' <summary>A snapshot row existed and now carries the new flags
+        ''' (or was deleted — see ParkedRowRemoved).</summary>
+        Public Property SnapshotUpdated As Boolean
+        ''' <summary>Autostart was switched off while the snapshot was a
+        ''' parked (Stopped) row — the row was deleted outright.</summary>
+        Public Property ParkedRowRemoved As Boolean
+    End Class
+
+    ''' <summary>
+    ''' Result of POST /api/instances/park (additive endpoint,
+    ''' 2026-08-10): the node persists a STOPPED ("parked") snapshot
+    ''' from a full StartInstanceRequest WITHOUT spawning anything —
+    ''' the missing piece for arming "Auto start with node" on an
+    ''' instance that is stopped and has no snapshot (nothing had
+    ''' stored its launch settings yet, so the boot pass had nothing
+    ''' to start). The Manager sends the same request a real start
+    ''' would send; the node writes the recovery payload + flags and
+    ''' the next node boot starts the instance through the normal
+    ''' resurrection pass. Refused while the node already tracks the
+    ''' instance as Running/Starting (a live instance's flags go
+    ''' through /boot-flags instead).
+    ''' </summary>
+    Public Class ParkInstanceResponse
+        Public Property Parked As Boolean
+        Public Property Refused As Boolean
+        Public Property Message As String
+    End Class
+
+    ''' <summary>
+    ''' Result of POST /api/instances/{id}/forget (additive endpoint,
+    ''' 2026-08-10): the node drops every trace it keeps of an
+    ''' instance the Manager is deleting — snapshot row (parked or
+    ''' not) and boot-flap-guard row — so a deleted instance can
+    ''' never be auto-started at a later node boot. Refused (HTTP
+    ''' 409) while the node believes the instance is running or
+    ''' starting; stop it first.
+    ''' </summary>
+    Public Class ForgetInstanceResponse
+        Public Property Removed As Boolean
+        Public Property Refused As Boolean
+        Public Property Message As String
     End Class
 
     Public Class InstanceStatusResponse
@@ -475,6 +771,58 @@ Namespace GSM.Node.Api
         ''' on the wire so adding this is backward-compatible.
         ''' </summary>
         Public Property InstalledBuildId As String
+
+        ''' <summary>
+        ''' What happened with the _CommonRedist pass for this
+        ''' operation (incident follow-up #6 — the July Palworld
+        ''' DirectX-runtime gap was invisible because redist
+        ''' execution only left node-log lines). One of:
+        '''   "ran"            — RunCommonRedistAsync executed; see
+        '''                      RedistResults for per-installer
+        '''                      outcomes.
+        '''   "disabled"       — RunCommonRedist was off in the
+        '''                      installation settings.
+        '''   "no-folder"      — enabled, but no _CommonRedist
+        '''                      directory exists in the install.
+        '''   "not-applicable" — non-Windows node.
+        ''' Nothing/empty on operations that never reach the redist
+        ''' phase (failed installs, non-SteamCMD flows without the
+        ''' pass) and on nodes older than this field — absent
+        ''' deserializes to Nothing, additive-field pattern.
+        ''' </summary>
+        Public Property RedistStatus As String
+
+        ''' <summary>
+        ''' Per-installer outcomes of the _CommonRedist pass, in
+        ''' execution order. Populated only when RedistStatus is
+        ''' "ran". Additive — old Managers ignore it.
+        ''' </summary>
+        Public Property RedistResults As List(Of RedistResult)
+    End Class
+
+    ''' <summary>
+    ''' Outcome of one redistributable installer executed by the
+    ''' node's _CommonRedist pass (EventStream-era incident
+    ''' follow-up #6). Additive wire DTO — Manager/Node surface
+    ''' only, not plugin-facing (no ContractsVersion bump).
+    ''' </summary>
+    Public Class RedistResult
+        ''' <summary>Installer file name (e.g. "vc_redist.x64.exe",
+        ''' relative to _CommonRedist for uniqueness).</summary>
+        Public Property Installer As String
+
+        ''' <summary>Raw exit code; Nothing when the process never
+        ''' produced one (timeout, launch failure).</summary>
+        Public Property ExitCode As Integer?
+
+        ''' <summary>One of "installed" (0/1638/3010),
+        ''' "requirements-not-met" (5100), "failed" (other codes),
+        ''' "timeout" (5-minute cap hit), "error" (launch threw).</summary>
+        Public Property Outcome As String
+
+        ''' <summary>Human-readable detail (exception message for
+        ''' "error", empty otherwise).</summary>
+        Public Property Detail As String
     End Class
 
     Public Class SteamCredential
@@ -912,11 +1260,107 @@ Namespace GSM.Node.Api
         Function GetApiVersionAsync(force As Boolean,
                                      cancellation As CancellationToken) As Task(Of NodeVersionResponse)
 
+        ' ---- TLS onboarding (Phase 7 / 0.7.0) ----
+
+        ''' <summary>
+        ''' Asks the node to enable its HTTPS listener. Called over the
+        ''' authenticated HTTP channel. The returned fingerprint is the
+        ''' pin the Manager stores. The node restarts shortly after
+        ''' responding (RestartRequired) — callers should expect the
+        ''' connection to drop and re-probe over HTTPS with the pin.
+        ''' 404s on pre-TLS nodes (surface as NodeApiException).
+        ''' </summary>
+        Function EnableTlsAsync(request As EnableTlsRequest,
+                                cancellation As CancellationToken) As Task(Of EnableTlsResponse)
+
+        ''' <summary>
+        ''' Current TLS state of the node. 404s on pre-TLS nodes.
+        ''' </summary>
+        Function GetTlsStatusAsync(cancellation As CancellationToken) As Task(Of TlsStatusResponse)
+
         ' ---- Instance lifecycle ----
         Function StartInstanceAsync(request As StartInstanceRequest, cancellation As CancellationToken) As Task(Of InstanceStatusResponse)
         Function StopInstanceAsync(request As StopInstanceRequest, cancellation As CancellationToken) As Task(Of InstanceStatusResponse)
         Function GetInstanceStatusAsync(instanceId As String, cancellation As CancellationToken) As Task(Of InstanceStatusResponse)
         Function GetAllInstanceStatusesAsync(cancellation As CancellationToken) As Task(Of IReadOnlyList(Of InstanceStatusResponse))
+
+        ''' <summary>
+        ''' Pushes the instance's node-boot flags ("Recover state on
+        ''' node restart" / "Auto start with node") to the node
+        ''' WITHOUT a start/stop cycle — see BootFlagsRequest. Called
+        ''' by the Manager when the Edit Instance form is saved.
+        ''' 404s on nodes older than this endpoint (surface as
+        ''' NodeApiException StatusCode=NotFound); callers treat that
+        ''' as "flags apply from the instance's next start" and
+        ''' proceed.
+        ''' </summary>
+        Function UpdateBootFlagsAsync(instanceId As String,
+                                       request As BootFlagsRequest,
+                                       cancellation As CancellationToken) As Task(Of BootFlagsResponse)
+
+        ''' <summary>
+        ''' Tells the node to drop every trace of an instance the
+        ''' Manager is deleting (snapshot row incl. parked autostart
+        ''' rows + flap-guard row) so nothing is left to auto-start
+        ''' at a later node boot. Returns Refused=True (HTTP 409
+        ''' body) while the node believes the instance is running.
+        ''' 404s on older nodes — nothing to clean there, callers
+        ''' proceed.
+        ''' </summary>
+        Function ForgetInstanceAsync(instanceId As String,
+                                      cancellation As CancellationToken) As Task(Of ForgetInstanceResponse)
+
+        ''' <summary>
+        ''' Persists a parked (Stopped) snapshot from a full start
+        ''' request WITHOUT spawning — arms "Auto start with node"
+        ''' for an instance that is stopped with no snapshot on the
+        ''' node. See ParkInstanceResponse. 404s on older nodes;
+        ''' callers treat that as "arms from the instance's next
+        ''' start" and proceed.
+        ''' </summary>
+        Function ParkInstanceAsync(request As StartInstanceRequest,
+                                    cancellation As CancellationToken) As Task(Of ParkInstanceResponse)
+
+        ''' <summary>
+        ''' Per-instance event-source diagnostics (Slice 2's
+        ''' GET /api/instances/{id}/events/sources): appended /
+        ''' suppressed counters per source + the active authority
+        ''' map. Surfaced by the Manager's Diagnostics window
+        ''' (2026-08-14) so authority checks don't require curl.
+        ''' Counters are per node session. 404s on pre-stream
+        ''' nodes (NodeApiException StatusCode=NotFound) — callers
+        ''' show "not supported by this node". Additive member,
+        ''' same no-version-bump rationale as UpdateParseRulesAsync
+        ''' (Manager↔Node plumbing, not plugin-facing).
+        ''' </summary>
+        Function GetEventSourceDiagnosticsAsync(instanceId As String,
+                                                 cancellation As CancellationToken) As Task(Of IReadOnlyList(Of EventSourceDiagnostics))
+
+        ' ---- Diagnostics Wave 2 (2026-08-15, all additive; 404 on
+        '      older nodes → Manager renders "not supported") ----
+
+        Function GetEventWatermarksAsync(instanceId As String,
+                                          cancellation As CancellationToken) As Task(Of EventWatermarkDiagnosticsResponse)
+
+        Function GetParseTraceAsync(instanceId As String,
+                                     cancellation As CancellationToken) As Task(Of ParseTraceResponse)
+
+        ''' <summary>Re-arms the 20-line post-registration log trace
+        ''' (the in-memory ring is always on).</summary>
+        Function RearmParseTraceAsync(instanceId As String,
+                                       cancellation As CancellationToken) As Task(Of ParseTraceResponse)
+
+        ''' <summary>Dry-runs one console line through the instance's
+        ''' registered rules — no append, no fold.</summary>
+        Function TestParseLineAsync(instanceId As String,
+                                     request As RuleDryRunRequest,
+                                     cancellation As CancellationToken) As Task(Of RuleDryRunResponse)
+
+        Function GetBootStateAsync(instanceId As String,
+                                    cancellation As CancellationToken) As Task(Of BootStateResponse)
+
+        Function GetShimStateAsync(instanceId As String,
+                                    cancellation As CancellationToken) As Task(Of ShimStateResponse)
 
         ' ---- Installation ----
         Function StartInstallAsync(request As InstallRequest, cancellation As CancellationToken) As Task(Of InstallProgressResponse)
@@ -1139,6 +1583,380 @@ Namespace GSM.Node.Api
         Function RespondToPromptAsync(response As PromptResponse, cancellation As CancellationToken) As Task(Of Boolean)
         Function UninstallAsync(request As UninstallRequest, cancellation As CancellationToken) As Task(Of Boolean)
 
+        ' ---- Event stream (EventStream Slice 3, additive) ----
+
+        ''' <summary>
+        ''' Cursor-paged pull from the node's per-instance event
+        ''' stream. Returns events with Seq strictly greater than
+        ''' sinceSeq, oldest first, at most max. The response's
+        ''' LastSeq is the next call's cursor. 404s on pre-stream
+        ''' nodes (surface as NodeApiException).
+        ''' </summary>
+        Function GetEventsAsync(instanceId As String,
+                                 sinceSeq As Long,
+                                 max As Integer,
+                                 cancellation As CancellationToken) As Task(Of EventBatchResponse)
+
+        ''' <summary>
+        ''' The instance stream's current head Seq (0 when the
+        ''' scope has no events yet) without transferring any
+        ''' events. Used to seed a first-connect cursor at "now" so
+        ''' a fresh sync consumer doesn't replay retained history
+        ''' the legacy ingestion path already covered.
+        ''' </summary>
+        Function GetEventsHeadAsync(instanceId As String,
+                                     cancellation As CancellationToken) As Task(Of Long)
+
+        ''' <summary>
+        ''' Kind-restricted Manager→node append (the
+        ''' manager:identity enrichment channel). The node accepts
+        ''' PlayerIdentity ONLY, forces SourceId to
+        ''' "manager:identity", and routes the event through its
+        ''' normal ingestion (append + fold), so its enrich-or-stash
+        ''' identity rules apply unchanged.
+        ''' </summary>
+        Function AppendIdentityEventAsync(instanceId As String,
+                                           request As AppendEventRequest,
+                                           cancellation As CancellationToken) As Task(Of AppendEventResponse)
+
+        ''' <summary>
+        ''' SSE live-follow of the node's per-instance event stream
+        ''' (GET /events/stream?since={seq}). The node replays the
+        ''' gap after sinceSeq first, then pushes live events until
+        ''' the connection drops — backfill and live arrive through
+        ''' the same callback in the same representation. onEvent is
+        ''' awaited per record, so a slow consumer back-pressures
+        ''' the read loop instead of losing events; an exception it
+        ''' throws tears the stream down and propagates.
+        '''
+        ''' Unlike StreamLogsAsync this method THROWS on transport
+        ''' failure (connect refused, mid-stream drop, idle timeout
+        ''' with no keep-alive) rather than swallowing — the caller
+        ''' (EventSyncService) owns the fallback-to-pull decision
+        ''' and needs to see the failure. Returns normally only when
+        ''' the server ends the stream. Honors cancellation.
+        ''' (INodeClient member — Manager client surface, not
+        ''' plugin-facing; no ContractsVersion bump per the v4
+        ''' comment precedent.)
+        ''' </summary>
+        Function StreamEventsAsync(instanceId As String,
+                                    sinceSeq As Long,
+                                    onEvent As Func(Of EventRecord, Task),
+                                    cancellation As CancellationToken) As Task
+
     End Interface
+
+    ' ============================================================
+    '  Event stream — wire DTOs (EventStream Slice 1, additive)
+    '
+    '  One canonical, append-only event stream per instance, owned
+    '  by the node. Consumed by cursor:
+    '    GET /api/instances/{id}/events?since={seq}&max={n}
+    '    GET /api/instances/{id}/events/stream?since={seq}   (SSE)
+    '  The SSE variant replays the gap after {seq} first, then
+    '  goes live; each SSE data: payload is one EventRecord in the
+    '  same camelCase JSON the GET endpoint returns, so both paths
+    '  deserialise through one code path.
+    '
+    '  Seq is per-instance, strictly increasing, assigned by the
+    '  node at append, never reused, and survives node restarts.
+    '  since=0 reads from the beginning of retained history.
+    ' ============================================================
+
+    ''' <summary>
+    ''' One event in an instance's canonical stream. Parse-rule
+    ''' hits, poller diffs (Slice 2), and node lifecycle
+    ''' transitions all share this shape — downstream cannot (and
+    ''' should not) tell them apart except by SourceId.
+    ''' </summary>
+    Public Class EventRecord
+        ''' <summary>Monotonic per-instance sequence number,
+        ''' assigned by the node at append. Cursor key.</summary>
+        Public Property Seq As Long
+
+        Public Property InstanceId As String
+
+        ''' <summary>Event time (UTC). For parse-derived events
+        ''' this is the embedded log-line timestamp when one is
+        ''' parseable (stable across replays), else the capture
+        ''' wall-clock; for lifecycle events, the emit time.</summary>
+        Public Property UtcAt As DateTime
+
+        Public Property Kind As ParsedEventKind
+
+        ''' <summary>Which ingestion source emitted this event —
+        ''' "stdout", "tailer", "lifecycle", later "pal-rest" /
+        ''' "conpty" / "manager:identity".</summary>
+        Public Property SourceId As String
+
+        ''' <summary>Named capture fields (DisplayName, Platform,
+        ''' PlatformUserId, CharacterId, RemoteAddress, Message,
+        ''' MatchState, TileId, TileName, MapPath, Registered,
+        ''' ExitCode, CrashCount, Custom_* passthroughs, ...).
+        ''' Nothing when the event carries no fields.</summary>
+        Public Property Fields As Dictionary(Of String, String)
+
+        ''' <summary>Original log line for parse-derived events;
+        ''' Nothing for synthesized events (lifecycle, pollers).</summary>
+        Public Property Raw As String
+    End Class
+
+    ''' <summary>
+    ''' Response of GET /api/instances/{id}/events. LastSeq echoes
+    ''' the last returned event's Seq (or the request's since value
+    ''' when no events matched) so callers can advance their cursor
+    ''' without inspecting the array.
+    ''' </summary>
+    Public Class EventBatchResponse
+        Public Property Events As List(Of EventRecord)
+        Public Property LastSeq As Long
+    End Class
+
+    ''' <summary>
+    ''' Body of POST /api/instances/{id}/events — the Manager→node
+    ''' enrichment append (EventStream Slice 3). The endpoint is
+    ''' kind-restricted server-side (PlayerIdentity only) and the
+    ''' node forces the SourceId; the request carries no SourceId
+    ''' field on purpose.
+    ''' </summary>
+    Public Class AppendEventRequest
+        Public Property Kind As ParsedEventKind
+
+        ''' <summary>Event time (UTC). DateTime.MinValue / unset →
+        ''' the node stamps its own clock at append.</summary>
+        Public Property UtcAt As DateTime
+
+        ''' <summary>Named capture fields — same vocabulary as
+        ''' parse-rule captures (CharacterId, PlatformUserId,
+        ''' DisplayName, Platform, PlatformPersona, ...).</summary>
+        Public Property Fields As Dictionary(Of String, String)
+    End Class
+
+    Public Class AppendEventResponse
+        ''' <summary>True when the event was actually appended —
+        ''' False when replay-dedup, a purge watermark, or an
+        ''' unregistered instance dropped it.</summary>
+        Public Property Inserted As Boolean
+    End Class
+
+    ' ============================================================
+    '  State polling — wire DTOs (EventStream Slice 2, additive)
+    '
+    '  A ResolvedStatePollSource describes one endpoint the NODE
+    '  polls on the game's own admin/status API, fully resolved by
+    '  the game plugin at instance start (see IStatePollProvider in
+    '  IGamePlugin.vb). The node is game-agnostic: it GETs the URL,
+    '  walks PlayersArrayPath, maps payload keys through FieldMap,
+    '  and diffs successive snapshots by KeyField.
+    ' ============================================================
+
+    Public Enum PollAuthKind
+        None
+        Basic          ' HTTP Basic — AuthUsername / AuthPassword
+    End Enum
+
+    Public Enum PollPayloadShape
+        ''' <summary>JSON object containing an array of player
+        ''' objects at PlayersArrayPath (e.g. Palworld's
+        ''' {"players":[{...}]}).</summary>
+        PlayerArray
+    End Enum
+
+    Public Class ResolvedStatePollSource
+        ''' <summary>Stream SourceId for events this poller emits
+        ''' (e.g. "pal-rest"). Must not collide with the built-in
+        ''' "stdout" / "tailer" / "lifecycle" ids.</summary>
+        Public Property SourceId As String
+
+        ''' <summary>Fully resolved URL, normally against 127.0.0.1
+        ''' (the poller runs on the node, next to the game).</summary>
+        Public Property Url As String
+
+        Public Property AuthKind As PollAuthKind
+        Public Property AuthUsername As String
+        Public Property AuthPassword As String
+
+        ''' <summary>Poll cadence. Values &lt; 1 fall back to 5.</summary>
+        Public Property IntervalSeconds As Integer = 5
+
+        Public Property PayloadShape As PollPayloadShape
+
+        ''' <summary>JSON property on the response object that holds
+        ''' the player array (PlayerArray shape). Default "players".</summary>
+        Public Property PlayersArrayPath As String = "players"
+
+        ''' <summary>CAPTURE-FIELD name (post-FieldMap) used as the
+        ''' identity key when diffing snapshots — must be stable per
+        ''' player per session (e.g. "PlatformUserId").</summary>
+        Public Property KeyField As String
+
+        ''' <summary>Optional: capture-field whose value has a
+        ''' platform prefix joined by '_' (Palworld userId =
+        ''' "steam_7656..."). When set, the poller splits it into
+        ''' Platform + remainder, matching the semantics the
+        ''' remote-control player path established.</summary>
+        Public Property PlatformPrefixField As String
+
+        ''' <summary>Payload key -&gt; capture-field name (DisplayName,
+        ''' PlatformPersona, PlatformUserId, CharacterId,
+        ''' RemoteAddress, ...). Payload keys are matched
+        ''' case-insensitively — the live Palworld API returns "iP".</summary>
+        Public Property FieldMap As Dictionary(Of String, String)
+
+        ''' <summary>Kinds this source OWNS for the instance — the
+        ''' node's per-kind authority map suppresses these kinds from
+        ''' any OTHER source at append time (dedupe opt-in; see the
+        ''' EventStream plan's Source authority section). Lifecycle
+        ''' kinds cannot be claimed.</summary>
+        Public Property AuthoritativeKinds As List(Of ParsedEventKind)
+    End Class
+
+    ''' <summary>
+    ''' Per-source stream counters for one instance — response
+    ''' element of GET /api/instances/{id}/events/sources. Makes a
+    ''' misconfigured authority map observable instead of silent:
+    ''' a healthy dual-source setup shows the suppressed counter
+    ''' climbing on the non-authoritative source.
+    ''' </summary>
+    Public Class EventSourceDiagnostics
+        Public Property SourceId As String
+        Public Property Appended As Long
+        Public Property Suppressed As Long
+
+        ''' <summary>Kinds this source owns per the active authority
+        ''' map (names, for readability).</summary>
+        Public Property OwnedKinds As List(Of String)
+
+        ''' <summary>Diagnostics Wave 2 (additive, 2026-08-15):
+        ''' kinds this source has PARSE RULES for — informational
+        ''' only, distinct from OwnedKinds (which is the
+        ''' authority-ENFORCED map and only populated for contested
+        ''' kinds). Fills the display gap where a single-source game
+        ''' (LO tailer) showed no kinds at all despite parsing
+        ''' join/leave. Set only on line-capture sources
+        ''' (conpty/stdout/tailer); Nothing from older nodes.</summary>
+        Public Property ParsesKinds As List(Of String)
+    End Class
+
+    ' ============================================================
+    '  Diagnostics Wave 2 (2026-08-15) — node observability DTOs.
+    '  All additive; older nodes 404 the endpoints and the Manager
+    '  renders "not supported by this node".
+    ' ============================================================
+
+    ''' <summary>GET /api/instances/{id}/events/watermarks — the
+    ''' purge-watermark gate + per-kind event counts, endpoint-ified
+    ''' from the --dump-watermarks CLI so watermark hunts don't need
+    ''' a terminal on the node box.</summary>
+    Public Class EventWatermarkDiagnosticsResponse
+        Public Property Watermarks As List(Of EventWatermarkEntry)
+        Public Property EventCounts As List(Of EventKindCount)
+    End Class
+
+    Public Class EventWatermarkEntry
+        Public Property KindName As String
+        ''' <summary>Raw stored cutoff (roundtrip format).</summary>
+        Public Property PurgedThroughUtc As String
+        ''' <summary>True when the watermark sits at/after now —
+        ''' such a watermark BLOCKS every new event of the kind
+        ''' (they only move forward). The one-glance red flag.</summary>
+        Public Property IsFuture As Boolean
+    End Class
+
+    Public Class EventKindCount
+        Public Property KindName As String
+        Public Property Count As Long
+        Public Property LastEventUtc As String
+    End Class
+
+    ''' <summary>GET /api/instances/{id}/events/parsetrace — recent
+    ''' parse-path activity (ring of the last lines ProcessLine saw,
+    ''' with the rule matched and the append outcome). POST
+    ''' .../parsetrace/rearm re-arms the log-side trace budget too.</summary>
+    Public Class ParseTraceResponse
+        Public Property Entries As List(Of ParseTraceEntry)
+        ''' <summary>Remaining log-side trace budget (the 20-line
+        ''' post-registration logger); the ring itself is always on.</summary>
+        Public Property LogBudgetRemaining As Integer
+    End Class
+
+    Public Class ParseTraceEntry
+        Public Property AtUtc As DateTime
+        Public Property SourceId As String
+        ''' <summary>Rule that matched, or Nothing.</summary>
+        Public Property RuleName As String
+        ''' <summary>Append outcome ("inserted=True suppressed=False
+        ''' purged=False"), or Nothing when no rule matched.</summary>
+        Public Property Outcome As String
+        Public Property Line As String
+    End Class
+
+    ''' <summary>POST /api/instances/{id}/events/test-line — dry-run
+    ''' one console line through the instance's REGISTERED rules. No
+    ''' append, no fold; pure regex verdicts + captured groups. The
+    ''' G2 prefix bug would have been a 30-second check with this.</summary>
+    Public Class RuleDryRunRequest
+        Public Property Line As String
+    End Class
+
+    Public Class RuleDryRunResponse
+        Public Property Results As List(Of RuleDryRunResult)
+    End Class
+
+    Public Class RuleDryRunResult
+        Public Property RuleName As String
+        Public Property KindName As String
+        Public Property Matched As Boolean
+        ''' <summary>Named captures when matched (group → value).</summary>
+        Public Property Captures As Dictionary(Of String, String)
+    End Class
+
+    ''' <summary>GET /api/instances/{id}/boot-state — everything the
+    ''' node-boot resurrection pass would see for this instance:
+    ''' snapshot/parked state, boot flags, flap-guard chain. Makes
+    ''' the GR gates and "why didn't it autostart" observable from
+    ''' the Manager.</summary>
+    Public Class BootStateResponse
+        ''' <summary>Node currently tracks the instance in memory.</summary>
+        Public Property Tracked As Boolean
+        Public Property TrackedState As String
+        Public Property SnapshotExists As Boolean
+        Public Property SnapshotState As String
+        ''' <summary>SnapshotExists AND State=Stopped — an armed
+        ''' "Auto start with node" park row.</summary>
+        Public Property Parked As Boolean
+        Public Property ResurrectOnBoot As Boolean
+        Public Property AutoStartOnBoot As Boolean
+        Public Property StopIntentPending As Boolean
+        Public Property ShimRingSeq As Long
+        ''' <summary>Flap-guard chain: last boot-resurrect attempt
+        ''' (DateTime.MinValue = none) and consecutive count (3 =
+        ''' suppressed until 10 quiet minutes pass).</summary>
+        Public Property FlapLastAttemptUtc As DateTime
+        Public Property FlapAttemptCount As Integer
+    End Class
+
+    ''' <summary>GET /api/instances/{id}/shim-state — the shim link
+    ''' as the node sees it: mode, strategy, pids, negotiated
+    ''' protocol, ring cursors (live consumed vs snapshot-persisted).</summary>
+    Public Class ShimStateResponse
+        Public Property Tracked As Boolean
+        ''' <summary>"Direct" or "Shim".</summary>
+        Public Property ExecutionMode As String
+        ''' <summary>SpawnStrategy name (e.g. "ConPty").</summary>
+        Public Property Strategy As String
+        Public Property ShimPid As Integer
+        Public Property ShimEndpoint As String
+        ''' <summary>Negotiated shim protocol version (0 = n/a).</summary>
+        Public Property ShimProtocolVersion As Integer
+        ''' <summary>A live ShimSession is attached right now.</summary>
+        Public Property Attached As Boolean
+        ''' <summary>Highest ring-frame seq consumed this session
+        ''' (live counter when attached, else the in-memory cursor).</summary>
+        Public Property ConsumedRingSeq As Long
+        ''' <summary>Ring cursor persisted on the snapshot row (what
+        ''' the next adopt would send as Hello.ReplayAfterSeq).</summary>
+        Public Property SnapshotRingSeq As Long
+    End Class
 
 End Namespace

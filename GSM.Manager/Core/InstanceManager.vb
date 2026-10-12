@@ -57,6 +57,41 @@ Namespace GSM.Manager.Core
         ' it) and dropped only on a real stop (StopLogStream).
         Private ReadOnly _connectionBindings As _
             New ConcurrentDictionary(Of String, IDictionary(Of String, String))
+
+        ' Connect-before-join persona stash (double-Join fix,
+        ' 2026-08-13), Manager-side mirror of the node's
+        ' PendingIdentity path 1b. Palworld's "connected the
+        ' server" line is now kind=PlayerIdentity (so it doesn't
+        ' render as a second Join row), which means the platform
+        ' persona (Steam handle) no longer rides the PlayerJoin
+        ' event at all — it arrives seconds EARLIER on the
+        ' identity event. ApplyStreamPlayerEventsAsync stashes
+        ' persona (+platform) by (instanceId, PlatformUserId)
+        ' here and consults it when the join/leave for the same
+        ' pid arrives, restoring the legacy persona-first
+        ' PlayerName selection (History Player column, bucket
+        ' key, PlayerSessions upsert key, notifications). The
+        ' entry is kept until the LEAVE for the pid has used it
+        ' (leave removes it); the instance's whole map drops on
+        ' StopLogStream alongside _connectionBindings.
+        Private ReadOnly _pendingPersonaByPid As _
+            New ConcurrentDictionary(Of String, ConcurrentDictionary(Of String, (Persona As String, Platform As String)))
+
+        ' Nameless-join stash (2026-08-15, Windrose-class fix).
+        ' Windrose's join line carries ONLY CharacterId + IP — no
+        ' persona, no display — so the stream apply's name
+        ' selection came up empty and the join fell into the
+        ' "unattributable — skip" path: roster filled (node fold
+        ' keys by cid) but History never got the Join row. Stash
+        ' the nameless join by (instanceId, cid); the roster-dump
+        ' PlayerIdentity event that follows carries cid + Name and
+        ' DRAINS it — the Join row is written then, stamped at the
+        ' ORIGINAL join time. A nameless LEAVE for a still-pending
+        ' cid drops the stash instead (session never got a name —
+        ' nothing attributable to show). Cleared on StopLogStream
+        ' with the persona stash.
+        Private ReadOnly _pendingJoinsByCid As _
+            New ConcurrentDictionary(Of String, ConcurrentDictionary(Of String, (UtcAt As DateTime, Addr As String, Pid As String, Platform As String)))
         Private ReadOnly _liveStates As New ConcurrentDictionary(Of String, InstanceStatusResponse)
 
         ' Guards the cancel-old / install-new transition inside
@@ -277,7 +312,16 @@ Namespace GSM.Manager.Core
         ''' Starts an instance on its node. Resolves plugin config,
         ''' builds launch arguments, sends StartInstanceRequest.
         ''' </summary>
-        Public Async Function StartInstanceAsync(instanceId As String) As Task(Of Boolean)
+        ''' <param name="parkOnly">When True, build the exact request a
+        ''' real start would send but have the node PARK it (persist a
+        ''' Stopped snapshot, no spawn) — used to arm "Auto start with
+        ''' node" on a stopped instance whose node holds no snapshot.
+        ''' Exe candidate probing can't run without a spawn, so the
+        ''' first candidate is parked; a wrong exe surfaces at the next
+        ''' node boot's start attempt and self-heals on the next real
+        ''' start.</param>
+        Public Async Function StartInstanceAsync(instanceId As String,
+                                                 Optional parkOnly As Boolean = False) As Task(Of Boolean)
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
                 Dim instanceEntity = db.Instances.Find(instanceId)
@@ -506,6 +550,7 @@ Namespace GSM.Manager.Core
                 ' AttachConsole(parent) startup trick).
                 Dim resolvedStdoutIsLog As Boolean = False
                 Dim resolvedRequiresConsoleIsolation As Boolean = False
+                Dim resolvedNeedsPseudoConsole As Boolean = False
                 Dim resolvedTailerDelayMs As Integer = -1
                 Dim resolvedEnvVars As Dictionary(Of String, String) = Nothing
                 If plugin IsNot Nothing Then
@@ -516,12 +561,49 @@ Namespace GSM.Manager.Core
                             If opts IsNot Nothing Then
                                 resolvedStdoutIsLog = opts.StdoutIsLog
                                 resolvedRequiresConsoleIsolation = opts.RequiresConsoleIsolation
+                                resolvedNeedsPseudoConsole = opts.NeedsPseudoConsole
                                 resolvedTailerDelayMs = opts.LogTailerStartDelayMs
                                 resolvedEnvVars = opts.EnvironmentVars
                             End If
                         Catch ex As Exception
                             _logger.LogWarning(ex,
                                 "Plugin failed to report launch options for {Id} — falling back to defaults",
+                                instanceId)
+                        End Try
+                    End If
+                End If
+
+                ' EventStream Slice 2: resolve state-poll sources from
+                ' the plugin (IStatePollProvider, opt-in). Fully
+                ' GENERIC — the plugin returns resolved sources (final
+                ' URL against the node's loopback, literal
+                ' credentials, read from the game's own config file
+                ' via the same FetchInstanceFile plumbing the
+                ' remote-control surface uses) and we copy them onto
+                ' the wire verbatim; zero game-specific code here.
+                ' Best-effort: a plugin failure or missing/unreadable
+                ' game config means no poller, never a failed start.
+                Dim resolvedPollSources As List(Of ResolvedStatePollSource) = Nothing
+                If plugin IsNot Nothing Then
+                    Dim pollProvider = TryCast(plugin, IStatePollProvider)
+                    If pollProvider IsNot Nothing Then
+                        Try
+                            Dim pollCtx As New StatePollResolveContext With {
+                                .Config = instanceConfig,
+                                .FetchInstanceFile =
+                                    Function(relPath) FetchInstanceFileTextAsync(
+                                        client, instanceId, installEntity.InstallPath, relPath)
+                            }
+                            Dim declared = Await pollProvider.GetStatePollSourcesAsync(pollCtx)
+                            If declared IsNot Nothing AndAlso declared.Count > 0 Then
+                                resolvedPollSources = New List(Of ResolvedStatePollSource)(declared)
+                                _logger.LogInformation(
+                                    "Plugin declared {Count} state-poll source(s) for {Id}",
+                                    resolvedPollSources.Count, instanceId)
+                            End If
+                        Catch ex As Exception
+                            _logger.LogWarning(ex,
+                                "Plugin failed to resolve state-poll sources for {Id} — starting without a poller",
                                 instanceId)
                         End Try
                     End If
@@ -581,8 +663,41 @@ Namespace GSM.Manager.Core
                         .LogParseRules = parseRules,
                         .StdoutIsLog = resolvedStdoutIsLog,
                         .RequiresConsoleIsolation = resolvedRequiresConsoleIsolation,
-                        .LogTailerStartDelayMs = resolvedTailerDelayMs
+                        .NeedsPseudoConsole = resolvedNeedsPseudoConsole,
+                        .LogTailerStartDelayMs = resolvedTailerDelayMs,
+                        .PollSources = resolvedPollSources,
+                        .ResurrectOnNodeBoot = GetBoolField(customFields, "ResurrectOnNodeBoot", False),
+                        .AutoStartOnNodeBoot = GetBoolField(customFields, "AutoStartOnNodeBoot", False),
+                        .BootStartDelaySeconds = GetIntField(customFields, "BootStartDelaySeconds", 0)
                     }
+
+                    ' Park-only: persist the request as a Stopped snapshot
+                    ' on the node and return — no spawn, no candidate
+                    ' probing (that needs a real start to fail), no
+                    ' post-start bookkeeping.
+                    If parkOnly Then
+                        Try
+                            Dim parkResult = Await client.ParkInstanceAsync(request, CancellationToken.None)
+                            If parkResult IsNot Nothing AndAlso parkResult.Refused Then
+                                _logger.LogInformation(
+                                    "Park for {Id} refused by node: {Msg}", instanceId, parkResult.Message)
+                                Return False
+                            End If
+                            _logger.LogInformation(
+                                "Parked launch settings for {Id} on node {Node} (exe {Exe}) — node-boot autostart armed without a start",
+                                instanceId, nodeEntity.DisplayName, candidate)
+                            Return True
+                        Catch ex As NodeApiException When ex.StatusCode.HasValue AndAlso
+                                                          ex.StatusCode.Value = HttpStatusCode.NotFound
+                            _logger.LogDebug(
+                                "Park endpoint not available on node for {Id} — autostart arms from the next start",
+                                instanceId)
+                            Return False
+                        Catch ex As Exception
+                            _logger.LogWarning(ex, "Failed to park {Id} on node", instanceId)
+                            Return False
+                        End Try
+                    End If
 
                     Try
                         Dim result = Await client.StartInstanceAsync(request, CancellationToken.None)
@@ -840,6 +955,24 @@ Namespace GSM.Manager.Core
                 StopLogStream(instanceId)
             End Try
 
+            ' Stop-tail drain (2026-08-15): StopLogStream just tore
+            ' down the sync loop at the exact moment the node
+            ' appended InstanceStopRequested/ProcessExited — the SSE
+            ' delivery loses that race, and the stop rows only
+            ' reached History via cursor replay at the NEXT start
+            ' (live-observed on LO). One bounded cursor drain right
+            ' here lands them now. Outside the Finally (VB forbids
+            ' Await there); best-effort — the next-start replay
+            ' remains the backstop.
+            Try
+                Dim sync = EventSync()
+                If sync IsNot Nothing Then
+                    Await sync.StopSyncAndDrainAsync(instanceId)
+                End If
+            Catch ex As Exception
+                _logger.LogDebug(ex, "Stop-tail drain failed for {Id}", instanceId)
+            End Try
+
             Return succeeded
         End Function
 
@@ -1050,20 +1183,53 @@ Namespace GSM.Manager.Core
             Dim client = GetClientForInstance(instanceId)
             If client Is Nothing Then Return New List(Of PlayerSession)()
 
+            ' Console-first (ConPTY C4b, 2026-08-11): the RC override below
+            ' predates log-based tracking for these games ("the node list is
+            ' permanently empty for them" — no longer true). When the plugin
+            ' declares join/leave parse rules, the NODE roster is
+            ' authoritative — including an EMPTY roster — and we skip the
+            ' RC fetch entirely: this method sits on the instance panel's
+            ' 3s refresh timer, so the override was hammering the game's
+            ' admin REST every 3s per open panel (the exact chatter the
+            ' console-first flip exists to kill). Games whose plugins have
+            ' no roster rules keep the RC override unchanged.
+            Dim hasRosterRules As Boolean = False
+            Try
+                Dim gameId = GetGameIdForInstance(instanceId)
+                Dim rosterPlugin = If(String.IsNullOrEmpty(gameId), Nothing, _pluginRegistry.GetPlugin(gameId))
+                If rosterPlugin IsNot Nothing Then
+                    Dim rules = rosterPlugin.GetLogParseRules()
+                    If rules IsNot Nothing Then
+                        For Each r In rules
+                            If r IsNot Nothing AndAlso
+                               (r.Kind = GSM.Plugin.ParsedEventKind.PlayerJoin OrElse
+                                r.Kind = GSM.Plugin.ParsedEventKind.PlayerLeave) Then
+                                hasRosterRules = True
+                                Exit For
+                            End If
+                        Next
+                    End If
+                End If
+            Catch
+                ' plugin unavailable — treat as no rules; RC override applies
+            End Try
+
             ' Remote-control override source. Plugin returns the
             ' PlayerSession shape directly — all game-specific field
             ' mapping lives plugin-side.
-            Try
-                Dim rc = Await BuildRemoteControlContextAsync(instanceId, client)
-                If rc IsNot Nothing Then
-                    Using cts As New CancellationTokenSource(TimeSpan.FromSeconds(8))
-                        Dim remote = Await rc.Item1.GetPlayersAsync(rc.Item2, cts.Token)
-                        If remote IsNot Nothing Then Return remote
-                    End Using
-                End If
-            Catch ex As Exception
-                _logger.LogDebug(ex, "Remote-control player fetch failed for {Id}; using node list", instanceId)
-            End Try
+            If Not hasRosterRules Then
+                Try
+                    Dim rc = Await BuildRemoteControlContextAsync(instanceId, client)
+                    If rc IsNot Nothing Then
+                        Using cts As New CancellationTokenSource(TimeSpan.FromSeconds(8))
+                            Dim remote = Await rc.Item1.GetPlayersAsync(rc.Item2, cts.Token)
+                            If remote IsNot Nothing Then Return remote
+                        End Using
+                    End If
+                Catch ex As Exception
+                    _logger.LogDebug(ex, "Remote-control player fetch failed for {Id}; using node list", instanceId)
+                End Try
+            End If
 
             Try
                 Return Await client.GetPlayersAsync(instanceId, CancellationToken.None)
@@ -1172,6 +1338,18 @@ Namespace GSM.Manager.Core
         ''' poller can't both observe the same transition.
         ''' </summary>
         Public Async Function RefreshInstanceStateAsync(instanceId As String) As Task(Of InstanceStatusResponse)
+            ' Detached node (IsEnabled=False): the operator opted it out of
+            ' polling. The background loop already skips these, but the
+            ' selected InstancePanel's 3 s timer did not — it kept dialing
+            ' the node and feeding the connection-failure dedup with muted
+            ' exceptions (2026-10-11). Treat as unknown: drop any stale
+            ' cached state so the tree/panel show grey, and return Nothing.
+            If IsInstanceNodeDetached(instanceId) Then
+                Dim stale As InstanceStatusResponse = Nothing
+                _liveStates.TryRemove(instanceId, stale)
+                Return Nothing
+            End If
+
             Dim client = GetClientForInstance(instanceId)
             If client Is Nothing Then Return Nothing
 
@@ -1253,7 +1431,13 @@ Namespace GSM.Manager.Core
                 ' 3s on every instance it hosts; API-level failures
                 ' (HTTP 500/404/etc.) log normally since they're
                 ' usually one-offs worth seeing every time.
-                If IsConnectionFailure(ex) Then
+                If IsConnectionFailure(ex) OrElse IsNodeWideRejection(ex) Then
+                    ' 429 (rate-limit lockout) / 401 / 403 are node-wide
+                    ' conditions, not per-instance one-offs: during the
+                    ' 2026-10-11 post-rotation lockout every 3 s poll on
+                    ' every instance wrote a full stack trace for 15 min.
+                    ' Ride the per-node dedup (first at Warning, heartbeat,
+                    ' "reachable again" on recovery) — stack only at Debug.
                     NoteNodeNetworkFailure(instanceId, ex)
                 Else
                     _logger.LogWarning(ex, "Failed to refresh state for {Id}", instanceId)
@@ -1347,6 +1531,13 @@ Namespace GSM.Manager.Core
                                    live.CurrentState = GSM.Plugin.InstanceState.Running AndAlso
                                    Not _logStreamCancellations.ContainsKey(id) Then
                                     Await EnsureLogStreamAsync(id)
+                                End If
+                                ' EventStream Slice 3: same idempotent
+                                ' re-ensure for the sync loop (its own
+                                ' self-cleanup mirrors the stream's).
+                                If live IsNot Nothing AndAlso
+                                   live.CurrentState = GSM.Plugin.InstanceState.Running Then
+                                    EventSync()?.EnsureSync(id)
                                 End If
                             Catch ex As Exception
                                 _logger.LogDebug(ex,
@@ -1757,6 +1948,27 @@ Namespace GSM.Manager.Core
             End Try
         End Function
 
+        ''' <summary>True when the instance's hosting node is detached
+        ''' (NodeEntity.IsEnabled = False); False when unresolvable.</summary>
+        Private Function IsInstanceNodeDetached(instanceId As String) As Boolean
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim enabled = (From inst In db.Instances
+                                   Join install In db.Installations
+                                       On inst.InstallationId Equals install.InstallationId
+                                   Join node In db.Nodes
+                                       On install.NodeId Equals node.NodeId
+                                   Where inst.InstanceId = instanceId
+                                   Select node.IsEnabled).ToList()
+                    If enabled.Count = 0 Then Return False
+                    Return Not enabled(0)
+                End Using
+            Catch
+                Return False
+            End Try
+        End Function
+
         Private Function FetchAllInstanceIds() As List(Of String)
             Dim ids As New List(Of String)
             Using scope = ManagerProgram.Services.CreateScope()
@@ -1820,6 +2032,22 @@ Namespace GSM.Manager.Core
         End Function
 
         ''' <summary>
+        ''' Number of players the Manager currently tracks as online for
+        ''' an instance (the _activePlayers bucket: fed by the event
+        ''' stream, the legacy log parser and adoption hydration). Pure
+        ''' in-memory read — safe on a UI timer (tree badges, 2026-10-11).
+        ''' 0 when the instance is unknown or has no roster.
+        ''' </summary>
+        Public Function GetActivePlayerCount(instanceId As String) As Integer
+            If String.IsNullOrEmpty(instanceId) Then Return 0
+            Dim bucket As HashSet(Of String) = Nothing
+            If Not _activePlayers.TryGetValue(instanceId, bucket) OrElse bucket Is Nothing Then Return 0
+            SyncLock bucket
+                Return bucket.Count
+            End SyncLock
+        End Function
+
+        ''' <summary>
         ''' Returns all instance IDs for an installation.
         ''' </summary>
         Public Function GetInstanceIdsForInstallation(installationId As String) As IReadOnlyList(Of String)
@@ -1859,6 +2087,16 @@ Namespace GSM.Manager.Core
         ''' transient mis-classification of the first few lines.
         ''' </summary>
         Private Sub StartLogStream(instanceId As String, client As INodeClient)
+            ' EventStream Slice 3: register the stream sync
+            ' alongside the log stream (idempotent, capability-
+            ' gated inside the loop). Registered BEFORE the stream
+            ' task spawns so the join/leave dispatch gate sees
+            ' Pending/Active instead of racing the first lines.
+            Try
+                EventSync()?.EnsureSync(instanceId)
+            Catch
+            End Try
+
             SyncLock _logStreamLock
                 ' Cancel any existing stream BEFORE installing the
                 ' new one. TryRemove + Cancel + Dispose explicitly,
@@ -1977,11 +2215,32 @@ Namespace GSM.Manager.Core
                 ' streaming with whatever state we have. The next
                 ' stream restart's resync retries; the next real
                 ' leave or instance stop cleans up bucket state.
-                Try
-                    Dim players = Await client.GetPlayersAsync(instanceId, ourCts.Token)
-                    Await ResyncActivePlayersFromNodeAsync(instanceId, players, ourCts.Token)
-                Catch
-                End Try
+                ' EventStream Slice 3: when the stream sync owns
+                ' join/leave for this instance, the resync synthesis
+                ' must NOT run — the sync catch-up replay IS the
+                ' downtime-gap filler, and running both would
+                ' synthesize the same missed joins twice. A Pending
+                ' capability probe is waited out (bounded) before
+                ' deciding; the sync loop itself does the bucket
+                ' seed-merge from /players after its catch-up.
+                Dim streamOwnsResync = False
+                Dim resyncSyncSvc = EventSync()
+                If resyncSyncSvc IsNot Nothing Then
+                    Try
+                        streamOwnsResync =
+                            (Await resyncSyncSvc.WaitForDecisionAsync(
+                                instanceId, TimeSpan.FromSeconds(5))) =
+                            EventSyncService.SyncState.Active
+                    Catch
+                    End Try
+                End If
+                If Not streamOwnsResync Then
+                    Try
+                        Dim players = Await client.GetPlayersAsync(instanceId, ourCts.Token)
+                        Await ResyncActivePlayersFromNodeAsync(instanceId, players, ourCts.Token)
+                    Catch
+                    End Try
+                End If
 
                 Await client.StreamLogsAsync(instanceId,
                     Sub(line)
@@ -2002,13 +2261,20 @@ Namespace GSM.Manager.Core
                                 If parsed IsNot Nothing Then
                                     Select Case parsed.EventType
                                         Case LogEventType.PlayerJoin
-                                            Dim name = If(parsed.PlayerInfo IsNot Nothing,
-                                                          parsed.PlayerInfo.PlayerName, "")
-                                            HandlePlayerJoin(instanceId, name)
+                                            ' Slice 3: skipped when the
+                                            ' stream sync owns join/leave
+                                            ' (double-ingestion guard).
+                                            If Not StreamOwnsPlayerIngestion(instanceId) Then
+                                                Dim name = If(parsed.PlayerInfo IsNot Nothing,
+                                                              parsed.PlayerInfo.PlayerName, "")
+                                                HandlePlayerJoin(instanceId, name)
+                                            End If
                                         Case LogEventType.PlayerLeave
-                                            Dim name = If(parsed.PlayerInfo IsNot Nothing,
-                                                          parsed.PlayerInfo.PlayerName, "")
-                                            HandlePlayerLeave(instanceId, name)
+                                            If Not StreamOwnsPlayerIngestion(instanceId) Then
+                                                Dim name = If(parsed.PlayerInfo IsNot Nothing,
+                                                              parsed.PlayerInfo.PlayerName, "")
+                                                HandlePlayerLeave(instanceId, name)
+                                            End If
                                         Case LogEventType.TileLoaded
                                             ' Session identity was committed by
                                             ' the parser just before this event;
@@ -2073,6 +2339,14 @@ Namespace GSM.Manager.Core
         End Function
 
         Private Sub StopLogStream(instanceId As String)
+            ' EventStream Slice 3: stop the sync loop first so no
+            ' concurrent apply races the stop-flush below. Only
+            ' stop/purge paths call StopLogStream; the background
+            ' poll's Ensure restarts the loop on reconnect.
+            Try
+                EventSync()?.StopSync(instanceId)
+            Catch
+            End Try
             Dim cts As CancellationTokenSource = Nothing
             If _logStreamCancellations.TryRemove(instanceId, cts) Then
                 cts.Cancel()
@@ -2087,6 +2361,12 @@ Namespace GSM.Manager.Core
             ' addr->name entries must not carry across a restart.
             Dim removedBindings As IDictionary(Of String, String) = Nothing
             _connectionBindings.TryRemove(instanceId, removedBindings)
+            ' Same lifetime for the connect-before-join persona
+            ' stash — a fresh game process gets fresh connects.
+            Dim removedPersonas As ConcurrentDictionary(Of String, (Persona As String, Platform As String)) = Nothing
+            _pendingPersonaByPid.TryRemove(instanceId, removedPersonas)
+            Dim removedJoins As ConcurrentDictionary(Of String, (UtcAt As DateTime, Addr As String, Pid As String, Platform As String)) = Nothing
+            _pendingJoinsByCid.TryRemove(instanceId, removedJoins)
         End Sub
 
         ''' <summary>
@@ -2761,6 +3041,748 @@ Namespace GSM.Manager.Core
         Public Function GetCurrentSessionIdentity(instanceId As String) As String
             Return ResolveSessionIdentity(instanceId)
         End Function
+
+        ' ==========================================================
+        '  EventStream Slice 3 — stream-sync entry points
+        '
+        '  EventSyncService owns loop lifecycle and cursor paging;
+        '  the APPLY lives here because InstanceManager owns every
+        '  store a player event projects into (_activePlayers,
+        '  PlayerSessions, PlayerActivity, resolver, utility bus,
+        '  notification emitter). Service-located both ways to
+        '  avoid constructor churn (established pattern).
+        ' ==========================================================
+
+        Private _eventSyncRef As EventSyncService
+
+        Private Function EventSync() As EventSyncService
+            If _eventSyncRef Is Nothing Then
+                Try
+                    _eventSyncRef = ManagerProgram.Services.GetService(Of EventSyncService)()
+                Catch
+                End Try
+            End If
+            Return _eventSyncRef
+        End Function
+
+        ''' <summary>
+        ''' True when the stream sync owns join/leave ingestion for
+        ''' this instance — the legacy parser dispatch must not also
+        ''' ingest (see EventSyncService.SuppressesLegacyIngestion
+        ''' for why Pending suppresses too).
+        ''' </summary>
+        Private Function StreamOwnsPlayerIngestion(instanceId As String) As Boolean
+            Dim sync = EventSync()
+            Return sync IsNot Nothing AndAlso sync.SuppressesLegacyIngestion(instanceId)
+        End Function
+
+        ''' <summary>Node client lookup for EventSyncService (the
+        ''' factory plumbing is private to this class).</summary>
+        Public Function GetNodeClientForInstance(instanceId As String) As INodeClient
+            Return GetClientForInstance(instanceId)
+        End Function
+
+        ''' <summary>
+        ''' Running instances currently serving (gameId,
+        ''' sessionScope) — the manager:identity push maps a
+        ''' scope-keyed contribution onto the instance(s) serving
+        ''' that scope (plan: Identity enrichment §, implementer
+        ''' note 2). Empty sessionScope matches every running
+        ''' instance of the game.
+        ''' </summary>
+        Public Function FindInstancesForIdentityScope(gameId As String,
+                                                      sessionScope As String) As List(Of String)
+            Dim result As New List(Of String)
+            If String.IsNullOrEmpty(gameId) Then Return result
+            Try
+                For Each id In FetchAllInstanceIds()
+                    Try
+                        Dim live = GetLiveState(id)
+                        If live Is Nothing OrElse
+                           live.CurrentState <> GSM.Plugin.InstanceState.Running Then Continue For
+                        If Not String.Equals(GetGameIdForInstance(id), gameId,
+                                             StringComparison.OrdinalIgnoreCase) Then Continue For
+                        If String.IsNullOrEmpty(sessionScope) Then
+                            result.Add(id)
+                        Else
+                            ' GetCurrentSessionIdentity returns the FULL
+                            ' identity "{gameId}:{scope}" while identity
+                            ' contributions carry the game-STRIPPED scope
+                            ' (the resolver's (GameId, SessionScope)
+                            ' keying — see SplitSessionIdentity). Compare
+                            ' the scope part, or the full string for
+                            ' fallback identities with no colon.
+                            Dim fullIdentity = GetCurrentSessionIdentity(id)
+                            Dim scopePart = fullIdentity
+                            If Not String.IsNullOrEmpty(fullIdentity) Then
+                                Dim ci = fullIdentity.IndexOf(":"c)
+                                If ci >= 0 Then scopePart = fullIdentity.Substring(ci + 1)
+                            End If
+                            If String.Equals(scopePart, sessionScope, StringComparison.Ordinal) Then
+                                result.Add(id)
+                            End If
+                        End If
+                    Catch
+                        ' Per-instance lookup failure — skip it.
+                    End Try
+                Next
+            Catch ex As Exception
+                _logger.LogDebug(ex,
+                    "FindInstancesForIdentityScope failed for {Game}/{Scope}",
+                    gameId, sessionScope)
+            End Try
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Merge-add the node's current roster names into
+        ''' _activePlayers. Called by the sync loop AFTER catch-up:
+        ''' pre-cursor sessions (players who joined before this
+        ''' Manager run, whose join events sit below the cursor)
+        ''' must be represented so the stop-flush synthetic leaves
+        ''' and the nameless-leave inference keep working. Add-only
+        ''' — removal is the stream's job.
+        ''' </summary>
+        Public Sub SeedActivePlayersBucket(instanceId As String,
+                                           players As IReadOnlyList(Of PlayerSession))
+            If String.IsNullOrEmpty(instanceId) OrElse players Is Nothing Then Return
+            Dim bucket = _activePlayers.GetOrAdd(instanceId,
+                Function(id) New HashSet(Of String)(StringComparer.OrdinalIgnoreCase))
+            For Each sess In players
+                If sess Is Nothing Then Continue For
+                Dim name = If(Not String.IsNullOrEmpty(sess.PlatformPersona),
+                              sess.PlatformPersona, sess.DisplayName)
+                If String.IsNullOrEmpty(name) Then Continue For
+                SyncLock bucket
+                    bucket.Add(name)
+                End SyncLock
+            Next
+        End Sub
+
+        ''' <summary>One applied player event's post-commit side
+        ''' effects, collected during the DB pass.</summary>
+        Private Class StreamAppliedPlayerEvent
+            Public IsJoin As Boolean
+            Public Name As String
+            Public CharacterId As String
+            Public PlatformUserId As String
+            Public DisplayName As String
+            Public Platform As String
+            Public SessionIdentity As String
+            Public UtcAt As DateTime
+        End Class
+
+        Private Shared Function StreamField(fields As Dictionary(Of String, String),
+                                            key As String) As String
+            If fields Is Nothing Then Return Nothing
+            Dim value As String = Nothing
+            If fields.TryGetValue(key, value) AndAlso Not String.IsNullOrEmpty(value) Then
+                Return value
+            End If
+            Return Nothing
+        End Function
+
+        ''' <summary>PlayerName marker for lifecycle rows in
+        ''' PlayerActivity (the column is NOT NULL and player-
+        ''' pattern filters run LIKE over it — a fixed marker keeps
+        ''' lifecycle rows out of player searches). Parenthesized so
+        ''' it can never collide with a real login name.</summary>
+        Friend Const ServerActivityMarker As String = "(server)"
+
+        ''' <summary>
+        ''' Maps a stream lifecycle kind to its PlayerActivity
+        ''' EventKind string (lowercase, ≤20 chars per the column
+        ''' contract). Nothing for non-lifecycle kinds.
+        ''' InstanceStopRequested is deliberately absent — it is
+        ''' intent, not a state transition, and the matching
+        ''' ProcessExited row already lands.
+        ''' </summary>
+        Friend Shared Function LifecycleActivityKind(kind As ParsedEventKind) As String
+            Select Case kind
+                Case ParsedEventKind.ProcessStarted : Return "start"
+                Case ParsedEventKind.ProcessExited : Return "stop"
+                Case ParsedEventKind.ProcessExitedUnexpectedly : Return "crash"
+                Case ParsedEventKind.CrashRestartScheduled : Return "restart"
+                Case ParsedEventKind.CrashLoopHalted : Return "halt"
+                Case ParsedEventKind.InstanceAdopted : Return "adopt"
+                Case Else : Return Nothing
+            End Select
+        End Function
+
+        ''' <summary>
+        ''' Human-readable detail for a lifecycle History row,
+        ''' built from the event's fields ("exit 3", "restart 2/5
+        ''' in 4000ms", the halt reason). Stored in the row's
+        ''' DisplayName column (nullable, max 100) and rendered in
+        ''' the timeline's message column.
+        ''' </summary>
+        Private Shared Function LifecycleActivityDetail(ev As EventRecord) As String
+            Dim parts As New List(Of String)
+            Dim exitCode = StreamField(ev.Fields, "ExitCode")
+            Dim crashCount = StreamField(ev.Fields, "CrashCount")
+            Dim maxCrash = StreamField(ev.Fields, "MaxCrashCount")
+            Dim delayMs = StreamField(ev.Fields, "DelayMs")
+            Dim reason = StreamField(ev.Fields, "Reason")
+            Dim pidField = StreamField(ev.Fields, "Pid")
+
+            If ev.Kind = ParsedEventKind.CrashRestartScheduled AndAlso
+               Not String.IsNullOrEmpty(crashCount) Then
+                Dim ladder = crashCount
+                If Not String.IsNullOrEmpty(maxCrash) Then ladder &= "/" & maxCrash
+                Dim restartTxt = "restart " & ladder
+                If Not String.IsNullOrEmpty(delayMs) Then restartTxt &= " in " & delayMs & "ms"
+                parts.Add(restartTxt)
+            End If
+            If Not String.IsNullOrEmpty(exitCode) Then parts.Add("exit " & exitCode)
+            If Not String.IsNullOrEmpty(pidField) Then parts.Add("pid " & pidField)
+            If Not String.IsNullOrEmpty(reason) Then parts.Add(reason)
+
+            If parts.Count = 0 Then Return Nothing
+            Dim detail = String.Join(" · ", parts)
+            If detail.Length > 100 Then detail = detail.Substring(0, 100)
+            Return detail
+        End Function
+
+        ''' <summary>
+        ''' Applies a batch of synced stream events to the Manager's
+        ''' projections. PlayerJoin/PlayerLeave project fully;
+        ''' lifecycle kinds (start/stop/crash/restart/halt/adopt)
+        ''' project as History-only PlayerActivity rows (no bucket,
+        ''' no resolver, no notification — those stay status-poll-
+        ''' driven per the Slice 3 decision); every other kind is
+        ''' skipped by design (chat rides the /chat mirror,
+        ''' tile/session state rides the parser).
+        '''
+        ''' EXACTLY-ONCE: the cursor row (cursorKey := cursorSeq)
+        ''' is written in the SAME SaveChanges as the projected
+        ''' rows. A crash before commit replays the batch (cursor
+        ''' unchanged); a crash after commit skips it (cursor
+        ''' advanced). Both-or-neither — gate Q6.
+        '''
+        ''' Unlike the legacy HandlePlayer* path, persistence is NOT
+        ''' gated on bucket membership: the stream is replay-deduped
+        ''' node-side and cursor-deduped here, and bucket state
+        ''' can't be trusted to cover pre-cursor sessions. The
+        ''' bucket is maintained as a best-effort mirror instead.
+        '''
+        ''' Identity: event fields first (captured at the moment —
+        ''' this is what kills the legacy leave-time /players race),
+        ''' resolver consult for gaps, leave-time inheritance from
+        ''' the most recent resolved join row as the last resort
+        ''' (same rationale as the legacy path).
+        '''
+        ''' Notifications: liveMode only, and only for events
+        ''' younger than 5 minutes — the backfill guardrail.
+        ''' Utility-plugin events publish for every applied event
+        ''' (programmatic consumers; matches resync-synthesis
+        ''' semantics). Returns the new cursor (= cursorSeq).
+        ''' </summary>
+        Public Async Function ApplyStreamPlayerEventsAsync(instanceId As String,
+                                                           events As IReadOnlyList(Of EventRecord),
+                                                           liveMode As Boolean,
+                                                           cursorKey As String,
+                                                           cursorSeq As Long) As Task(Of Long)
+            Dim sessionIdentity = ResolveSessionIdentity(instanceId)
+            Dim nodeId = GetNodeIdForInstance(instanceId)
+            Dim bucket = _activePlayers.GetOrAdd(instanceId,
+                Function(id) New HashSet(Of String)(StringComparer.OrdinalIgnoreCase))
+            Dim applied As New List(Of StreamAppliedPlayerEvent)
+
+            ' Lazy node-roster consult for the myrealm-regression
+            ' fix below — fetched at most once per apply call.
+            Dim roster As IReadOnlyList(Of PlayerSession) = Nothing
+            Dim rosterFetched As Boolean = False
+
+            Using scope = ManagerProgram.Services.CreateScope()
+                Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+
+                If events IsNot Nothing AndAlso Not String.IsNullOrEmpty(sessionIdentity) Then
+                    For Each ev In events
+                        If ev Is Nothing Then Continue For
+
+                        ' ---- Lifecycle rows (EventStream follow-up:
+                        ' crash/restart/halt/start in the History
+                        ' timeline). Straight PlayerActivity append —
+                        ' no bucket, no resolver, no utility publish,
+                        ' and NEVER a notification (lifecycle
+                        ' notifications stay status-poll-driven per
+                        ' the Slice 3 decision; firing them from the
+                        ' stream too would double-notify, and
+                        ' backfilled lifecycle rows must stay silent).
+                        ' PlayerName is the "(server)" marker so
+                        ' player-pattern filters skip these; the
+                        ' human-readable detail rides DisplayName
+                        ' (existing nullable column — no migration).
+                        Dim lifecycleKind = LifecycleActivityKind(ev.Kind)
+                        If lifecycleKind IsNot Nothing Then
+                            Dim lifecycleAt = ev.UtcAt
+                            If lifecycleAt = DateTime.MinValue Then lifecycleAt = DateTime.UtcNow
+                            db.PlayerActivity.Add(New PlayerActivityEntity With {
+                                .ActivityId = Guid.NewGuid().ToString("N"),
+                                .SessionIdentity = sessionIdentity,
+                                .NodeId = nodeId,
+                                .InstanceId = instanceId,
+                                .TimestampUtc = lifecycleAt,
+                                .PlayerName = ServerActivityMarker,
+                                .EventKind = lifecycleKind,
+                                .CharacterId = Nothing,
+                                .PlatformUserId = Nothing,
+                                .DisplayName = LifecycleActivityDetail(ev)
+                            })
+                            Continue For
+                        End If
+
+                        ' Connect-before-join persona stash (see the
+                        ' _pendingPersonaByPid doc). A PlayerIdentity
+                        ' event carrying persona + pid (Palworld's
+                        ' "connected the server" line) doesn't make a
+                        ' History row, but its persona is the value
+                        ' the subsequent join/leave for the same pid
+                        ' needs for the persona-first name selection
+                        ' below. Stash and move on.
+                        If ev.Kind = ParsedEventKind.PlayerIdentity Then
+                            Dim idPersona = StreamField(ev.Fields, "PlatformPersona")
+                            Dim idPid = StreamField(ev.Fields, "PlatformUserId")
+                            Dim idDisplay = StreamField(ev.Fields, "DisplayName")
+                            Dim idCid = StreamField(ev.Fields, "CharacterId")
+                            Dim idPlatform = StreamField(ev.Fields, "Platform")
+                            If Not String.IsNullOrEmpty(idPersona) AndAlso
+                               Not String.IsNullOrEmpty(idPid) Then
+                                Dim map = _pendingPersonaByPid.GetOrAdd(
+                                    instanceId,
+                                    Function(id) New ConcurrentDictionary(Of String, (Persona As String, Platform As String))(StringComparer.Ordinal))
+                                map(idPid) = (idPersona, idPlatform)
+                            End If
+
+                            ' Nameless-join drain (see _pendingJoinsByCid):
+                            ' an identity event carrying cid + a name
+                            ' completes a stashed Windrose-class join —
+                            ' write the Join row NOW, stamped at the
+                            ' original join time.
+                            If Not String.IsNullOrEmpty(idCid) AndAlso
+                               (Not String.IsNullOrEmpty(idDisplay) OrElse
+                                Not String.IsNullOrEmpty(idPersona)) Then
+                                Dim jmap As ConcurrentDictionary(Of String, (UtcAt As DateTime, Addr As String, Pid As String, Platform As String)) = Nothing
+                                If _pendingJoinsByCid.TryGetValue(instanceId, jmap) Then
+                                    Dim pj As (UtcAt As DateTime, Addr As String, Pid As String, Platform As String) = Nothing
+                                    If jmap.TryRemove(idCid, pj) Then
+                                        Dim jName = If(Not String.IsNullOrEmpty(idPersona), idPersona, idDisplay)
+                                        Dim jPid = If(Not String.IsNullOrEmpty(idPid), idPid, pj.Pid)
+                                        Dim jPlatform = If(Not String.IsNullOrEmpty(idPlatform), idPlatform, pj.Platform)
+
+                                        UpsertPlayerSession(db, sessionIdentity, jName, pj.UtcAt, instanceId)
+
+                                        db.PlayerActivity.Add(New PlayerActivityEntity With {
+                                            .ActivityId = Guid.NewGuid().ToString("N"),
+                                            .SessionIdentity = sessionIdentity,
+                                            .NodeId = nodeId,
+                                            .InstanceId = instanceId,
+                                            .TimestampUtc = pj.UtcAt,
+                                            .PlayerName = jName,
+                                            .EventKind = "join",
+                                            .CharacterId = idCid,
+                                            .PlatformUserId = jPid,
+                                            .DisplayName = idDisplay
+                                        })
+
+                                        SyncLock bucket
+                                            bucket.Add(jName)
+                                        End SyncLock
+
+                                        applied.Add(New StreamAppliedPlayerEvent With {
+                                            .IsJoin = True,
+                                            .Name = jName,
+                                            .CharacterId = idCid,
+                                            .PlatformUserId = jPid,
+                                            .DisplayName = idDisplay,
+                                            .Platform = jPlatform,
+                                            .SessionIdentity = sessionIdentity,
+                                            .UtcAt = pj.UtcAt
+                                        })
+                                    End If
+                                End If
+                            End If
+                            Continue For
+                        End If
+
+                        If ev.Kind <> ParsedEventKind.PlayerJoin AndAlso
+                           ev.Kind <> ParsedEventKind.PlayerLeave Then Continue For
+
+                        Dim isJoin = (ev.Kind = ParsedEventKind.PlayerJoin)
+                        Dim persona = StreamField(ev.Fields, "PlatformPersona")
+                        Dim display = StreamField(ev.Fields, "DisplayName")
+                        Dim cid = StreamField(ev.Fields, "CharacterId")
+                        Dim pid = StreamField(ev.Fields, "PlatformUserId")
+                        Dim platform = StreamField(ev.Fields, "Platform")
+                        Dim addr = StreamField(ev.Fields, "RemoteAddress")
+
+                        ' Persona-less join/leave (Palworld's joined/
+                        ' left lines carry only the character name +
+                        ' pid): claim the stashed connect-line persona
+                        ' for this pid so name selection stays
+                        ' persona-first. Join leaves the entry in
+                        ' place (the leave still needs it); leave
+                        ' consumes it.
+                        Dim personaFromConnectStash As Boolean = False
+                        If String.IsNullOrEmpty(persona) AndAlso
+                           Not String.IsNullOrEmpty(pid) Then
+                            Dim map As ConcurrentDictionary(Of String, (Persona As String, Platform As String)) = Nothing
+                            If _pendingPersonaByPid.TryGetValue(instanceId, map) Then
+                                Dim stashed As (Persona As String, Platform As String) = Nothing
+                                If map.TryGetValue(pid, stashed) Then
+                                    persona = stashed.Persona
+                                    If String.IsNullOrEmpty(platform) Then platform = stashed.Platform
+                                    If Not isJoin Then
+                                        map.TryRemove(pid, stashed)
+                                        personaFromConnectStash = True
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        ' Same bucket-key selection as the legacy
+                        ' paths: persona first, DisplayName fallback.
+                        Dim name = If(Not String.IsNullOrEmpty(persona), persona, display)
+
+                        ' Aborted-connect suppression (2026-08-17,
+                        ' live-observed): a client that CONNECTED but
+                        ' never completed join (auth/version/world-
+                        ' settings failure) still gets a "left the
+                        ' server" line — which wrote a LONE Leave row
+                        ' for a player History never saw join.
+                        ' Signature: this LEAVE's persona came from
+                        ' the connect stash AND the player was never
+                        ' in the joined bucket. Operator rule: "log
+                        ' nothing or both" — nothing is correct, the
+                        ' player never entered the world (the node's
+                        ' fold made the same call: no session). The
+                        ' raw connect/left lines remain in the
+                        ' console log for forensics.
+                        If Not isJoin AndAlso personaFromConnectStash Then
+                            Dim everJoined As Boolean
+                            SyncLock bucket
+                                everJoined = bucket.Contains(name)
+                            End SyncLock
+                            If Not everJoined Then
+                                _logger.LogDebug(
+                                    "Suppressed lone Leave for {Name} on {Id} — connect never completed join",
+                                    name, instanceId)
+                                Continue For
+                            End If
+                        End If
+
+                        If String.IsNullOrEmpty(name) AndAlso Not isJoin Then
+                            ' Nameless leave (LO address-only channel
+                            ' close). Try the parser's addr->name
+                            ' bindings, then the single-tracked-player
+                            ' inference the legacy path uses.
+                            If Not String.IsNullOrEmpty(addr) Then
+                                Dim bindings As IDictionary(Of String, String) = Nothing
+                                If _connectionBindings.TryGetValue(instanceId, bindings) Then
+                                    Dim bound As String = Nothing
+                                    If bindings.TryGetValue(addr, bound) Then name = bound
+                                End If
+                            End If
+                            If String.IsNullOrEmpty(name) Then
+                                SyncLock bucket
+                                    If bucket.Count = 1 Then name = bucket.First()
+                                End SyncLock
+                            End If
+                        End If
+                        ' Nameless-but-cid-keyed events (Windrose-class,
+                        ' 2026-08-15): a JOIN with a cid but no name yet
+                        ' stashes and waits for the identity event to
+                        ' drain it (see _pendingJoinsByCid); a nameless
+                        ' LEAVE for a still-pending cid drops the stash
+                        ' (the session never became attributable).
+                        If String.IsNullOrEmpty(name) AndAlso
+                           Not String.IsNullOrEmpty(cid) Then
+                            If isJoin Then
+                                Dim jmap = _pendingJoinsByCid.GetOrAdd(
+                                    instanceId,
+                                    Function(id) New ConcurrentDictionary(Of String, (UtcAt As DateTime, Addr As String, Pid As String, Platform As String))(StringComparer.Ordinal))
+                                Dim joinAt = ev.UtcAt
+                                If joinAt = DateTime.MinValue Then joinAt = DateTime.UtcNow
+                                jmap(cid) = (joinAt, addr, pid, platform)
+                                Continue For
+                            Else
+                                Dim jmap As ConcurrentDictionary(Of String, (UtcAt As DateTime, Addr As String, Pid As String, Platform As String)) = Nothing
+                                If _pendingJoinsByCid.TryGetValue(instanceId, jmap) Then
+                                    Dim dropped As (UtcAt As DateTime, Addr As String, Pid As String, Platform As String) = Nothing
+                                    jmap.TryRemove(cid, dropped)
+                                End If
+                            End If
+                        End If
+
+                        ' Unattributable event (connection-accept noise,
+                        ' nameless leave with 0/2+ tracked) — skip. The
+                        ' node's fold made the same call.
+                        If String.IsNullOrEmpty(name) Then Continue For
+
+                        ' Resolver consult for identity gaps.
+                        If String.IsNullOrEmpty(display) OrElse
+                           String.IsNullOrEmpty(cid) OrElse
+                           String.IsNullOrEmpty(pid) Then
+                            Try
+                                ' Probe with every key the event carries —
+                                ' persona-only probes miss cid-keyed games
+                                ' (Windrose) entirely (2026-08-15).
+                                Dim probe = New PlayerSession With {
+                                    .PlatformPersona = name,
+                                    .CharacterId = cid,
+                                    .PlatformUserId = pid
+                                }
+                                Dim hit = _identityResolver.EnrichBySessionIdentity(sessionIdentity, probe)
+                                If hit IsNot Nothing Then
+                                    If String.IsNullOrEmpty(display) Then display = hit.DisplayName
+                                    If String.IsNullOrEmpty(cid) Then cid = hit.CharacterId
+                                    If String.IsNullOrEmpty(pid) Then pid = hit.PlatformUserId
+                                    If String.IsNullOrEmpty(platform) Then platform = hit.Platform
+                                End If
+                            Catch
+                            End Try
+                        End If
+
+                        ' Node-roster consult (2026-08-15, myrealm-
+                        ' regression fix). The LEGACY publish path
+                        ' resolved identity via a node /players hit
+                        ' before dispatching utility events — that is
+                        ' how LO joins reached myrealm with the
+                        ' CharacterId from the login line within
+                        ' seconds. The stream path published only the
+                        ' event's own fields; LO's join event carries
+                        ' no cid (it rides a separate PlayerIdentity
+                        ' line), so myrealm's CharacterId gate made it
+                        ' return and the name waited ~2 min for the
+                        ' persistence tick ("the entire reason for
+                        ' that plugin to exist has been turned moot").
+                        ' Restore the roster hit: at most ONE
+                        ' /players fetch per apply call, only when a
+                        ' JOIN still lacks cid or display after the
+                        ' resolver consult. The node fold consumed
+                        ' the login/charid line before it emitted the
+                        ' join, so the roster already knows.
+                        If isJoin AndAlso
+                           (String.IsNullOrEmpty(cid) OrElse String.IsNullOrEmpty(display)) Then
+                            If Not rosterFetched Then
+                                rosterFetched = True
+                                Try
+                                    Dim rosterClient = GetClientForInstance(instanceId)
+                                    If rosterClient IsNot Nothing Then
+                                        Using rcts As New CancellationTokenSource(TimeSpan.FromSeconds(5))
+                                            roster = Await rosterClient.GetPlayersAsync(instanceId, rcts.Token)
+                                        End Using
+                                    End If
+                                Catch rosterEx As Exception
+                                    _logger.LogDebug(rosterEx,
+                                        "Join-time roster consult failed for {Id}", instanceId)
+                                End Try
+                            End If
+                            If roster IsNot Nothing Then
+                                Dim hit As PlayerSession = Nothing
+                                ' Strongest key first: pid, then
+                                ' persona, then display name.
+                                For Each p In roster
+                                    If p Is Nothing Then Continue For
+                                    If Not String.IsNullOrEmpty(pid) AndAlso
+                                       String.Equals(p.PlatformUserId, pid, StringComparison.Ordinal) Then
+                                        hit = p : Exit For
+                                    End If
+                                    If Not String.IsNullOrEmpty(cid) AndAlso
+                                       String.Equals(p.CharacterId, cid, StringComparison.Ordinal) Then
+                                        hit = p : Exit For
+                                    End If
+                                Next
+                                If hit Is Nothing Then
+                                    For Each p In roster
+                                        If p Is Nothing Then Continue For
+                                        If Not String.IsNullOrEmpty(name) AndAlso
+                                           (String.Equals(p.PlatformPersona, name, StringComparison.Ordinal) OrElse
+                                            String.Equals(p.DisplayName, name, StringComparison.Ordinal)) Then
+                                            hit = p : Exit For
+                                        End If
+                                    Next
+                                End If
+                                If hit IsNot Nothing Then
+                                    If String.IsNullOrEmpty(cid) Then cid = hit.CharacterId
+                                    If String.IsNullOrEmpty(display) Then display = hit.DisplayName
+                                    If String.IsNullOrEmpty(pid) Then pid = hit.PlatformUserId
+                                    If String.IsNullOrEmpty(platform) Then platform = hit.Platform
+                                End If
+                            End If
+                        End If
+
+                        ' Leave-time identity inheritance (same
+                        ' rationale + conditions as the legacy path).
+                        If Not isJoin AndAlso String.IsNullOrEmpty(display) Then
+                            Try
+                                Dim inheritName = name
+                                Dim recentJoin = db.PlayerActivity.
+                                    Where(Function(a) a.SessionIdentity = sessionIdentity AndAlso
+                                                      a.PlayerName = inheritName AndAlso
+                                                      a.EventKind = "join" AndAlso
+                                                      a.DisplayName IsNot Nothing AndAlso
+                                                      a.DisplayName <> "").
+                                    OrderByDescending(Function(a) a.TimestampUtc).
+                                    FirstOrDefault()
+                                If recentJoin IsNot Nothing Then
+                                    If String.IsNullOrEmpty(cid) Then cid = recentJoin.CharacterId
+                                    If String.IsNullOrEmpty(pid) Then pid = recentJoin.PlatformUserId
+                                    display = recentJoin.DisplayName
+                                End If
+                            Catch
+                            End Try
+                        End If
+
+                        Dim utcAt = ev.UtcAt
+                        If utcAt = DateTime.MinValue Then utcAt = DateTime.UtcNow
+
+                        ' PlayerSessions UPSERT (aggregate summary).
+                        UpsertPlayerSession(db, sessionIdentity, name, utcAt, instanceId)
+
+                        ' PlayerActivity append — stamped at the TRUE
+                        ' event time with write-time identity.
+                        db.PlayerActivity.Add(New PlayerActivityEntity With {
+                            .ActivityId = Guid.NewGuid().ToString("N"),
+                            .SessionIdentity = sessionIdentity,
+                            .NodeId = nodeId,
+                            .InstanceId = instanceId,
+                            .TimestampUtc = utcAt,
+                            .PlayerName = name,
+                            .EventKind = If(isJoin, "join", "leave"),
+                            .CharacterId = cid,
+                            .PlatformUserId = pid,
+                            .DisplayName = display
+                        })
+
+                        ' Bucket mirror (best-effort — see doc note).
+                        SyncLock bucket
+                            If isJoin Then bucket.Add(name) Else bucket.Remove(name)
+                        End SyncLock
+
+                        applied.Add(New StreamAppliedPlayerEvent With {
+                            .IsJoin = isJoin,
+                            .Name = name,
+                            .CharacterId = cid,
+                            .PlatformUserId = pid,
+                            .DisplayName = display,
+                            .Platform = platform,
+                            .SessionIdentity = sessionIdentity,
+                            .UtcAt = utcAt
+                        })
+                    Next
+                ElseIf events IsNot Nothing AndAlso events.Count > 0 AndAlso
+                       String.IsNullOrEmpty(sessionIdentity) Then
+                    ' Degenerate (gameId unresolvable). Advance the
+                    ' cursor anyway — otherwise the loop wedges on a
+                    ' batch it can never use.
+                    _logger.LogWarning(
+                        "Event sync for {Id}: no session identity — skipping {Count} event(s)",
+                        instanceId, events.Count)
+                End If
+
+                ' Cursor rides the same transaction — this is Q6.
+                If Not String.IsNullOrEmpty(cursorKey) Then
+                    db.SetSetting(cursorKey, cursorSeq.ToString())
+                End If
+                Await db.SaveChangesAsync()
+            End Using
+
+            ' ---- Post-commit side effects ----
+            For Each fx In applied
+                Try
+                    _identityResolver.ObserveBySessionIdentity(
+                        fx.SessionIdentity,
+                        New IdentityObservation With {
+                            .PlatformPersona = fx.Name,
+                            .CharacterId = fx.CharacterId,
+                            .PlatformUserId = fx.PlatformUserId,
+                            .DisplayName = fx.DisplayName,
+                            .Platform = fx.Platform,
+                            .ObservedAtUtc = fx.UtcAt
+                        })
+                Catch
+                End Try
+                Try
+                    Dim utilityHost = ManagerProgram.Services.GetService(Of UtilityPluginHost)()
+                    utilityHost?.PublishPlayerEvent(
+                        instanceId, fx.IsJoin, fx.Name,
+                        fx.CharacterId, fx.PlatformUserId,
+                        fx.Platform, fx.DisplayName,
+                        fx.SessionIdentity, fx.UtcAt)
+                Catch
+                End Try
+                ' Backfill guardrail: live mode AND young events only.
+                If liveMode AndAlso _emitter IsNot Nothing AndAlso
+                   (DateTime.UtcNow - fx.UtcAt) < TimeSpan.FromMinutes(5) Then
+                    Try
+                        If fx.IsJoin Then
+                            _emitter.PlayerJoined(instanceId,
+                                PlayerLabelForNotification(instanceId, fx.Name))
+                        Else
+                            _emitter.PlayerLeft(instanceId,
+                                PlayerLabelForNotification(instanceId, fx.Name))
+                        End If
+                    Catch
+                    End Try
+                End If
+            Next
+
+            Return cursorSeq
+        End Function
+
+        ''' <summary>
+        ''' PlayerSessions upsert that is CHANGE-TRACKER AWARE
+        ''' (2026-08-29 wedge fix). The previous inline upsert
+        ''' queried the DATABASE (FirstOrDefault) for an existing
+        ''' row, which cannot see a row Added earlier in the SAME
+        ''' apply call and not yet saved. A catch-up batch carrying
+        ''' two events for a never-seen player (join + leave, or
+        ''' connect-abort + join) therefore Added the same
+        ''' (SessionIdentity, PlayerName) twice and SaveChanges
+        ''' died on the UNIQUE index — and because the cursor rides
+        ''' that same transaction, nothing advanced: the sync loop
+        ''' ended, the background Ensure restarted it, it re-pulled
+        ''' the identical batch and died again, ~20x a minute, for
+        ''' days (Palworld - stream: cursor pinned at 28 from
+        ''' 08-25 through 08-28, 200 MB/day of stack traces, no
+        ''' join/leave/lifecycle rows while chat — which rides the
+        ''' separate /chat sync — kept flowing). Live SSE delivers
+        ''' one event per apply, so the bug only bit on replay —
+        ''' which is exactly the path that runs after every node
+        ''' or Manager restart.
+        '''
+        ''' Consult the local change tracker FIRST, then the
+        ''' database. Same LastSeen/LastHost update semantics as
+        ''' before.
+        ''' </summary>
+        Private Shared Sub UpsertPlayerSession(db As GsmDbContext,
+                                               sessionIdentity As String,
+                                               playerName As String,
+                                               utcAt As DateTime,
+                                               instanceId As String)
+            Dim row As PlayerSessionEntity = db.PlayerSessions.Local.FirstOrDefault(
+                Function(p) String.Equals(p.SessionIdentity, sessionIdentity, StringComparison.Ordinal) AndAlso
+                            String.Equals(p.PlayerName, playerName, StringComparison.Ordinal))
+            If row Is Nothing Then
+                row = db.PlayerSessions.FirstOrDefault(
+                    Function(p) p.SessionIdentity = sessionIdentity AndAlso
+                                p.PlayerName = playerName)
+            End If
+            If row Is Nothing Then
+                db.PlayerSessions.Add(New PlayerSessionEntity With {
+                    .PlayerSessionId = Guid.NewGuid().ToString("N"),
+                    .SessionIdentity = sessionIdentity,
+                    .PlayerName = playerName,
+                    .FirstSeenUtc = utcAt,
+                    .LastSeenUtc = utcAt,
+                    .LastHostInstanceId = instanceId
+                })
+            ElseIf utcAt > row.LastSeenUtc Then
+                row.LastSeenUtc = utcAt
+                row.LastHostInstanceId = instanceId
+            End If
+        End Sub
 
         ''' <summary>
         ''' Sync entry point invoked from the SSE log-stream
@@ -3935,6 +4957,110 @@ Namespace GSM.Manager.Core
         '  Helpers
         ' ============================================================
 
+        ''' <summary>
+        ''' Pushes the instance's CURRENT boot-flag checkboxes
+        ''' ("Recover state on node restart" / "Auto start with node")
+        ''' to its node without a start/stop cycle. Called from the
+        ''' Edit Instance save path so a checkbox change takes effect
+        ''' at the next node boot immediately. Best-effort by design:
+        ''' node offline or pre-endpoint (404) both just mean the
+        ''' flags apply from the instance's next start, exactly as
+        ''' before this endpoint existed. Returns True when the node
+        ''' acknowledged the update.
+        ''' </summary>
+        Public Async Function PushBootFlagsAsync(instanceId As String) As Task(Of Boolean)
+            Try
+                Dim request As BootFlagsRequest = Nothing
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim instanceEntity = db.Instances.Find(instanceId)
+                    If instanceEntity Is Nothing Then Return False
+                    Dim installEntity = db.Installations.Find(instanceEntity.InstallationId)
+                    If installEntity Is Nothing Then Return False
+                    Dim customFields = MergeConfigLayers(db, installEntity, instanceEntity)
+                    request = New BootFlagsRequest With {
+                        .ResurrectOnNodeBoot = GetBoolField(customFields, "ResurrectOnNodeBoot", False),
+                        .AutoStartOnNodeBoot = GetBoolField(customFields, "AutoStartOnNodeBoot", False),
+                        .BootStartDelaySeconds = GetIntField(customFields, "BootStartDelaySeconds", 0)
+                    }
+                End Using
+
+                Dim client = GetClientForInstance(instanceId)
+                If client Is Nothing Then Return False
+                Dim result = Await client.UpdateBootFlagsAsync(instanceId, request, CancellationToken.None)
+                _logger.LogInformation(
+                    "Pushed boot flags for {Id}: recover={Recover} autostart={Auto} (snapshotUpdated={Snap})",
+                    instanceId, request.ResurrectOnNodeBoot, request.AutoStartOnNodeBoot,
+                    If(result IsNot Nothing, result.SnapshotUpdated, False))
+
+                ' Autostart ticked but the node had NO snapshot to stamp
+                ' (instance stopped, never parked): build the full launch
+                ' payload and PARK it so the very next node boot can
+                ' start the instance — no start/stop cycle required.
+                If request.AutoStartOnNodeBoot AndAlso
+                   result IsNot Nothing AndAlso Not result.SnapshotUpdated Then
+                    Dim parked = Await StartInstanceAsync(instanceId, parkOnly:=True)
+                    _logger.LogInformation(
+                        "Boot-flags push for {Id}: no snapshot on node — park attempt {Outcome}",
+                        instanceId, If(parked, "succeeded", "failed (autostart arms from the next start)"))
+                End If
+                Return True
+            Catch ex As NodeApiException When ex.StatusCode.HasValue AndAlso
+                                              ex.StatusCode.Value = HttpStatusCode.NotFound
+                _logger.LogDebug(
+                    "Boot-flags endpoint not available on node for {Id} — flags apply from the instance's next start",
+                    instanceId)
+                Return False
+            Catch ex As Exception
+                If IsConnectionFailure(ex) Then
+                    NoteNodeNetworkFailure(instanceId, ex)
+                Else
+                    _logger.LogWarning(ex, "Failed to push boot flags for {Id}", instanceId)
+                End If
+                Return False
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Asks the instance's node to forget it (snapshot + boot
+        ''' flap-guard rows) as part of Manager-side deletion, so a
+        ''' parked "Auto start with node" row can't keep starting a
+        ''' deleted instance at every node boot. Returns the node's
+        ''' response (Refused=True means the node still sees it
+        ''' running — stop first), a synthetic Removed=True for
+        ''' pre-endpoint nodes (nothing to clean there), or Nothing
+        ''' when the node is unreachable — the caller decides whether
+        ''' to proceed with the local delete.
+        ''' </summary>
+        Public Async Function ForgetInstanceOnNodeAsync(instanceId As String) As Task(Of ForgetInstanceResponse)
+            Try
+                Dim client = GetClientForInstance(instanceId)
+                If client Is Nothing Then
+                    ' No node record — nothing that could auto-start it.
+                    Return New ForgetInstanceResponse With {
+                        .Removed = True, .Refused = False,
+                        .Message = "no node association"
+                    }
+                End If
+                Return Await client.ForgetInstanceAsync(instanceId, CancellationToken.None)
+            Catch ex As NodeApiException When ex.StatusCode.HasValue AndAlso
+                                              ex.StatusCode.Value = HttpStatusCode.NotFound
+                ' Pre-endpoint node: it has no autostart feature, so it
+                ' holds nothing that needs cleaning.
+                Return New ForgetInstanceResponse With {
+                    .Removed = True, .Refused = False,
+                    .Message = "older node — nothing to clean"
+                }
+            Catch ex As Exception
+                If IsConnectionFailure(ex) Then
+                    NoteNodeNetworkFailure(instanceId, ex)
+                Else
+                    _logger.LogWarning(ex, "Failed to forget instance {Id} on node", instanceId)
+                End If
+                Return Nothing
+            End Try
+        End Function
+
         Private Function GetClientForInstance(instanceId As String) As INodeClient
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
@@ -4156,7 +5282,7 @@ Namespace GSM.Manager.Core
         ''' the InstanceConfig/InstallationConfig JSON:
         '''   MaxCrashCount, CrashWindowMinutes,
         '''   CrashCountResetAfterSeconds, MinRestartDelayMs,
-        '''   GracefulTimeoutMs
+        '''   GracefulTimeoutMs, BootStartDelaySeconds
         ''' </summary>
         Private Shared Function GetIntField(fields As Dictionary(Of String, String),
                                             key As String,
@@ -4168,6 +5294,32 @@ Namespace GSM.Manager.Core
             Dim parsed As Integer
             If Integer.TryParse(raw.Trim(), parsed) AndAlso parsed > 0 Then Return parsed
             Return defaultValue
+        End Function
+
+        ''' <summary>
+        ''' Boolean custom-field reader (GetIntField's sibling, added
+        ''' for the node-boot resurrection opt-in). Truthy values:
+        ''' "true"/"1"/"yes"/"on" (case-insensitive, trimmed);
+        ''' anything else — including unset, blank, or garbage —
+        ''' returns the default. The custom-field vehicle follows
+        ''' the GracefulTimeoutMs precedent: per-instance opt-in
+        ''' with no EF migration and no new UI surface.
+        ''' </summary>
+        Private Shared Function GetBoolField(fields As Dictionary(Of String, String),
+                                             key As String,
+                                             defaultValue As Boolean) As Boolean
+            If fields Is Nothing Then Return defaultValue
+            Dim raw As String = Nothing
+            If Not fields.TryGetValue(key, raw) Then Return defaultValue
+            If String.IsNullOrWhiteSpace(raw) Then Return defaultValue
+            Select Case raw.Trim().ToLowerInvariant()
+                Case "true", "1", "yes", "on"
+                    Return True
+                Case "false", "0", "no", "off"
+                    Return False
+                Case Else
+                    Return defaultValue
+            End Select
         End Function
 
         ''' <summary>
@@ -4559,6 +5711,25 @@ Namespace GSM.Manager.Core
         End Function
 
         ''' <summary>
+        ''' HTTP rejections that apply to the whole node rather than one
+        ''' instance: 429 (AuthFailureTracker / RequestRateTracker lockout),
+        ''' 401 (stale token) and 403. Deduped per node like a connection
+        ''' failure so a lockout doesn't spam a stack trace per poll.
+        ''' </summary>
+        Private Shared Function IsNodeWideRejection(ex As Exception) As Boolean
+            Dim api = TryCast(ex, NodeApiException)
+            If api Is Nothing OrElse Not api.StatusCode.HasValue Then Return False
+            Select Case api.StatusCode.Value
+                Case HttpStatusCode.TooManyRequests,
+                     HttpStatusCode.Unauthorized,
+                     HttpStatusCode.Forbidden
+                    Return True
+                Case Else
+                    Return False
+            End Select
+        End Function
+
+        ''' <summary>
         ''' Called from RefreshInstanceStateAsync's success path.
         ''' If a failure state was previously recorded for this
         ''' node, emit a "back online" line summarising the
@@ -4629,11 +5800,11 @@ Namespace GSM.Manager.Core
             If shouldLog Then
                 If isFirst Then
                     _logger.LogWarning(
-                        "Node {NodeId} unreachable while polling instance {Id}: {Err} (further failures from this node will be suppressed for up to {Window} minute(s))",
+                        "Node {NodeId} unreachable or rejecting requests while polling instance {Id}: {Err} (further failures from this node will be suppressed for up to {Window} minute(s))",
                         nodeId, instanceId, ex.Message, FailureHeartbeatMinutes)
                 Else
                     _logger.LogWarning(
-                        "Node {NodeId} still unreachable: {Err} (suppressed {Count} similar warning(s) over the last ~{Window} minute(s))",
+                        "Node {NodeId} still unreachable/rejecting: {Err} (suppressed {Count} similar warning(s) over the last ~{Window} minute(s))",
                         nodeId, ex.Message, suppressedAtLog, FailureHeartbeatMinutes)
                 End If
                 ' Full stack only at Debug/verbose — keeps the Warning-level

@@ -340,22 +340,6 @@ Namespace GSM.Manager.UI
             Dim values = _schemaResult.ValueExtractor.Invoke()
             If values Is Nothing Then values = New Dictionary(Of String, String)
 
-            ' Plugin builds the new file text from form values +
-            ' the cached existing text. Throwing here is a plugin-
-            ' validated rejection \u2014 surface the message and don't
-            ' upload.
-            Dim newText As String
-            Try
-                newText = provider.WriteValuesToFile(_editor.Key, values, _lastDownloadedText)
-            Catch ex As Exception
-                SetStatus($"Validation failed: {ex.Message}", Color.Firebrick)
-                Return
-            End Try
-            If String.IsNullOrEmpty(newText) Then
-                SetStatus("Plugin produced empty file content — not saved.", Color.Firebrick)
-                Return
-            End If
-
             _opInFlight = True
             UpdateButtons()
             SetStatus("Saving...", Color.DarkOrange)
@@ -363,6 +347,47 @@ Namespace GSM.Manager.UI
             Dim token = If(_disposeCts IsNot Nothing, _disposeCts.Token, CancellationToken.None)
 
             Try
+                ' Fresh-base re-read (2026-08-29): two editor tabs can
+                ' share ONE file (Palworld's Server Settings and World
+                ' Settings both splice PalWorldSettings.ini). Each tab
+                ' caches the text it loaded, so saving tab A and then
+                ' tab B would rebuild B's file from B's STALE cache and
+                ' silently revert A's keys. Re-download right before
+                ' the splice so the base always reflects the node's
+                ' current file; a 404 (file gone/never existed) falls
+                ' back to the cached text, which is the old behaviour.
+                Dim baseText As String = _lastDownloadedText
+                Try
+                    baseText = Await DownloadAsTextAsync(resolved, token)
+                Catch ex As OperationCanceledException
+                    Throw
+                Catch ex As NodeApiException
+                    If Not IsNotFound(ex) Then Throw
+                    baseText = ""
+                End Try
+                If token.IsCancellationRequested OrElse Me.IsDisposed Then Return
+                _lastDownloadedText = baseText
+
+                ' Plugin builds the new file text from form values +
+                ' the current file text. Throwing here is a plugin-
+                ' validated rejection \u2014 surface the message and don't
+                ' upload.
+                Dim newText As String = Nothing
+                Dim validationError As String = Nothing
+                Try
+                    newText = provider.WriteValuesToFile(_editor.Key, values, baseText)
+                Catch ex As Exception
+                    validationError = ex.Message
+                End Try
+                If validationError IsNot Nothing Then
+                    SetStatus($"Validation failed: {validationError}", Color.Firebrick)
+                    Return
+                End If
+                If String.IsNullOrEmpty(newText) Then
+                    SetStatus("Plugin produced empty file content — not saved.", Color.Firebrick)
+                    Return
+                End If
+
                 Await UploadTextAsync(resolved, newText, token)
                 If token.IsCancellationRequested OrElse Me.IsDisposed Then Return
 

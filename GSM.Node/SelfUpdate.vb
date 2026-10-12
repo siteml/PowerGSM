@@ -155,6 +155,10 @@ Namespace GSM.Node
                 Return StageOpResult.Make(400, New With {.error = "sha256 is required"})
             End If
 
+            If IsCtrlCSenderTarget(request.TargetName) AndAlso Not OperatingSystem.IsWindows() Then
+                Return StageOpResult.Make(400, New With {.error = "ctrlcsender is a Windows-only component; this node is not Windows"})
+            End If
+
             Dim paths = ResolveTarget(request.TargetName, request.Version)
             If paths Is Nothing Then
                 Return StageOpResult.Make(400, New With {.error = "unknown target"})
@@ -385,6 +389,8 @@ Namespace GSM.Node
         '''                (RequiresExit = True — the endpoint then stops the host)
         '''   nodesetup -> in-process swap of the idle NodeSetup binary; the node
         '''                keeps running (no survivor, no exit)
+        '''   ctrlcsender -> same in-process swap (Windows only; the helper is
+        '''                spawned per graceful stop, so it is idle between stops)
         '''   shim      -> no-op: commit already installed the new version folder
         ''' Refuses (Accepted = False) when nothing is staged for a swap target.
         ''' </summary>
@@ -395,6 +401,11 @@ Namespace GSM.Node
                     Return RequestUpdateExit(ResolveTarget("node", Nothing))
                 Case "nodesetup"
                     Return ApplyInPlaceSwap(ResolveTarget("nodesetup", Nothing))
+                Case "ctrlcsender"
+                    If Not OperatingSystem.IsWindows() Then
+                        Return ApplyResult.Fail("ctrlcsender is a Windows-only component")
+                    End If
+                    Return ApplyInPlaceSwap(ResolveTarget("ctrlcsender", Nothing))
                 Case "shim"
                     ' The versioned shim binary is installed at commit time; there
                     ' is nothing to swap and the node does not bounce. New spawns
@@ -477,6 +488,35 @@ Namespace GSM.Node
         End Function
 
         ''' <summary>
+        ''' Requests a plain restart (no staged binary) — used by the TLS
+        ''' enable flow (0.7.0), which needs Kestrel to come back up with a
+        ''' new listener config. Reuses the update-exit machinery verbatim:
+        ''' under systemd the non-zero exit lets Restart=on-failure relaunch
+        ''' us (ExecStartPre's swap step is a no-op with no .new staged);
+        ''' everywhere else the NodeSetup relauncher explicitly handles the
+        ''' nothing-staged case by relaunching the existing binary.
+        ''' Returns False when no restart vehicle is available (NodeSetup
+        ''' missing on a non-systemd box) — callers must then NOT stop the
+        ''' host, or the node would stay down.
+        ''' </summary>
+        Public Function RequestRestart() As Boolean
+            Dim underSystemd As Boolean = (Not OperatingSystem.IsWindows()) AndAlso IsUnderSystemd()
+            If underSystemd Then
+                _exitNonZeroForSystemd = True
+                _updateExitRequested = True
+                _logger.LogInformation("Restart requested: deferring relaunch to systemd (Restart=on-failure).")
+                Return True
+            End If
+            If Not LaunchNodeSetupRelauncher() Then
+                _logger.LogError("Restart requested but no relauncher available; refusing to stop the host.")
+                Return False
+            End If
+            _updateExitRequested = True
+            _logger.LogInformation("Restart requested: NodeSetup relauncher launched; node will exit clean and be relaunched.")
+            Return True
+        End Function
+
+        ''' <summary>
         ''' Schedules a graceful host stop shortly after the current HTTP
         ''' response has had a chance to flush, so the Manager gets its 202
         ''' before the node tears down. The stop fires ApplicationStopping,
@@ -539,6 +579,18 @@ Namespace GSM.Node
                         .LivePath = live,
                         .NewPath = live & NewSuffix,
                         .OldPath = live & OldSuffix}
+                Case "ctrlcsender"
+                    ' Windows-only helper beside the node (ProcessManager spawns
+                    ' it per graceful stop). Same idle in-place swap as NodeSetup;
+                    ' Begin/Apply reject it on non-Windows before getting here.
+                    If Not OperatingSystem.IsWindows() Then Return Nothing
+                    Dim live = NodeExePath("GSM.CtrlCSender")
+                    Return New TargetPaths With {
+                        .TargetName = "ctrlcsender",
+                        .Shape = TargetShape.SwapInPlace,
+                        .LivePath = live,
+                        .NewPath = live & NewSuffix,
+                        .OldPath = live & OldSuffix}
                 Case "shim"
                     Dim install As String = ShimInstallPath(version)
                     ' install is Nothing when the version is missing/unsafe; Begin
@@ -554,6 +606,11 @@ Namespace GSM.Node
                 Case Else
                     Return Nothing
             End Select
+        End Function
+
+        Private Shared Function IsCtrlCSenderTarget(targetName As String) As Boolean
+            Return Not String.IsNullOrWhiteSpace(targetName) AndAlso
+                   String.Equals(targetName.Trim(), "ctrlcsender", StringComparison.OrdinalIgnoreCase)
         End Function
 
         ''' <summary>Path to a sibling exe in the node's base dir (OS-suffixed).</summary>
@@ -663,6 +720,10 @@ Namespace GSM.Node
 
         ''' <summary>Adds +x (user/group/other) to a staged binary on Linux.</summary>
         Private Shared Sub EnsureExecutable(path As String)
+            ' CA1416: the analyzer only recognises OperatingSystem.*
+            ' guards, so gate in-body even though callers are
+            ' Linux-only paths — Get/SetUnixFileMode throw on Windows.
+            If OperatingSystem.IsWindows() Then Return
             Try
                 Dim mode = File.GetUnixFileMode(path)
                 Dim newMode = mode Or UnixFileMode.UserExecute Or
@@ -733,8 +794,18 @@ Namespace GSM.Node
 
             Dim pid = Environment.ProcessId
 
+            ' A user-mode node launched from a console (double-click / cmd)
+            ' should come back WITH a console: the survivor's direct launch
+            ' is windowless by default (right for the service / bare cases),
+            ' which left a hand-run node headless after a TLS-enable restart
+            ' with no way to stop it but Task Manager (2026-10-10).
+            Dim consoleFlag As String = ""
+            If OperatingSystem.IsWindows() AndAlso GetConsoleWindow() <> IntPtr.Zero Then
+                consoleFlag = " --console"
+            End If
+
             If OperatingSystem.IsWindows() Then
-                If LaunchDetachedWindows(setupPath, "--apply-update --wait-pid " & pid.ToString()) Then
+                If LaunchDetachedWindows(setupPath, "--apply-update --wait-pid " & pid.ToString() & consoleFlag) Then
                     Return True
                 End If
                 _logger.LogWarning("Native detached launch failed; falling back to Process.Start.")
@@ -749,6 +820,7 @@ Namespace GSM.Node
                 psi.ArgumentList.Add("--apply-update")
                 psi.ArgumentList.Add("--wait-pid")
                 psi.ArgumentList.Add(pid.ToString())
+                If consoleFlag.Length > 0 Then psi.ArgumentList.Add("--console")
                 Dim proc = Process.Start(psi)
                 Return proc IsNot Nothing
             Catch ex As Exception
@@ -812,6 +884,12 @@ Namespace GSM.Node
         Private Shared Function CloseHandle(hObject As IntPtr) As Boolean
         End Function
 
+        ''' <summary>Non-zero when this process is attached to a console
+        ''' window (hand-launched); zero for a service or windowless launch.</summary>
+        <DllImport("kernel32.dll")>
+        Private Shared Function GetConsoleWindow() As IntPtr
+        End Function
+
         <StructLayout(LayoutKind.Sequential, CharSet:=CharSet.Unicode)>
         Private Structure STARTUPINFOW
             Public cb As Integer
@@ -861,7 +939,7 @@ Namespace GSM.Node
 
         Private Enum TargetShape
             SwapWithSurvivor = 0   ' node: stage .new, survivor swaps + relaunches on exit
-            SwapInPlace = 1        ' nodesetup: stage .new, swap in-process (idle), no exit
+            SwapInPlace = 1        ' nodesetup / ctrlcsender: stage .new, swap in-process (idle), no exit
             VersionedInstall = 2   ' shim: install directly into GSM.Shim\<version>\, no swap
         End Enum
 

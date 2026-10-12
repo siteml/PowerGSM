@@ -1,4 +1,4 @@
-Imports System
+﻿Imports System
 Imports System.Collections.Generic
 Imports System.Globalization
 Imports System.IO
@@ -10,6 +10,7 @@ Imports Microsoft.AspNetCore.Http
 Imports Microsoft.Extensions.Configuration
 Imports Microsoft.Extensions.DependencyInjection
 Imports Microsoft.Extensions.Hosting
+Imports Microsoft.Extensions.Hosting.Systemd
 Imports Microsoft.Extensions.Logging
 Imports Microsoft.Data.Sqlite
 Imports GSM.Node.Api
@@ -149,6 +150,42 @@ Namespace GSM.Node
 
         Sub Main(args As String())
 
+            ' Fast path (Phase 8-2 follow-up 5b): --version prints the same
+            ' identity axes /api/version reports and exits 0 BEFORE any host
+            ' or service construction — on-box diagnostics ("what is this
+            ' node actually running" over SSH) that work even when the node
+            ' can't start, and the Linux-native answer to ELF binaries
+            ' having no VERSIONINFO equivalent. The constants come from the
+            ' MSBuild-generated build marker (follow-up 5a), so the printed
+            ' identity and the byte-scannable PGSMBUILD marker never drift.
+            If args IsNot Nothing AndAlso Array.IndexOf(args, "--version") >= 0 Then
+                If OperatingSystem.IsWindows() Then
+                    Try
+                        AttachConsole(ATTACH_PARENT_PROCESS)
+                    Catch
+                    End Try
+                End If
+                Console.WriteLine($"{PowerGSM.BuildInfo.PgsmBuildMarker.Component} {PowerGSM.BuildInfo.PgsmBuildMarker.BuildVersion} ({PowerGSM.BuildInfo.PgsmBuildMarker.Rid})")
+                Console.WriteLine($"ProtocolVersion: {NodeApiContract.ProtocolVersion}")
+                Console.WriteLine($"ContractsVersion: {NodeApiContract.ContractsVersion}")
+                Environment.Exit(0)
+            End If
+
+            ' Diagnostic mode: prove the event-stream source-authority
+            ' dedupe in-process (EventStream Slice 2, gate Q4b) — a
+            ' second source emitting an owned kind is suppressed and
+            ' counted, lifecycle kinds can't be claimed. Throwaway
+            ' SQLite db in TEMP; no game, service, or Manager needed.
+            If args IsNot Nothing AndAlso Array.IndexOf(args, "--eventstream-selftest") >= 0 Then
+                If OperatingSystem.IsWindows() Then
+                    Try
+                        AttachConsole(ATTACH_PARENT_PROCESS)
+                    Catch
+                    End Try
+                End If
+                Environment.Exit(EventStreamSelfTest.Run())
+            End If
+
             ' Diagnostic mode: drive a real ShimSession against the deployed
             ' shim and exit, without spinning up the web host. See ShimSelfTest.
             If args IsNot Nothing AndAlso Array.IndexOf(args, "--shim-self-test") >= 0 Then
@@ -174,6 +211,38 @@ Namespace GSM.Node
                 End If
                 Dim rc As Integer = ShimReconnectTest.RunAsync().GetAwaiter().GetResult()
                 Environment.Exit(rc)
+            End If
+
+            ' Diagnostic mode: prove the Node-side ConPTY chain against the
+            ' deployed shim (protocol-v2 pseudoconsole spawn -> raw VT frames
+            ' -> VtConsoleFilter clean lines -> detach/adopt replay stays
+            ' clean -> stop/Exited). See ShimConPtyTest. Windows-only
+            ' (skip-passes elsewhere).
+            If args IsNot Nothing AndAlso Array.IndexOf(args, "--shim-conpty-test") >= 0 Then
+                If OperatingSystem.IsWindows() Then
+                    Try
+                        AttachConsole(ATTACH_PARENT_PROCESS)
+                    Catch
+                    End Try
+                End If
+                Dim rc As Integer = ShimConPtyTest.RunAsync().GetAwaiter().GetResult()
+                Environment.Exit(rc)
+            End If
+
+            ' Diagnostic mode: inspect/clear the event purge-watermark gate
+            ' directly in node.db (sqlite3.exe isn't stock Windows). See
+            ' WatermarkDiag — added after a future-cutoff purge test left
+            ' watermarks silently dropping every new join/leave/chat append.
+            If args IsNot Nothing AndAlso
+               (Array.IndexOf(args, "--dump-watermarks") >= 0 OrElse
+                Array.IndexOf(args, "--clear-watermarks") >= 0) Then
+                If OperatingSystem.IsWindows() Then
+                    Try
+                        AttachConsole(ATTACH_PARENT_PROCESS)
+                    Catch
+                    End Try
+                End If
+                Environment.Exit(WatermarkDiag.Run(args))
             End If
 
             ' Diagnostic mode: stage the live binary as GSM.Node.new through the
@@ -202,11 +271,30 @@ Namespace GSM.Node
                 SetConsoleCtrlHandler(_consoleCtrlHandler, True)
             End If
 
+            ' Kill the framework's default appsettings.json reload watcher
+            ' BEFORE the builder wires up configuration. reloadOnChange is
+            ' implemented as ONE FileSystemWatcher over the entire content
+            ' root with IncludeSubdirectories=True (PhysicalFilesWatcher
+            ' filters events in managed code afterwards). Our content root
+            ' is the node install dir, which BY DESIGN contains servers\ —
+            ' so that watcher probed every file every game server wrote.
+            ' On games with atomic ReplaceFile saves (Palworld), the probe
+            ' handle intermittently landed inside the zero-open-handles
+            ' rename window -> STATUS_ACCESS_DENIED -> "Failed to save" ->
+            ' player kicks roughly every ~34 saves (the "17-minute
+            ' disconnect" incident, July 2026 — ProcMon captures in
+            ' Examining\). Nothing in the node consumes live config
+            ' reloads: NodeConfiguration/SecurityConfiguration are bound
+            ' once into singletons at startup, and TLS settings changes
+            ' apply via node restart. Reload was pure liability.
+            Environment.SetEnvironmentVariable("DOTNET_hostBuilder:reloadConfigOnChange", "false")
+
             Dim builder = WebApplication.CreateBuilder(args)
 
+            ' reloadOnChange MUST stay False — see the comment above.
             builder.Configuration.AddJsonFile("nodesettings.json",
                                               optional:=False,
-                                              reloadOnChange:=True)
+                                              reloadOnChange:=False)
 
             ' ---- File logging ----
             ' WebApplication.CreateBuilder wires up Console (visible
@@ -244,11 +332,34 @@ Namespace GSM.Node
             builder.Host.UseWindowsService()
             builder.Host.UseSystemd()
 
+            ' ---- Phase 8-2 hardening follow-up 1 — self-test-gated readiness ----
+            ' Under systemd the unit is Type=notify (8b-2), so READY=1 is the
+            ' health signal the update rollback machinery keys off. Route it
+            ' through a gate: SystemdLifetime resolves ISystemdNotifier from DI,
+            ' and this registration comes AFTER UseSystemd() so it wins — the
+            ' lifetime's automatic READY on ApplicationStarted is held until the
+            ' startup self-check passes (see StartupSelfTest.vb). Registered
+            ' only when actually under systemd; every other platform keeps its
+            ' existing behaviour (their health gate is the NodeSetup survivor).
+            Dim readinessGate As GatedSystemdNotifier = Nothing
+            If SystemdHelpers.IsSystemdService() Then
+                readinessGate = New GatedSystemdNotifier()
+                builder.Services.AddSingleton(Of ISystemdNotifier)(readinessGate)
+            End If
+
             ' ---- Core services ----
             Dim db As New NodeDatabase(nodeConfig.DataDirectory)
             db.EnsureCreated()
             builder.Services.AddSingleton(db)
+            ' EventStreamStore before EventStore: the store owns the
+            ' canonical events table + seq assignment (EventStream
+            ' Slice 1); EventStore appends parse hits into it and
+            ' ProcessManager appends lifecycle events.
+            builder.Services.AddSingleton(Of EventStreamStore)()
             builder.Services.AddSingleton(Of EventStore)()
+            ' Slice 2: generic REST poller host — synthesizes
+            ' join/leave events from game admin APIs into the stream.
+            builder.Services.AddSingleton(Of StatePollerHost)()
             builder.Services.AddSingleton(Of ProcessManager)()
             builder.Services.AddSingleton(Of RingBufferStore)()
             builder.Services.AddSingleton(Of RconClientManager)()
@@ -260,9 +371,89 @@ Namespace GSM.Node
             builder.Services.AddSingleton(Of AuthFailureTracker)()
             builder.Services.AddSingleton(Of RequestRateTracker)()
 
+            ' ---- TLS certificate service (0.7.0) ----
+            ' Constructed eagerly (with a real console/file logger) because
+            ' the Kestrel callback below needs the certificate synchronously
+            ' when EnableTls is set. The same instance is registered in DI
+            ' for the /api/tls/* endpoints.
+            Dim tlsLoggerFactory = LoggerFactory.Create(
+                Sub(lb)
+                    lb.AddConsole()
+                    lb.AddProvider(fileLogProvider)
+                End Sub)
+            ' The service itself lives in GSM.Contracts (slice 2) so NodeSetup
+            ' can mint the same cert at setup time; it takes plain callbacks
+            ' rather than ILogger (Contracts is dependency-free).
+            Dim tlsLogger = tlsLoggerFactory.CreateLogger("GSM.Node.Tls")
+            Dim tlsService As New TlsCertificateService(
+                nodeConfig.DataDirectory,
+                Sub(msg) tlsLogger.LogInformation("{Message}", msg),
+                Sub(msg, ex) tlsLogger.LogWarning(ex, "{Message}", msg))
+            builder.Services.AddSingleton(tlsService)
+
             ' ---- Kestrel hardening ----
+            ' Certificate is resolved BEFORE the Kestrel callback so a failure
+            ' can be turned into a startup refusal rather than a silent
+            ' plaintext fallback (HTTPS_SinglePort_Plan D2: HTTP is all-or-
+            ' nothing — a node configured HttpMode=Disabled must never come up
+            ' reachable only over plaintext, and must never come up unreachable
+            ' without saying why).
+            Dim tlsCert As System.Security.Cryptography.X509Certificates.X509Certificate2 = Nothing
+            If nodeConfig.EnableTls Then
+                Try
+                    tlsCert = tlsService.GetOrCreateCertificate(nodeConfig.NodeId)
+                Catch ex As Exception
+                    If nodeConfig.HttpMode.Trim().Equals("Disabled", StringComparison.OrdinalIgnoreCase) Then
+                        Throw New InvalidOperationException(
+                            "TLS certificate could not be loaded or generated and HttpMode is Disabled; " &
+                            "refusing to start rather than come up without a usable listener. " &
+                            "Fix or delete <DataDirectory>/tls/node.pfx, or set Node:HttpMode to Open in nodesettings.json. " &
+                            "Cause: " & ex.Message, ex)
+                    End If
+                    Console.Error.WriteLine(
+                        "TLS listener not started (certificate failure): " & ex.Message &
+                        " — serving plain HTTP only (HttpMode=" & nodeConfig.HttpMode & ").")
+                End Try
+            End If
+
+            Dim sniffLogger = tlsLoggerFactory.CreateLogger("GSM.Node.TlsSniff")
+
             builder.WebHost.ConfigureKestrel(Sub(options)
-                                                 options.ListenAnyIP(nodeConfig.ListenPort)
+                                                 If tlsCert IsNot Nothing AndAlso nodeConfig.UsesSinglePort Then
+                                                     ' ---- Single-port mode (HTTPS_SinglePort_Plan slice 1) ----
+                                                     ' ONE listener on ListenPort. TlsSniffConnectionMiddleware
+                                                     ' peeks byte 1: TLS ClientHello → SslStream + HTTP/1.1;
+                                                     ' anything else → plaintext per HttpMode (Disabled = the
+                                                     ' socket is closed before a single byte is parsed).
+                                                     Dim policy = TlsSniffConnectionMiddleware.ParsePolicy(nodeConfig.HttpMode)
+                                                     options.ListenAnyIP(nodeConfig.ListenPort,
+                                                         Sub(listen)
+                                                             listen.Protocols = Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http1
+                                                             listen.Use(Function(nextMiddleware As Microsoft.AspNetCore.Connections.ConnectionDelegate) As Microsoft.AspNetCore.Connections.ConnectionDelegate
+                                                                            Dim mw As New TlsSniffConnectionMiddleware(
+                                                                                nextMiddleware, tlsCert, policy, sniffLogger)
+                                                                            Return AddressOf mw.InvokeAsync
+                                                                        End Function)
+                                                         End Sub)
+                                                 Else
+                                                     ' ---- Legacy two-listener layout (TlsPort explicitly set,
+                                                     ' or TLS off / cert unavailable). Byte-identical to 0.7.0.
+                                                     Select Case nodeConfig.HttpMode.Trim().ToLowerInvariant()
+                                                         Case "disabled"
+                                                             ' No plain-HTTP listener at all. Only valid
+                                                             ' with EnableTls; guarded in EnsureDefaults.
+                                                         Case "loopbackonly"
+                                                             options.ListenLocalhost(nodeConfig.ListenPort)
+                                                         Case Else ' "open"
+                                                             options.ListenAnyIP(nodeConfig.ListenPort)
+                                                     End Select
+
+                                                     If tlsCert IsNot Nothing Then
+                                                         options.ListenAnyIP(nodeConfig.EffectiveTlsPort,
+                                                             Sub(listen) listen.UseHttps(tlsCert))
+                                                     End If
+                                                 End If
+
                                                  options.AddServerHeader = False
                                                  options.Limits.MaxRequestBodySize = secConfig.MaxRequestBodyBytes
                                                  options.Limits.MaxConcurrentConnections = secConfig.MaxConcurrentConnections
@@ -372,6 +563,16 @@ Namespace GSM.Node
                 ' fills the gaps. Same synchronous startup context, and the
                 ' sweep is internally try-guarded per endpoint.
                 pm.SweepAdoptLiveShims()
+
+                ' Node-boot resurrection: restart opt-in instances whose
+                ' snapshot said Running (no stop intent) but whose adopt
+                ' found the process/shim DEAD — the host-reboot case the
+                ' adoption passes above can only discard. Runs as a
+                ' BACKGROUND task (app.Run() below is not delayed): the
+                ' adoption passes collected the eligible rows, this just
+                ' fires the pass. Dedup, the flap guard, and routing
+                ' through the normal start path all live inside.
+                pm.StartBootResurrection()
             Catch ex As Exception
                 Try
                     Dim adoptLogger = app.Services.
@@ -414,10 +615,27 @@ Namespace GSM.Node
             ' bare nodes use the NodeSetup survivor's own health gate instead).
             Try
                 Dim lifetimeForUpdate = app.Services.GetRequiredService(Of IHostApplicationLifetime)()
-                lifetimeForUpdate.ApplicationStarted.Register(AddressOf ScheduleUpdateMarkerClear)
+                If readinessGate Is Nothing Then
+                    lifetimeForUpdate.ApplicationStarted.Register(AddressOf ScheduleUpdateMarkerClear)
+                Else
+                    ' Follow-up 1: under systemd both READY=1 and the marker
+                    ' clear are gated on the startup self-check, so "healthy"
+                    ' now means "self-checked, then up 15 s" — not just
+                    ' "started". A failed check stops the host gracefully
+                    ' (shims detach, games keep running) and exits non-zero,
+                    ' which is a failed start to systemd — exactly what the
+                    ' 8b-2 marker/revert ExecStartPre handles.
+                    Dim gateForCheck = readinessGate
+                    lifetimeForUpdate.ApplicationStarted.Register(
+                        Sub() Task.Run(Function() RunStartupSelfCheckAsync(app, gateForCheck, lifetimeForUpdate)))
+                End If
             Catch
                 ' Non-fatal: a lingering marker only affects the NEXT start after
-                ' an update apply, and the operator can delete it by hand.
+                ' an update apply, and the operator can delete it by hand. If the
+                ' self-check runner itself failed to register, fail OPEN — a
+                ' node bricked by its own watchdog scaffolding would be worse
+                ' than an ungated READY (the pre-follow-up-1 status quo).
+                If readinessGate IsNot Nothing Then readinessGate.OpenGate()
             End Try
 
             ' ---- Phase 8-2 — Node self-update exit code (capture before Run) ----
@@ -449,7 +667,55 @@ Namespace GSM.Node
                 Environment.Exit(SelfUpdateService.UpdateExitCode)
             End If
 
+            ' Follow-up 1: a failed startup self-check exits non-zero so
+            ' systemd (Restart=on-failure + the 8b-2 marker/revert
+            ' ExecStartPre) treats this as the failed start it is. The flag is
+            ' only ever set under systemd; READY was never sent either, so
+            ' Type=notify already counted the start as failed — this exit code
+            ' makes the journal unambiguous about WHY.
+            If _startupSelfTestFailed Then
+                Environment.Exit(StartupSelfTest.ExitCodeSelfTestFailed)
+            End If
+
         End Sub
+
+        ' ---- Phase 8-2 hardening follow-up 1 — startup self-check driver ----
+
+        ' Set when the self-check failed and the host was stopped because of
+        ' it; read after app.Run() to exit non-zero. A module field for the
+        ' same host-disposal reason selfUpdateForExit is captured before Run.
+        Private _startupSelfTestFailed As Boolean
+
+        ''' <summary>
+        ''' Runs the startup self-check (fired off ApplicationStarted, systemd
+        ''' only) and applies policy: pass → open the READY gate + start the
+        ''' 8b-2 marker-clear grace timer; fail → flag + graceful stop. An
+        ''' infrastructure failure of the check scaffolding itself (DI, logger)
+        ''' fails OPEN — the checks decide health, scaffolding errors must not
+        ''' brick startup.
+        ''' </summary>
+        Private Async Function RunStartupSelfCheckAsync(app As WebApplication,
+                                                        gate As GatedSystemdNotifier,
+                                                        lifetime As IHostApplicationLifetime) As Task
+            Dim passed As Boolean
+            Try
+                Dim cfgForCheck = app.Services.GetRequiredService(Of NodeConfiguration)()
+                Dim dbForCheck = app.Services.GetRequiredService(Of NodeDatabase)()
+                Dim checkLogger = app.Services.
+                    GetRequiredService(Of ILoggerFactory)().
+                    CreateLogger("GSM.Node.SelfTest")
+                passed = Await StartupSelfTest.RunAsync(cfgForCheck, dbForCheck, checkLogger).ConfigureAwait(False)
+            Catch
+                passed = True   ' fail open — see summary
+            End Try
+            If passed Then
+                gate.OpenGate()
+                ScheduleUpdateMarkerClear()
+            Else
+                _startupSelfTestFailed = True
+                lifetime.StopApplication()
+            End If
+        End Function
 
         ' ---- Phase 8-2 slice 8b-2 — systemd self-update health marker ----
 
@@ -516,7 +782,7 @@ Namespace GSM.Node
             Dim secCfg = context.RequestServices.GetRequiredService(Of SecurityConfiguration)()
 
             ' 1. Global per-IP rate limit
-            If rateTracker.IsOverLimit(ip) Then
+            If rateTracker.IsOverLimit(ip, context.Request.Path.Value) Then
                 context.Response.StatusCode = 429
                 context.Response.Headers("Retry-After") = "60"
                 Await context.Response.WriteAsJsonAsync(New With {.error = "Rate limit exceeded"})
@@ -576,6 +842,61 @@ Namespace GSM.Node
         Public Property NodeId As String
         Public Property ListenPort As Integer = 8765
         Public Property AuthToken As String
+
+        ' ---- TLS (0.7.0) ----
+
+        ''' <summary>
+        ''' When True, Kestrel additionally serves HTTPS on
+        ''' EffectiveTlsPort using the node's self-signed certificate
+        ''' (see TlsCertificateService). Written by POST /api/tls/enable;
+        ''' the node restarts to pick it up.
+        ''' </summary>
+        Public Property EnableTls As Boolean = False
+
+        ''' <summary>
+        ''' HTTPS port. 0 (default) = SAME port as ListenPort, served by
+        ''' the sniffing listener (HTTPS_SinglePort_Plan). A non-zero
+        ''' value ≠ ListenPort keeps the legacy two-listener layout with
+        ''' a dedicated HTTPS listener on that port. A value equal to
+        ''' ListenPort is normalised to 0 by EnsureDefaults.
+        '''
+        ''' Compatibility: 0.7.0's /api/tls/enable always wrote an explicit
+        ''' port (ListenPort + 1), so nodes onboarded before single-port
+        ''' keep their second port until re-enabled or edited.
+        ''' </summary>
+        Public Property TlsPort As Integer = 0
+
+        ''' <summary>
+        ''' Plain-HTTP listener policy: "Open" (default — listen on all
+        ''' interfaces, exactly the pre-0.7.0 behavior), "LoopbackOnly"
+        ''' (localhost only; recommended hardening once the Manager is on
+        ''' HTTPS), or "Disabled" (no HTTP listener; only honored when
+        ''' EnableTls is set, otherwise coerced back to Open so a config
+        ''' typo can never brick the node's reachability).
+        ''' </summary>
+        Public Property HttpMode As String = "Open"
+
+        ''' <summary>
+        ''' Resolved HTTPS port: TlsPort when set, else ListenPort (shared).
+        ''' This is what /api/version and /api/tls/status advertise; the
+        ''' Manager connects to whatever is advertised, so both layouts
+        ''' work against the same Manager code.
+        ''' </summary>
+        Public ReadOnly Property EffectiveTlsPort As Integer
+            Get
+                Return If(TlsPort > 0, TlsPort, ListenPort)
+            End Get
+        End Property
+
+        ''' <summary>
+        ''' True when HTTPS is served on ListenPort itself via the sniffing
+        ''' listener (TlsPort = 0). False = dedicated HTTPS listener.
+        ''' </summary>
+        Public ReadOnly Property UsesSinglePort As Boolean
+            Get
+                Return EnableTls AndAlso TlsPort <= 0
+            End Get
+        End Property
         Public Property DataDirectory As String = "./data"
         Public Property MaxConcurrentInstalls As Integer = 2
         Public Property LogRetentionDays As Integer = 30
@@ -613,6 +934,16 @@ Namespace GSM.Node
             If String.IsNullOrEmpty(NodeId) Then
                 NodeId = Environment.MachineName
             End If
+            ' A node with no TLS listener must never lose its HTTP listener,
+            ' no matter what the config file says.
+            If String.IsNullOrWhiteSpace(HttpMode) Then HttpMode = "Open"
+            If Not EnableTls AndAlso
+               HttpMode.Trim().Equals("Disabled", StringComparison.OrdinalIgnoreCase) Then
+                HttpMode = "Open"
+            End If
+            ' TlsPort equal to ListenPort means "same port" — normalise to 0
+            ' so UsesSinglePort / the config file have one spelling for it.
+            If TlsPort = ListenPort Then TlsPort = 0
             If String.IsNullOrEmpty(DataDirectory) Then
                 DataDirectory = "./data"
             End If
@@ -692,6 +1023,22 @@ Namespace GSM.Node
                 Return _lastCorruptionBackup
             End Get
         End Property
+
+        ''' <summary>
+        ''' Phase 8-2 hardening follow-up 1 — startup self-test probe. Opens
+        ''' the database and runs a trivial query so "DB openable" is a
+        ''' verified fact, not an assumption. Throws on failure; the caller
+        ''' (StartupSelfTest) decides policy.
+        ''' </summary>
+        Public Sub VerifyReadable()
+            Using conn As New SqliteConnection(_connectionString)
+                conn.Open()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "SELECT 1;"
+                    cmd.ExecuteScalar()
+                End Using
+            End Using
+        End Sub
 
         ''' <summary>
         ''' Creates tables if they do not exist. Self-heals a corrupt node.db:
@@ -819,6 +1166,21 @@ Namespace GSM.Node
 
                         CREATE INDEX IF NOT EXISTS IX_CrashEvents_Instance
                             ON CrashEvents(InstanceId, Timestamp);
+
+                        -- Node-boot resurrection flap guard: one row per
+                        -- instance tracking consecutive boot-resurrection
+                        -- attempts inside a short window. A node/host
+                        -- restart LOOP would otherwise re-resurrect a
+                        -- doomed instance every boot (in-memory crash
+                        -- ladders reset with the process). Rows are
+                        -- cleared when a resurrected instance stays up
+                        -- long enough (see ProcessManager's
+                        -- boot-resurrection pass).
+                        CREATE TABLE IF NOT EXISTS BootResurrectAttempts (
+                            InstanceId TEXT PRIMARY KEY,
+                            LastAttemptUtc TEXT NOT NULL,
+                            AttemptCount INTEGER NOT NULL DEFAULT 0
+                        );
                     "
                     cmd.ExecuteNonQuery()
                 End Using
@@ -873,7 +1235,15 @@ Namespace GSM.Node
                     ("ShimEndpoint", "TEXT"),
                     ("ShimPid", "INTEGER NOT NULL DEFAULT 0"),
                     ("ShimProtocolVersion", "INTEGER NOT NULL DEFAULT 0"),
-                    ("ExecutionMode", "INTEGER NOT NULL DEFAULT 0")
+                    ("ExecutionMode", "INTEGER NOT NULL DEFAULT 0"),
+                    ("PollSourcesJson", "TEXT"),
+                    ("ResurrectOnBoot", "INTEGER NOT NULL DEFAULT 0"),
+                    ("AutoStartOnBoot", "INTEGER NOT NULL DEFAULT 0"),
+                    ("ShimRingSeq", "INTEGER NOT NULL DEFAULT 0"),
+                    ("EnvironmentVarsJson", "TEXT"),
+                    ("CrashCountResetAfterSeconds", "INTEGER NOT NULL DEFAULT 300"),
+                    ("MinRestartDelayMs", "INTEGER NOT NULL DEFAULT 0"),
+                    ("BootStartDelaySeconds", "INTEGER NOT NULL DEFAULT 0")
                 }
 
                 For Each col In columnsToAdd
@@ -948,6 +1318,27 @@ Namespace GSM.Node
         ''' to re-adopt a running game process on the next startup
         ''' — see ProcessManager.AdoptSnapshots.
         ''' </summary>
+        ''' <summary>
+        ''' Ring-cursor persist (v2 additive): records the highest shim ring
+        ''' frame seq this node has consumed for the instance, so the next
+        ''' adopt sends it as Hello.ReplayAfterSeq and the shim replays only
+        ''' the gap. Forward-only (MAX-style guard in the WHERE) — a stale
+        ''' late write can't move the cursor backwards. No-op when the row
+        ''' is gone (instance stopped/forgotten).
+        ''' </summary>
+        Public Sub UpdateInstanceSnapshotRingSeq(instanceId As String, seq As Long)
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "UPDATE InstanceSnapshots
+                                       SET ShimRingSeq = @seq
+                                       WHERE InstanceId = @id AND ShimRingSeq < @seq"
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    cmd.Parameters.AddWithValue("@seq", seq)
+                    cmd.ExecuteNonQuery()
+                End Using
+            End Using
+        End Sub
+
         Public Sub SaveInstanceSnapshot(instanceId As String,
                                         state As String,
                                         pid As Integer,
@@ -966,18 +1357,30 @@ Namespace GSM.Node
                                         Optional shimEndpoint As String = Nothing,
                                         Optional shimPid As Integer = 0,
                                         Optional shimProtocolVersion As Integer = 0,
-                                        Optional executionMode As Integer = 0)
+                                        Optional executionMode As Integer = 0,
+                                        Optional pollSourcesJson As String = Nothing,
+                                        Optional resurrectOnBoot As Boolean = False,
+                                        Optional autoStartOnBoot As Boolean = False,
+                                        Optional shimRingSeq As Long = 0,
+                                        Optional environmentVarsJson As String = Nothing,
+                                        Optional crashCountResetAfterSeconds As Integer = 300,
+                                        Optional minRestartDelayMs As Integer = 0,
+                                        Optional bootStartDelaySeconds As Integer = 0)
             Using conn = OpenConnection()
                 Using cmd = conn.CreateCommand()
                     cmd.CommandText = "INSERT OR REPLACE INTO InstanceSnapshots
                         (InstanceId, State, Pid, StartedAtUtc, CrashPolicyJson, StopIntentPending,
                          ExePath, Arguments, WorkingDirectory, LogFilePathsJson, ParseRulesJson,
                          Strategy, StdoutIsLog, RequiresConsoleIsolation, LogTailerStartDelayMs,
-                         ShimEndpoint, ShimPid, ShimProtocolVersion, ExecutionMode)
+                         ShimEndpoint, ShimPid, ShimProtocolVersion, ExecutionMode, PollSourcesJson,
+                         ResurrectOnBoot, AutoStartOnBoot, ShimRingSeq, EnvironmentVarsJson,
+                         CrashCountResetAfterSeconds, MinRestartDelayMs, BootStartDelaySeconds)
                         VALUES (@id, @state, @pid, @started, @policy, @intent,
                                 @exe, @args, @cwd, @logs, @rules,
                                 @strategy, @stdoutLog, @iso, @delay,
-                                @shimEndpoint, @shimPid, @shimProto, @execMode)"
+                                @shimEndpoint, @shimPid, @shimProto, @execMode, @pollSources,
+                                @resurrect, @autoStart, @ringSeq, @envVars,
+                                @crashReset, @minRestart, @bootDelay)"
                     cmd.Parameters.AddWithValue("@id", instanceId)
                     cmd.Parameters.AddWithValue("@state", state)
                     cmd.Parameters.AddWithValue("@pid", pid)
@@ -997,6 +1400,14 @@ Namespace GSM.Node
                     cmd.Parameters.AddWithValue("@shimPid", shimPid)
                     cmd.Parameters.AddWithValue("@shimProto", shimProtocolVersion)
                     cmd.Parameters.AddWithValue("@execMode", executionMode)
+                    cmd.Parameters.AddWithValue("@pollSources", If(pollSourcesJson, CObj(DBNull.Value)))
+                    cmd.Parameters.AddWithValue("@resurrect", If(resurrectOnBoot, 1, 0))
+                    cmd.Parameters.AddWithValue("@autoStart", If(autoStartOnBoot, 1, 0))
+                    cmd.Parameters.AddWithValue("@ringSeq", shimRingSeq)
+                    cmd.Parameters.AddWithValue("@envVars", If(environmentVarsJson, CObj(DBNull.Value)))
+                    cmd.Parameters.AddWithValue("@crashReset", crashCountResetAfterSeconds)
+                    cmd.Parameters.AddWithValue("@minRestart", minRestartDelayMs)
+                    cmd.Parameters.AddWithValue("@bootDelay", bootStartDelaySeconds)
                     cmd.ExecuteNonQuery()
                 End Using
             End Using
@@ -1022,7 +1433,9 @@ Namespace GSM.Node
                     cmd.CommandText = "SELECT InstanceId, State, Pid, StartedAtUtc, CrashPolicyJson, StopIntentPending,
                                               ExePath, Arguments, WorkingDirectory, LogFilePathsJson, ParseRulesJson,
                                               Strategy, StdoutIsLog, RequiresConsoleIsolation, LogTailerStartDelayMs,
-                                              ShimEndpoint, ShimPid, ShimProtocolVersion, ExecutionMode
+                                              ShimEndpoint, ShimPid, ShimProtocolVersion, ExecutionMode, PollSourcesJson,
+                                              ResurrectOnBoot, AutoStartOnBoot, ShimRingSeq, EnvironmentVarsJson,
+                                              CrashCountResetAfterSeconds, MinRestartDelayMs, BootStartDelaySeconds
                                        FROM InstanceSnapshots"
                     Using reader = cmd.ExecuteReader()
                         While reader.Read()
@@ -1069,6 +1482,14 @@ Namespace GSM.Node
                             row.ShimPid = If(reader.IsDBNull(16), 0, reader.GetInt32(16))
                             row.ShimProtocolVersion = If(reader.IsDBNull(17), 0, reader.GetInt32(17))
                             row.ExecutionMode = If(reader.IsDBNull(18), 0, reader.GetInt32(18))
+                            row.PollSourcesJson = If(reader.IsDBNull(19), Nothing, reader.GetString(19))
+                            row.ResurrectOnBoot = Not reader.IsDBNull(20) AndAlso reader.GetInt32(20) <> 0
+                            row.AutoStartOnBoot = Not reader.IsDBNull(21) AndAlso reader.GetInt32(21) <> 0
+                            row.ShimRingSeq = If(reader.IsDBNull(22), 0L, reader.GetInt64(22))
+                            row.EnvironmentVarsJson = If(reader.IsDBNull(23), Nothing, reader.GetString(23))
+                            row.CrashCountResetAfterSeconds = If(reader.IsDBNull(24), 300, reader.GetInt32(24))
+                            row.MinRestartDelayMs = If(reader.IsDBNull(25), 0, reader.GetInt32(25))
+                            row.BootStartDelaySeconds = If(reader.IsDBNull(26), 0, reader.GetInt32(26))
                             rows.Add(row)
                         End While
                     End Using
@@ -1084,6 +1505,142 @@ Namespace GSM.Node
             Using conn = OpenConnection()
                 Using cmd = conn.CreateCommand()
                     cmd.CommandText = "DELETE FROM InstanceSnapshots WHERE InstanceId = @id"
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    cmd.ExecuteNonQuery()
+                End Using
+            End Using
+        End Sub
+
+        ''' <summary>
+        ''' PARKS a snapshot instead of deleting it — the stop path for
+        ''' instances flagged AutoStartOnBoot ("Auto start with node").
+        ''' Marks the row Stopped and clears the live-process fields
+        ''' (PID, shim endpoint) while keeping the whole recovery
+        ''' payload, so the next node boot can start the instance from
+        ''' it. FinalizeStart's INSERT OR REPLACE overwrites the parked
+        ''' row on the next successful start.
+        ''' </summary>
+        Public Sub MarkInstanceSnapshotStopped(instanceId As String)
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "UPDATE InstanceSnapshots
+                                       SET State = 'Stopped', Pid = 0, StopIntentPending = 0,
+                                           ShimEndpoint = NULL, ShimPid = 0
+                                       WHERE InstanceId = @id"
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    cmd.ExecuteNonQuery()
+                End Using
+            End Using
+        End Sub
+
+        ''' <summary>
+        ''' Whether a snapshot row exists for the instance and, if so,
+        ''' its persisted State ("Running" live row / "Stopped" parked
+        ''' row). Used by the boot-flags endpoint to decide between
+        ''' updating flag columns and deleting a now-pointless parked
+        ''' row.
+        ''' </summary>
+        Public Function GetInstanceSnapshotBootInfo(instanceId As String) As (Exists As Boolean, State As String)
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "SELECT State FROM InstanceSnapshots WHERE InstanceId = @id"
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    Dim result = cmd.ExecuteScalar()
+                    If result Is Nothing OrElse result Is DBNull.Value Then
+                        Return (False, Nothing)
+                    End If
+                    Return (True, CStr(result))
+                End Using
+            End Using
+        End Function
+
+        ''' <summary>
+        ''' Live-updates ONLY the boot-flag columns of an existing
+        ''' snapshot row (boot-flags endpoint — a checkbox change on
+        ''' the Edit Instance form must not wait for the instance's
+        ''' next start). Returns the number of rows affected (0 = no
+        ''' snapshot; caller decides what that means).
+        ''' </summary>
+        Public Function UpdateInstanceSnapshotBootFlags(instanceId As String,
+                                                        resurrectOnBoot As Boolean,
+                                                        autoStartOnBoot As Boolean,
+                                                        Optional bootStartDelaySeconds As Integer? = Nothing) As Integer
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    If bootStartDelaySeconds.HasValue Then
+                        cmd.CommandText = "UPDATE InstanceSnapshots
+                                           SET ResurrectOnBoot = @resurrect, AutoStartOnBoot = @autoStart,
+                                               BootStartDelaySeconds = @bootDelay
+                                           WHERE InstanceId = @id"
+                        cmd.Parameters.AddWithValue("@bootDelay", Math.Max(0, bootStartDelaySeconds.Value))
+                    Else
+                        cmd.CommandText = "UPDATE InstanceSnapshots
+                                           SET ResurrectOnBoot = @resurrect, AutoStartOnBoot = @autoStart
+                                           WHERE InstanceId = @id"
+                    End If
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    cmd.Parameters.AddWithValue("@resurrect", If(resurrectOnBoot, 1, 0))
+                    cmd.Parameters.AddWithValue("@autoStart", If(autoStartOnBoot, 1, 0))
+                    Return cmd.ExecuteNonQuery()
+                End Using
+            End Using
+        End Function
+
+        ' ----------------------------------------------------
+        '  Node-boot resurrection flap guard (BootResurrectAttempts)
+        '
+        '  Persisted (NOT in-memory) because the whole point is
+        '  surviving node restarts: the in-memory crash ladder
+        '  resets every boot, so a host/node restart loop would
+        '  re-resurrect a doomed instance forever without this.
+        ' ----------------------------------------------------
+
+        ''' <summary>
+        ''' Reads the flap-guard row for an instance. Returns
+        ''' (DateTime.MinValue, 0) when no row exists.
+        ''' </summary>
+        Public Function GetBootResurrectAttempt(instanceId As String) As (LastAttemptUtc As DateTime, Count As Integer)
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "SELECT LastAttemptUtc, AttemptCount FROM BootResurrectAttempts WHERE InstanceId = @id"
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    Using reader = cmd.ExecuteReader()
+                        If reader.Read() Then
+                            Dim at As DateTime = DateTime.MinValue
+                            Try
+                                at = DateTime.Parse(reader.GetString(0),
+                                    CultureInfo.InvariantCulture,
+                                    DateTimeStyles.RoundtripKind)
+                            Catch
+                            End Try
+                            Return (at, If(reader.IsDBNull(1), 0, reader.GetInt32(1)))
+                        End If
+                    End Using
+                End Using
+            End Using
+            Return (DateTime.MinValue, 0)
+        End Function
+
+        ''' <summary>Upserts the flap-guard row with the given count, stamped now.</summary>
+        Public Sub RecordBootResurrectAttempt(instanceId As String, count As Integer)
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "INSERT OR REPLACE INTO BootResurrectAttempts
+                        (InstanceId, LastAttemptUtc, AttemptCount)
+                        VALUES (@id, @at, @count)"
+                    cmd.Parameters.AddWithValue("@id", instanceId)
+                    cmd.Parameters.AddWithValue("@at", DateTime.UtcNow.ToString("o"))
+                    cmd.Parameters.AddWithValue("@count", count)
+                    cmd.ExecuteNonQuery()
+                End Using
+            End Using
+        End Sub
+
+        ''' <summary>Clears the flap-guard row (instance proved healthy).</summary>
+        Public Sub ClearBootResurrectAttempt(instanceId As String)
+            Using conn = OpenConnection()
+                Using cmd = conn.CreateCommand()
+                    cmd.CommandText = "DELETE FROM BootResurrectAttempts WHERE InstanceId = @id"
                     cmd.Parameters.AddWithValue("@id", instanceId)
                     cmd.ExecuteNonQuery()
                 End Using
@@ -1224,6 +1781,58 @@ Namespace GSM.Node
         Public Property ShimPid As Integer
         Public Property ShimProtocolVersion As Integer
         Public Property ExecutionMode As Integer
+        ''' <summary>Serialized ResolvedStatePollSource list
+        ''' (EventStream Slice 2) so polling survives node restart +
+        ''' adoption without the Manager. Carries the resolved API
+        ''' credential — accepted: node.db sits on the same box as
+        ''' the game INI holding the same value.</summary>
+        Public Property PollSourcesJson As String
+
+        ''' <summary>Node-boot resurrection opt-in (additive column,
+        ''' default 0): when set and this snapshot's adopt fails DEAD
+        ''' (dead PID / dead shim endpoint) with State=Running and no
+        ''' stop intent, the boot-resurrection pass restarts the
+        ''' instance from this row's recovery payload instead of just
+        ''' discarding it. See ProcessManager.StartBootResurrection.</summary>
+        Public Property ResurrectOnBoot As Boolean
+
+        ''' <summary>Unconditional node-boot autostart ("Auto start
+        ''' with node", additive column, default 0): when set, stops
+        ''' PARK this row (State=Stopped, PID cleared — see
+        ''' NodeDatabase.MarkInstanceSnapshotStopped) instead of
+        ''' deleting it, and the boot-resurrection pass starts the
+        ''' instance from the parked payload on every node start —
+        ''' prior state irrelevant. Shares the resurrection flap
+        ''' guard.</summary>
+        Public Property AutoStartOnBoot As Boolean
+
+        ''' <summary>Highest shim ring-frame seq this node consumed
+        ''' (ring-cursor, v2 additive; default 0 = replay everything).
+        ''' Sent as Hello.ReplayAfterSeq on adopt.</summary>
+        Public Property ShimRingSeq As Long
+
+        ''' <summary>Serialized request.EnvironmentVars (additive
+        ''' column, 2026-10-11). Plugin launch env — e.g. Stardew's
+        ''' GALLIUM_DRIVER=llvmpipe on Windows — was NOT persisted, so
+        ''' every boot-resurrect launched the game without it: Stardew
+        ''' came up on the Basic Render Driver and died with exit
+        ''' 458839 on every resurrect while manual starts worked.</summary>
+        Public Property EnvironmentVarsJson As String
+
+        ''' <summary>Crash-ladder knobs from the original request
+        ''' (additive columns, 2026-10-11). Were not persisted, so a
+        ''' boot-resurrect ran on node defaults (MinRestartDelayMs 0
+        ''' instead of the Manager's 5000 floor — fast enough that the
+        ''' Manager poller could miss the Crashed transition and lose
+        ''' the crash notification).</summary>
+        Public Property CrashCountResetAfterSeconds As Integer = 300
+        Public Property MinRestartDelayMs As Integer
+
+        ''' <summary>Boot stagger (seconds) for the resurrection pass:
+        ''' rows launch in ascending delay, each waiting until this
+        ''' many seconds have elapsed since the pass began. 0 = no
+        ''' wait. Additive column, 2026-10-11.</summary>
+        Public Property BootStartDelaySeconds As Integer
     End Class
 
 End Namespace

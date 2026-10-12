@@ -2,6 +2,7 @@ Imports System
 Imports System.Collections.Concurrent
 Imports System.Diagnostics
 Imports System.IO
+Imports System.Linq
 Imports System.Runtime.InteropServices
 Imports System.Text
 Imports System.Text.Json
@@ -106,6 +107,8 @@ Namespace GSM.Node
         Private ReadOnly _logStore As RingBufferStore
         Private ReadOnly _database As NodeDatabase
         Private ReadOnly _eventStore As EventStore
+        Private ReadOnly _events As EventStreamStore
+        Private ReadOnly _pollers As StatePollerHost
         Private ReadOnly _nodeConfig As NodeConfiguration
         Private ReadOnly _shimSocketDir As String
         Private ReadOnly _logger As Microsoft.Extensions.Logging.ILogger(Of ProcessManager)
@@ -113,16 +116,44 @@ Namespace GSM.Node
         Public Sub New(logStore As RingBufferStore,
                        database As NodeDatabase,
                        eventStore As EventStore,
+                       events As EventStreamStore,
+                       pollers As StatePollerHost,
                        nodeConfig As NodeConfiguration,
                        logger As Microsoft.Extensions.Logging.ILogger(Of ProcessManager))
             _logStore = logStore
             _database = database
             _eventStore = eventStore
+            _events = events
+            _pollers = pollers
             _nodeConfig = nodeConfig
             ' Linux shim sockets live under {DataDirectory}\shims; unused on
             ' Windows (named pipes). DataDirectory is already absolute here.
             _shimSocketDir = IO.Path.Combine(nodeConfig.DataDirectory, "shims")
             _logger = logger
+            ' Ring-cursor periodic persist (v2 additive): bounds the replay
+            ' overlap after a node CRASH (clean shutdowns persist exactly in
+            ' DetachShimsForShutdown). Dirty-checked — idle instances cost a
+            ' dictionary walk, no DB writes.
+            _ringCursorTimer = New Threading.Timer(AddressOf PersistRingCursors, Nothing,
+                                                   TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15))
+        End Sub
+
+        Private ReadOnly _ringCursorTimer As Threading.Timer
+
+        Private Sub PersistRingCursors(state As Object)
+            Try
+                For Each kvp In _instances
+                    Dim m = kvp.Value
+                    If m Is Nothing OrElse m.ExecutionMode <> ExecutionMode.Shim OrElse m.Shim Is Nothing Then Continue For
+                    Dim seq As Long = m.Shim.ConsumedRingSeq
+                    If seq > m.ShimRingCursor Then
+                        _database.UpdateInstanceSnapshotRingSeq(m.InstanceId, seq)
+                        m.ShimRingCursor = seq
+                    End If
+                Next
+            Catch ex As Exception
+                _logger.LogDebug(ex, "Periodic ring-cursor persist failed")
+            End Try
         End Sub
 
         ' ============================================================
@@ -210,6 +241,9 @@ Namespace GSM.Node
             managed.MinRestartDelayMs = request.MinRestartDelayMs
             managed.StopIntentPending = False
             managed.CrashCount = 0
+            managed.ResurrectOnBoot = request.ResurrectOnNodeBoot
+            managed.AutoStartOnBoot = request.AutoStartOnNodeBoot
+            managed.BootStartDelaySeconds = Math.Max(0, request.BootStartDelaySeconds)
 
             ' Build process start info. Note: the redirection flags
             ' are only honored by the stdout-captured path below;
@@ -247,6 +281,17 @@ Namespace GSM.Node
             managed.StartInfo = psi
             managed.LogFilePaths = request.LogFilePaths
             managed.ParseRules = request.LogParseRules
+            managed.PollSources = request.PollSources
+            ' Kept verbatim (not psi.EnvironmentVariables, which is the
+            ' whole inherited block) so the snapshot can persist ONLY the
+            ' plugin overrides for boot-resurrect. See EnvironmentVarsJson.
+            managed.EnvironmentVars = request.EnvironmentVars
+
+            ' Orphan-reap scope roots (incident follow-up #4),
+            ' captured from the PRE-WRAP request values — StartInfo
+            ' may later read "cmd.exe" (Strategy C) or "setsid"
+            ' (Linux) instead of the game path.
+            managed.ReapRoots = BuildReapRoots(request.ExePath, request.WorkingDirectory)
 
             ' Resolve the plugin-supplied LaunchOptions (StdoutIsLog
             ' and RequiresConsoleIsolation) into a concrete spawn
@@ -260,7 +305,20 @@ Namespace GSM.Node
             managed.RequiresConsoleIsolation = request.RequiresConsoleIsolation
             managed.Strategy = ResolveStrategy(request.StdoutIsLog,
                                                 request.RequiresConsoleIsolation,
-                                                request.LogFilePaths)
+                                                request.LogFilePaths,
+                                                request.NeedsPseudoConsole)
+
+            ' ConPTY requires the shim (the whole point is the shim owning
+            ' the pty across Node restarts) — with the DisableShim
+            ' kill-switch set there is no direct-mode ConPTY, so downgrade
+            ' to the hidden-console spawn (yesterday's Palworld behaviour:
+            ' game runs, capture dark, nothing breaks).
+            If managed.Strategy = SpawnStrategy.ConPty AndAlso _nodeConfig.DisableShim Then
+                _logger.LogWarning(
+                    "Instance {Id}: ConPty strategy requested but DisableShim is set — downgrading to HiddenConsoleDirect (no console capture)",
+                    request.InstanceId)
+                managed.Strategy = SpawnStrategy.HiddenConsoleDirect
+            End If
 
             ' CaptureStdout governs whether the stdout pipe data is
             ' forwarded to the ring buffer + EventStore. Strategy A
@@ -281,8 +339,12 @@ Namespace GSM.Node
             ' the file tailer instead, matching the Windows Strategy B
             ' behaviour and giving the EventStore the full Verbose
             ' stream rather than a Display-filtered subset.
+            ' ConPty joins Strategy A here: the pty output IS the capture
+            ' surface (it exists to be captured), same buffer/EventStore
+            ' routing — under SourceId "conpty" (slice C3).
             Dim hasFileLogs = request.LogFilePaths IsNot Nothing AndAlso request.LogFilePaths.Count > 0
-            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture) AndAlso
+            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture OrElse
+                                     managed.Strategy = SpawnStrategy.ConPty) AndAlso
                                     Not hasFileLogs
 
             ' Resolve the file-tailer startup delay. Negative values
@@ -365,6 +427,15 @@ Namespace GSM.Node
             managed.StopIntentPending = True
             managed.State = InstanceState.Stopping
             managed.StateChangedAt = DateTime.UtcNow
+
+            ' Lifecycle stream: record the stop INTENT before the
+            ' signalling dance below, so consumers can distinguish a
+            ' requested stop from a crash even if the exit code alone
+            ' is ambiguous.
+            EmitLifecycle(managed.InstanceId, ParsedEventKind.InstanceStopRequested,
+                          New Dictionary(Of String, String) From {
+                              {"GracefulTimeoutMs", If(request.GracefulTimeoutMs > 0, request.GracefulTimeoutMs, 20000).ToString()}
+                          })
 
             If managed.ExecutionMode = ExecutionMode.Shim AndAlso managed.Shim IsNot Nothing Then
                 Dim shim = managed.Shim
@@ -491,7 +562,7 @@ Namespace GSM.Node
 
             managed.State = InstanceState.Stopped
             managed.StateChangedAt = DateTime.UtcNow
-            _database.RemoveInstanceSnapshot(request.InstanceId)
+            ClearOrParkSnapshot(managed)
 
             _logger.LogInformation("Stopped instance {InstanceId}", request.InstanceId)
             Return BuildStatusResponse(managed)
@@ -510,6 +581,107 @@ Namespace GSM.Node
             Return _instances.Values.
                 Select(Function(m) BuildStatusResponse(m)).
                 ToList()
+        End Function
+
+        ' --------------------------------------------------------
+        '  Diagnostics Wave 2 (2026-08-15) — read-only observability
+        '  for the Manager's Diagnostics window. Best-effort plain
+        '  reads; never mutate state.
+        ' --------------------------------------------------------
+
+        ''' <summary>
+        ''' Everything the node-boot resurrection pass would see for
+        ''' this instance: in-memory tracking, snapshot/parked row,
+        ''' boot flags, flap-guard chain. Snapshot fields come from
+        ''' the persisted row (the boot pass's actual input), falling
+        ''' back to the in-memory flags for tracked instances with no
+        ''' row yet.
+        ''' </summary>
+        Public Function GetBootStateDiagnostics(instanceId As String) As BootStateResponse
+            Dim resp As New BootStateResponse With {
+                .FlapLastAttemptUtc = DateTime.MinValue
+            }
+
+            Dim managed As ManagedInstance = Nothing
+            If _instances.TryGetValue(instanceId, managed) Then
+                resp.Tracked = True
+                resp.TrackedState = managed.State.ToString()
+                resp.StopIntentPending = managed.StopIntentPending
+                resp.ResurrectOnBoot = managed.ResurrectOnBoot
+                resp.AutoStartOnBoot = managed.AutoStartOnBoot
+            End If
+
+            Try
+                For Each row In _database.LoadAllInstanceSnapshots()
+                    If Not String.Equals(row.InstanceId, instanceId, StringComparison.Ordinal) Then Continue For
+                    resp.SnapshotExists = True
+                    resp.SnapshotState = row.State
+                    resp.Parked = String.Equals(row.State, "Stopped", StringComparison.OrdinalIgnoreCase)
+                    ' The persisted row is authoritative for the boot
+                    ' pass — prefer it over in-memory flags.
+                    resp.ResurrectOnBoot = row.ResurrectOnBoot
+                    resp.AutoStartOnBoot = row.AutoStartOnBoot
+                    resp.StopIntentPending = row.StopIntentPending
+                    resp.ShimRingSeq = row.ShimRingSeq
+                    Exit For
+                Next
+            Catch ex As Exception
+                _logger.LogDebug(ex, "Boot-state snapshot read failed for {Id}", instanceId)
+            End Try
+
+            Try
+                Dim flap = _database.GetBootResurrectAttempt(instanceId)
+                resp.FlapLastAttemptUtc = flap.LastAttemptUtc
+                resp.FlapAttemptCount = flap.Count
+            Catch ex As Exception
+                _logger.LogDebug(ex, "Boot-state flap read failed for {Id}", instanceId)
+            End Try
+
+            Return resp
+        End Function
+
+        ''' <summary>
+        ''' The shim link as the node sees it: mode, strategy, pids,
+        ''' negotiated protocol, ring cursors (live consumed counter
+        ''' when a session is attached; the in-memory cursor
+        ''' otherwise; plus the snapshot-persisted value the next
+        ''' adopt would replay after).
+        ''' </summary>
+        Public Function GetShimStateDiagnostics(instanceId As String) As ShimStateResponse
+            Dim resp As New ShimStateResponse()
+
+            Dim managed As ManagedInstance = Nothing
+            If _instances.TryGetValue(instanceId, managed) Then
+                resp.Tracked = True
+                resp.ExecutionMode = managed.ExecutionMode.ToString()
+                resp.Strategy = managed.Strategy.ToString()
+                resp.ShimPid = managed.ShimPid
+                resp.ShimEndpoint = managed.ShimEndpoint
+                resp.ShimProtocolVersion = managed.ShimProtocolVersion
+                resp.Attached = managed.Shim IsNot Nothing
+                resp.ConsumedRingSeq = If(managed.Shim IsNot Nothing,
+                                          managed.Shim.ConsumedRingSeq,
+                                          managed.ShimRingCursor)
+            End If
+
+            Try
+                For Each row In _database.LoadAllInstanceSnapshots()
+                    If Not String.Equals(row.InstanceId, instanceId, StringComparison.Ordinal) Then Continue For
+                    resp.SnapshotRingSeq = row.ShimRingSeq
+                    If Not resp.Tracked Then
+                        resp.ExecutionMode = CType(row.ExecutionMode, ExecutionMode).ToString()
+                        resp.Strategy = CType(row.Strategy, SpawnStrategy).ToString()
+                        resp.ShimPid = row.ShimPid
+                        resp.ShimEndpoint = row.ShimEndpoint
+                        resp.ShimProtocolVersion = row.ShimProtocolVersion
+                    End If
+                    Exit For
+                Next
+            Catch ex As Exception
+                _logger.LogDebug(ex, "Shim-state snapshot read failed for {Id}", instanceId)
+            End Try
+
+            Return resp
         End Function
 
         ' ============================================================
@@ -631,6 +803,16 @@ Namespace GSM.Node
                 Dim m = kvp.Value
                 If m IsNot Nothing AndAlso m.ExecutionMode = ExecutionMode.Shim AndAlso m.Shim IsNot Nothing Then
                     shims.Add(m.Shim)
+                    ' Ring-cursor: persist exactly what this session consumed so
+                    ' the post-restart adopt replays only the downtime gap. The
+                    ' clean-shutdown write makes the deliberate-restart case
+                    ' (the common one) replay-exact; the periodic persist below
+                    ' bounds the overlap for crash restarts.
+                    Try
+                        _database.UpdateInstanceSnapshotRingSeq(m.InstanceId, m.Shim.ConsumedRingSeq)
+                    Catch ex As Exception
+                        _logger.LogDebug(ex, "Ring-cursor persist failed for {Id} during shutdown", m.InstanceId)
+                    End Try
                 End If
             Next
             If shims.Count = 0 Then Return
@@ -678,6 +860,25 @@ Namespace GSM.Node
                 Return False
             End If
 
+            ' PARKED row ("Auto start with node"): the stop path kept the
+            ' snapshot with State=Stopped so this boot can start the
+            ' instance fresh. Nothing to adopt — queue for the
+            ' boot-resurrection pass and LEAVE the row (a successful
+            ' start's FinalizeStart overwrites it; a failed/suppressed
+            ' start leaves it for the next boot to retry).
+            If String.Equals(snapshot.State, InstanceState.Stopped.ToString(),
+                             StringComparison.OrdinalIgnoreCase) Then
+                If snapshot.AutoStartOnBoot Then
+                    QueueBootResurrection(snapshot, "parked (auto start with node)")
+                Else
+                    ' Parked by a since-cleared flag — stale; clean up.
+                    _logger.LogInformation(
+                        "Snapshot {Id}: parked but no longer flagged — discarding", id)
+                    _database.RemoveInstanceSnapshot(id)
+                End If
+                Return False
+            End If
+
             ' Stop intent was pending when we wrote the snapshot.
             ' Most likely path: graceful stop was in flight at the
             ' moment the node was killed. Treat as fully stopped
@@ -688,7 +889,15 @@ Namespace GSM.Node
                 _logger.LogInformation(
                     "Snapshot {Id}: StopIntentPending was set — honoring stop and discarding",
                     id)
-                _database.RemoveInstanceSnapshot(id)
+                ' "Auto start with node" instances: honor the stop THIS
+                ' boot (the game may even still be running — starting a
+                ' second copy would be worse), but park the row so the
+                ' NEXT boot autostarts as configured.
+                If snapshot.AutoStartOnBoot Then
+                    _database.MarkInstanceSnapshotStopped(id)
+                Else
+                    _database.RemoveInstanceSnapshot(id)
+                End If
                 Return False
             End If
 
@@ -709,7 +918,10 @@ Namespace GSM.Node
                 _logger.LogInformation(
                     "Snapshot {Id}: PID {Pid} not running — discarding",
                     id, snapshot.Pid)
-                _database.RemoveInstanceSnapshot(id)
+                ' Dead-at-boot: the host-reboot / killed-during-downtime
+                ' case. Opt-in rows queue for the boot-resurrection pass.
+                QueueBootResurrection(snapshot, $"PID {snapshot.Pid} not running")
+                ParkOrRemoveDeadSnapshot(snapshot)
                 Return False
             End Try
 
@@ -741,7 +953,10 @@ Namespace GSM.Node
                 _logger.LogInformation(
                     "Snapshot {Id}: PID {Pid} appears to be a different process (start time differs by {Delta}: saved {Saved:o}, found {Found:o}) — discarding",
                     id, snapshot.Pid, delta, snapshot.StartedAtUtc, adoptedStartUtc)
-                _database.RemoveInstanceSnapshot(id)
+                ' PID recycled by an unrelated process ⇒ the game itself
+                ' is dead — same dead-at-boot class as PID-not-running.
+                QueueBootResurrection(snapshot, $"PID {snapshot.Pid} recycled by a different process")
+                ParkOrRemoveDeadSnapshot(snapshot)
                 Return False
             End If
 
@@ -755,6 +970,13 @@ Namespace GSM.Node
             managed.StateChangedAt = DateTime.UtcNow
             managed.StopIntentPending = False
             managed.CrashCount = 0
+            ' Round-trip the boot-resurrection opt-ins so the NEXT snapshot
+            ' (crash-restart FinalizeStart) doesn't silently drop them.
+            managed.ResurrectOnBoot = snapshot.ResurrectOnBoot
+            managed.AutoStartOnBoot = snapshot.AutoStartOnBoot
+            managed.BootStartDelaySeconds = snapshot.BootStartDelaySeconds
+            managed.CrashCountResetAfterSeconds = snapshot.CrashCountResetAfterSeconds
+            managed.MinRestartDelayMs = snapshot.MinRestartDelayMs
 
             ' Restore crash-policy fields. CrashPolicyJson is the
             ' same anonymous-typed shape FinalizeStart serialized
@@ -807,6 +1029,11 @@ Namespace GSM.Node
             psi.CreateNoWindow = True
             managed.StartInfo = psi
 
+            ' Snapshot ExePath may be a wrapped value ("setsid" +
+            ' args on Linux) — BuildReapRoots drops non-rooted
+            ' names and keeps the working directory root.
+            managed.ReapRoots = BuildReapRoots(snapshot.ExePath, snapshot.WorkingDirectory)
+
             ' Deserialize log file paths + parse rules. Both are
             ' optional — a snapshot with no rules means the
             ' instance was running with declarative-rules off,
@@ -836,7 +1063,8 @@ Namespace GSM.Node
             ' because the snapshot has Strategy=StdoutCapture.
             Dim adoptHasFileLogs = managed.LogFilePaths IsNot Nothing AndAlso
                                     managed.LogFilePaths.Count > 0
-            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture) AndAlso
+            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture OrElse
+                                     managed.Strategy = SpawnStrategy.ConPty) AndAlso
                                     Not adoptHasFileLogs
 
             Dim parseRules As IList(Of LogParseRule) = Nothing
@@ -849,6 +1077,7 @@ Namespace GSM.Node
                 End Try
             End If
             managed.ParseRules = parseRules
+            managed.PollSources = DeserializePollSources(snapshot, id)
 
             ' Wire up handlers + push into _instances. The Exited
             ' event will now fire if the process subsequently
@@ -869,7 +1098,12 @@ Namespace GSM.Node
             ' them until the next state-change event happens to
             ' land. Live events override the hydrated fields as
             ' they fire.
-            If parseRules IsNot Nothing AndAlso parseRules.Count > 0 Then
+            ' Slice 2: register when the instance has parse rules OR
+            ' poll sources — poller-only games (Palworld) need the
+            ' EventStore state registered for the fold + roster even
+            ' with zero rules.
+            If (parseRules IsNot Nothing AndAlso parseRules.Count > 0) OrElse
+               (managed.PollSources IsNot Nothing AndAlso managed.PollSources.Count > 0) Then
                 _eventStore.RegisterInstance(id, parseRules, hydrateState:=True)
             End If
 
@@ -908,6 +1142,17 @@ Namespace GSM.Node
             ' freshly-spawned one would.
             ScheduleCrashCountReset(managed, proc)
 
+            ' Slice 2: authority map + pollers resume with the
+            ' adopted run (roster-aware baseline prevents duplicate
+            ' joins — stream hydration already rebuilt the roster).
+            _pollers.StartPollers(id, InstallAuthority(managed))
+
+            EmitLifecycle(id, ParsedEventKind.InstanceAdopted,
+                          New Dictionary(Of String, String) From {
+                              {"Pid", managed.Pid.ToString()},
+                              {"Mode", "Direct"}
+                          })
+
             _logger.LogInformation(
                 "Adopted instance {Id} (PID {Pid}, started {Started:o}, {RuleCount} rule(s), {LogCount} log file(s), strategy={Strategy})",
                 id, snapshot.Pid, adoptedStartUtc,
@@ -944,6 +1189,12 @@ Namespace GSM.Node
             managed.StateChangedAt = DateTime.UtcNow
             managed.StopIntentPending = False
             managed.CrashCount = 0
+            ' Round-trip the boot-resurrection opt-ins (see the Direct path).
+            managed.ResurrectOnBoot = snapshot.ResurrectOnBoot
+            managed.AutoStartOnBoot = snapshot.AutoStartOnBoot
+            managed.BootStartDelaySeconds = snapshot.BootStartDelaySeconds
+            managed.CrashCountResetAfterSeconds = snapshot.CrashCountResetAfterSeconds
+            managed.MinRestartDelayMs = snapshot.MinRestartDelayMs
 
             ' Restore crash policy (same shape FinalizeStart serialized).
             If Not String.IsNullOrEmpty(snapshot.CrashPolicyJson) Then
@@ -978,6 +1229,7 @@ Namespace GSM.Node
             psi.UseShellExecute = False
             psi.CreateNoWindow = True
             managed.StartInfo = psi
+            managed.ReapRoots = BuildReapRoots(snapshot.ExePath, snapshot.WorkingDirectory)
 
             ' Log file paths + CaptureStdout (same hasFileLogs rule as the Direct
             ' path; shim Strategy A normally carries no file logs).
@@ -991,7 +1243,8 @@ Namespace GSM.Node
             End If
             managed.LogFilePaths = logFilePaths
             Dim adoptHasFileLogs = managed.LogFilePaths IsNot Nothing AndAlso managed.LogFilePaths.Count > 0
-            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture) AndAlso Not adoptHasFileLogs
+            managed.CaptureStdout = (managed.Strategy = SpawnStrategy.StdoutCapture OrElse
+                                     managed.Strategy = SpawnStrategy.ConPty) AndAlso Not adoptHasFileLogs
 
             Dim parseRules As IList(Of LogParseRule) = Nothing
             If Not String.IsNullOrEmpty(snapshot.ParseRulesJson) Then
@@ -1002,6 +1255,7 @@ Namespace GSM.Node
                 End Try
             End If
             managed.ParseRules = parseRules
+            managed.PollSources = DeserializePollSources(snapshot, id)
 
             ' Register EventStore + publish into _instances BEFORE reconnecting:
             ' AdoptViaShimAsync starts the read loop immediately, and the shim
@@ -1009,7 +1263,8 @@ Namespace GSM.Node
             ' must find registered rules (and the instance) already in place or
             ' they'd be dropped. hydrateState:=True inherits the prior session's
             ' persisted instance_state (tile / match-state) like the Direct path.
-            If parseRules IsNot Nothing AndAlso parseRules.Count > 0 Then
+            If (parseRules IsNot Nothing AndAlso parseRules.Count > 0) OrElse
+               (managed.PollSources IsNot Nothing AndAlso managed.PollSources.Count > 0) Then
                 _eventStore.RegisterInstance(id, parseRules, hydrateState:=True)
             End If
             _instances(id) = managed
@@ -1020,6 +1275,7 @@ Namespace GSM.Node
             ' 8s connect timeout bounds a dead-endpoint reconnect.
             Dim adopted As Boolean
             Try
+                managed.ShimRingCursor = snapshot.ShimRingSeq
                 adopted = AdoptViaShimAsync(managed, snapshot.ShimEndpoint).GetAwaiter().GetResult()
             Catch ex As Exception
                 _logger.LogWarning(ex, "Snapshot {Id}: shim adopt threw — discarding", id)
@@ -1033,7 +1289,13 @@ Namespace GSM.Node
                 Dim removed As ManagedInstance = Nothing
                 _instances.TryRemove(id, removed)
                 _eventStore.UnregisterInstance(id)
-                _database.RemoveInstanceSnapshot(id)
+                ' Dead shim endpoint at boot = shim + game died with the
+                ' host (or during the downtime window) — the shim-mode
+                ' flavour of dead-at-boot. Opt-in rows queue for the
+                ' boot-resurrection pass (which spawns a FRESH shim via
+                ' the normal start path).
+                QueueBootResurrection(snapshot, $"shim at {snapshot.ShimEndpoint} did not answer")
+                ParkOrRemoveDeadSnapshot(snapshot)
                 Return False
             End If
 
@@ -1044,6 +1306,18 @@ Namespace GSM.Node
             End If
 
             ScheduleCrashCountReset(managed, Nothing)
+
+            ' Slice 2: authority map + pollers resume with the
+            ' adopted run (roster-aware baseline prevents duplicate
+            ' joins — stream hydration already rebuilt the roster).
+            _pollers.StartPollers(id, InstallAuthority(managed))
+
+            EmitLifecycle(id, ParsedEventKind.InstanceAdopted,
+                          New Dictionary(Of String, String) From {
+                              {"Pid", managed.Pid.ToString()},
+                              {"ShimPid", managed.ShimPid.ToString()},
+                              {"Mode", "Shim"}
+                          })
 
             _logger.LogInformation(
                 "Adopted shim instance {Id} (game PID {Pid}, shim PID {ShimPid}, endpoint {Endpoint}, {RuleCount} rule(s))",
@@ -1226,6 +1500,11 @@ Namespace GSM.Node
             ' seconds via its stream-health reconnect.
             _eventStore.RegisterInstance(instanceId, New List(Of LogParseRule)(), hydrateState:=True)
             _instances(instanceId) = managed
+            ' Lean adopt has no snapshot, so no poll sources either —
+            ' documented Slice 2 gap, same as parse rules: polling
+            ' returns on the next full instance start. Authority is
+            ' still installed so lifecycle-kind protection holds.
+            InstallAuthority(managed)
 
             Dim adopted As Boolean
             Try
@@ -1263,11 +1542,576 @@ Namespace GSM.Node
                     paths.Count, instanceId)
             End If
 
+            EmitLifecycle(instanceId, ParsedEventKind.InstanceAdopted,
+                          New Dictionary(Of String, String) From {
+                              {"Pid", managed.Pid.ToString()},
+                              {"ShimPid", managed.ShimPid.ToString()},
+                              {"Mode", "ShimLean"}
+                          })
+
             _logger.LogInformation(
                 "Shim sweep: lean-adopted instance {Id} (game PID {Pid}, shim PID {ShimPid}, endpoint {Endpoint}); " &
                 "awaiting Manager rule re-push for event tracking",
                 instanceId, managed.Pid, managed.ShimPid, endpoint)
             Return True
+        End Function
+
+        ' ============================================================
+        '  Node-boot resurrection
+        '
+        '  The adoption passes above can only recover a game that is
+        '  STILL ALIVE. When the whole host restarts (or node + game
+        '  died together), every snapshot that said Running fails its
+        '  adopt dead and is discarded — the instance silently reads
+        '  Stopped until an operator intervenes. Two per-instance
+        '  opt-ins change that (both wired from custom fields through
+        '  StartInstanceRequest):
+        '   - ResurrectOnBoot ("Recover state on node restart"):
+        '     dead-discard rows that were RUNNING with no stop intent
+        '     queue here instead of being discarded.
+        '   - AutoStartOnBoot ("Auto start with node"): stops PARK the
+        '     snapshot (State=Stopped, payload kept) instead of
+        '     deleting it, and EVERY node boot queues the row —
+        '     parked-stopped or dead-running alike.
+        '  StartBootResurrection then restarts each queued row
+        '  through the NORMAL start path (StartInstanceAsync) so shim
+        '  launch, FinalizeStart, EventStore registration, pollers,
+        '  tailers, crash policy, and lifecycle events all behave
+        '  exactly like an operator-initiated start.
+        '
+        '  Guard rails:
+        '   - Eligibility is decided AT QUEUE TIME: no
+        '     StopIntentPending (an intended stop is never started
+        '     over — even AutoStart parks and waits for the NEXT
+        '     boot), recovery payload present, and either
+        '     AutoStartOnBoot (any state) or ResurrectOnBoot with
+        '     State=Running.
+        '   - Dedup against _instances right before starting — a live
+        '     shim the sweep adopted must not be double-started.
+        '   - Persisted flap guard (BootResurrectAttempts): the
+        '     in-memory crash ladder resets every boot, so a
+        '     host/node restart LOOP would re-resurrect a doomed
+        '     instance forever. At 3 attempts inside a 10-minute
+        '     window the pass suppresses (Warning + Custom event);
+        '     the row clears once a resurrected instance stays up 10
+        '     minutes (or manually via a fresh node.db).
+        '   - The pass runs as a BACKGROUND task after the
+        '     synchronous adoption window, so startup latency and the
+        '     endpoint-availability contract are untouched.
+        '
+        '  EnvironmentVars: persisted as EnvironmentVarsJson since
+        '  2026-10-11. The earlier "accepted gap" (not persisted) was
+        '  not benign: Stardew's Windows launch sets
+        '  GALLIUM_DRIVER=llvmpipe, and without it every resurrect
+        '  came up on the Basic Render Driver and died (exit 458839)
+        '  while manual Manager starts worked — a crash loop that
+        '  only ever happened on node restart.
+        ' ============================================================
+
+        Private ReadOnly _pendingResurrections As New List(Of InstanceSnapshotRow)
+
+        ''' <summary>How recent consecutive attempts must be to count toward the flap guard.</summary>
+        Private Shared ReadOnly BootResurrectFlapWindow As TimeSpan = TimeSpan.FromMinutes(10)
+        ''' <summary>Consecutive in-window attempts after which resurrection is suppressed.</summary>
+        Private Const BootResurrectMaxAttempts As Integer = 3
+        ''' <summary>How long a resurrected instance must stay up before its flap-guard row clears.</summary>
+        Private Shared ReadOnly BootResurrectHealthyAfter As TimeSpan = TimeSpan.FromMinutes(10)
+
+        ''' <summary>
+        ''' The stop-path snapshot disposition: instances flagged "Auto
+        ''' start with node" PARK their snapshot (State=Stopped, live
+        ''' fields cleared, payload kept) so the next node boot can
+        ''' start them; everything else deletes the row as always.
+        ''' </summary>
+        Private Sub ClearOrParkSnapshot(managed As ManagedInstance)
+            If managed Is Nothing Then Return
+            If managed.AutoStartOnBoot Then
+                _database.MarkInstanceSnapshotStopped(managed.InstanceId)
+            Else
+                _database.RemoveInstanceSnapshot(managed.InstanceId)
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Boot-time dead-discard disposition: "Auto start with node"
+        ''' rows are parked (kept, marked Stopped) so a failed or
+        ''' suppressed resurrection still leaves a payload for the NEXT
+        ''' boot to retry; unflagged rows are removed as always. (A
+        ''' successful resurrection overwrites the parked row via
+        ''' FinalizeStart either way.)
+        ''' </summary>
+        Private Sub ParkOrRemoveDeadSnapshot(snapshot As InstanceSnapshotRow)
+            If snapshot Is Nothing Then Return
+            If snapshot.AutoStartOnBoot Then
+                _database.MarkInstanceSnapshotStopped(snapshot.InstanceId)
+            Else
+                _database.RemoveInstanceSnapshot(snapshot.InstanceId)
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Live boot-flag update (POST /api/instances/{id}/boot-flags):
+        ''' applies "Recover state on node restart" / "Auto start with
+        ''' node" WITHOUT a start/stop cycle. Updates the in-memory
+        ''' instance (so the next stop parks/deletes correctly) and the
+        ''' persisted snapshot row (so the next node boot honors the
+        ''' change even if nothing else happens first). Switching
+        ''' autostart OFF on a parked row deletes the row — that row's
+        ''' only reason to exist was the autostart. If the instance is
+        ''' stopped with NO snapshot, there is no payload to park;
+        ''' autostart arms at the instance's next start via the wire
+        ''' flag as before.
+        ''' </summary>
+        Public Function UpdateBootFlags(instanceId As String,
+                                        resurrectOnBoot As Boolean,
+                                        autoStartOnBoot As Boolean,
+                                        Optional bootStartDelaySeconds As Integer? = Nothing) As BootFlagsResponse
+            Dim resp As New BootFlagsResponse()
+
+            Dim managed As ManagedInstance = Nothing
+            If _instances.TryGetValue(instanceId, managed) AndAlso managed IsNot Nothing Then
+                managed.ResurrectOnBoot = resurrectOnBoot
+                managed.AutoStartOnBoot = autoStartOnBoot
+                If bootStartDelaySeconds.HasValue Then
+                    managed.BootStartDelaySeconds = Math.Max(0, bootStartDelaySeconds.Value)
+                End If
+                resp.InstanceTracked = True
+            End If
+
+            Dim info = _database.GetInstanceSnapshotBootInfo(instanceId)
+            If info.Exists Then
+                If Not autoStartOnBoot AndAlso
+                   String.Equals(info.State, InstanceState.Stopped.ToString(),
+                                 StringComparison.OrdinalIgnoreCase) Then
+                    ' Parked row whose autostart was just turned off —
+                    ' nothing left for it to do; delete instead of
+                    ' leaving a stale parked row for the boot pass to
+                    ' discard one boot later.
+                    _database.RemoveInstanceSnapshot(instanceId)
+                    resp.SnapshotUpdated = True
+                    resp.ParkedRowRemoved = True
+                Else
+                    _database.UpdateInstanceSnapshotBootFlags(instanceId, resurrectOnBoot, autoStartOnBoot,
+                                                              bootStartDelaySeconds)
+                    resp.SnapshotUpdated = True
+                End If
+            End If
+
+            _logger.LogInformation(
+                "Boot flags for {Id}: recover={Recover} autostart={Auto} bootDelay={Delay} (tracked={Tracked}, snapshot={Snap}{Parked})",
+                instanceId, resurrectOnBoot, autoStartOnBoot,
+                If(bootStartDelaySeconds.HasValue, bootStartDelaySeconds.Value.ToString() & "s", "unchanged"),
+                resp.InstanceTracked,
+                resp.SnapshotUpdated, If(resp.ParkedRowRemoved, ", parked row removed", ""))
+            Return resp
+        End Function
+
+        ''' <summary>
+        ''' Park an instance's launch settings WITHOUT spawning (POST
+        ''' /api/instances/park): writes a Stopped snapshot row from a
+        ''' full StartInstanceRequest so "Auto start with node" can arm
+        ''' on an instance that is stopped and has no snapshot here —
+        ''' the case a live /boot-flags update cannot cover (no payload
+        ''' to update). The row is exactly what a stop-park would have
+        ''' produced; the next node boot starts it through the normal
+        ''' resurrection pass, and any later real start's FinalizeStart
+        ''' simply overwrites it. Refused while the instance is tracked
+        ''' Running/Starting (live instances use /boot-flags).
+        ''' </summary>
+        Public Function ParkInstance(request As StartInstanceRequest) As ParkInstanceResponse
+            If request Is Nothing OrElse String.IsNullOrEmpty(request.InstanceId) Then
+                Return New ParkInstanceResponse With {
+                    .Parked = False, .Refused = False, .Message = "missing request/InstanceId"
+                }
+            End If
+            Dim id = request.InstanceId
+
+            Dim managed As ManagedInstance = Nothing
+            If _instances.TryGetValue(id, managed) AndAlso managed IsNot Nothing AndAlso
+               (managed.State = InstanceState.Running OrElse
+                managed.State = InstanceState.Starting) Then
+                Return New ParkInstanceResponse With {
+                    .Parked = False, .Refused = True,
+                    .Message = $"Instance is {managed.State} — live flags go through boot-flags"
+                }
+            End If
+
+            If String.IsNullOrEmpty(request.ExePath) Then
+                Return New ParkInstanceResponse With {
+                    .Parked = False, .Refused = False, .Message = "no ExePath — nothing to park"
+                }
+            End If
+
+            ' Same serialized shapes FinalizeStart persists, so the boot
+            ' pass rebuilds an identical StartInstanceRequest from this row.
+            Dim strategy = ResolveStrategy(request.StdoutIsLog,
+                                           request.RequiresConsoleIsolation,
+                                           request.LogFilePaths,
+                                           request.NeedsPseudoConsole)
+            Dim policyJson = JsonSerializer.Serialize(New With {
+                .Policy = request.CrashPolicy.ToString(),
+                .MaxCrash = request.MaxCrashCount,
+                .WindowMin = request.CrashWindowMinutes
+            })
+            Dim logsJson As String = If(request.LogFilePaths IsNot Nothing AndAlso request.LogFilePaths.Count > 0,
+                                        JsonSerializer.Serialize(request.LogFilePaths), Nothing)
+            Dim rulesJson As String = If(request.LogParseRules IsNot Nothing AndAlso request.LogParseRules.Count > 0,
+                                         JsonSerializer.Serialize(request.LogParseRules), Nothing)
+            Dim pollJson As String = If(request.PollSources IsNot Nothing AndAlso request.PollSources.Count > 0,
+                                        JsonSerializer.Serialize(request.PollSources), Nothing)
+            Dim envJson As String = If(request.EnvironmentVars IsNot Nothing AndAlso request.EnvironmentVars.Count > 0,
+                                       JsonSerializer.Serialize(request.EnvironmentVars), Nothing)
+
+            _database.SaveInstanceSnapshot(
+                id, InstanceState.Stopped.ToString(),
+                0, DateTime.UtcNow,
+                policyJson,
+                False,
+                request.ExePath,
+                request.Arguments,
+                request.WorkingDirectory,
+                logsJson,
+                rulesJson,
+                CInt(strategy),
+                request.StdoutIsLog,
+                request.RequiresConsoleIsolation,
+                request.LogTailerStartDelayMs,
+                Nothing, 0, 0, 0,
+                pollJson,
+                request.ResurrectOnNodeBoot,
+                request.AutoStartOnNodeBoot,
+                0,
+                envJson,
+                request.CrashCountResetAfterSeconds,
+                request.MinRestartDelayMs,
+                Math.Max(0, request.BootStartDelaySeconds))
+
+            _logger.LogInformation(
+                "Parked launch settings for {Id} (exe {Exe}, strategy {Strategy}, recover={Recover} autostart={Auto}) — no spawn",
+                id, request.ExePath, strategy, request.ResurrectOnNodeBoot, request.AutoStartOnNodeBoot)
+            Return New ParkInstanceResponse With {
+                .Parked = True, .Refused = False, .Message = "parked"
+            }
+        End Function
+
+        ''' <summary>
+        ''' Forget an instance the Manager is deleting (POST
+        ''' /api/instances/{id}/forget): remove the snapshot row
+        ''' (parked or live) and the boot-flap-guard row so nothing is
+        ''' left to auto-start the instance at a later node boot.
+        ''' Refuses while the instance is Running/Starting here — stop
+        ''' first (deleting the bookkeeping under a live game would
+        ''' orphan it from crash-restart AND node-restart adoption).
+        ''' </summary>
+        Public Function ForgetInstance(instanceId As String) As ForgetInstanceResponse
+            Dim managed As ManagedInstance = Nothing
+            If _instances.TryGetValue(instanceId, managed) AndAlso managed IsNot Nothing AndAlso
+               (managed.State = InstanceState.Running OrElse
+                managed.State = InstanceState.Starting) Then
+                Return New ForgetInstanceResponse With {
+                    .Removed = False,
+                    .Refused = True,
+                    .Message = $"Instance is {managed.State} on this node — stop it before deleting"
+                }
+            End If
+
+            Dim removedM As ManagedInstance = Nothing
+            _instances.TryRemove(instanceId, removedM)
+            Try
+                _pollers.StopPollers(instanceId)
+            Catch
+            End Try
+            Try
+                _eventStore.UnregisterInstance(instanceId)
+            Catch
+            End Try
+            _database.RemoveInstanceSnapshot(instanceId)
+            Try
+                _database.ClearBootResurrectAttempt(instanceId)
+            Catch
+            End Try
+
+            _logger.LogInformation("Forgot instance {Id} (snapshot + flap guard cleared)", instanceId)
+            Return New ForgetInstanceResponse With {
+                .Removed = True,
+                .Refused = False,
+                .Message = "forgotten"
+            }
+        End Function
+
+        ''' <summary>
+        ''' Called from the adoption passes' dead-discard sites (and the
+        ''' parked-row branch). Queues the snapshot for the resurrection
+        ''' pass when the row is eligible; otherwise a silent no-op (the
+        ''' discard proceeds as always).
+        ''' </summary>
+        Private Sub QueueBootResurrection(snapshot As InstanceSnapshotRow, deadReason As String)
+            Try
+                If snapshot Is Nothing Then Return
+                If snapshot.StopIntentPending Then Return
+                ' Two ways in: "Auto start with node" (AutoStartOnBoot)
+                ' starts regardless of the row's prior state — parked
+                ' Stopped rows included; "Recover state on node restart"
+                ' (ResurrectOnBoot) only restarts rows that were RUNNING.
+                Dim autoStart As Boolean = snapshot.AutoStartOnBoot
+                Dim recover As Boolean = snapshot.ResurrectOnBoot AndAlso
+                                         String.Equals(snapshot.State, InstanceState.Running.ToString(),
+                                                       StringComparison.OrdinalIgnoreCase)
+                If Not (autoStart OrElse recover) Then Return
+                If String.IsNullOrEmpty(snapshot.ExePath) Then
+                    _logger.LogWarning(
+                        "Boot-resurrect: {Id} is flagged but its snapshot has no recovery payload — cannot resurrect",
+                        snapshot.InstanceId)
+                    Return
+                End If
+
+                SyncLock _pendingResurrections
+                    _pendingResurrections.Add(snapshot)
+                End SyncLock
+                _logger.LogInformation(
+                    "Boot-resurrect: queued {Id} ({Reason})", snapshot.InstanceId, deadReason)
+            Catch ex As Exception
+                _logger.LogWarning(ex, "Boot-resurrect queueing failed for {Id}",
+                                   If(snapshot IsNot Nothing, snapshot.InstanceId, "?"))
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Fires the background resurrection pass over whatever the adoption
+        ''' passes queued. Called from NodeProgram right after
+        ''' SweepAdoptLiveShims; returns immediately.
+        ''' </summary>
+        Public Sub StartBootResurrection()
+            Dim pending As List(Of InstanceSnapshotRow)
+            SyncLock _pendingResurrections
+                If _pendingResurrections.Count = 0 Then Return
+                pending = New List(Of InstanceSnapshotRow)(_pendingResurrections)
+                _pendingResurrections.Clear()
+            End SyncLock
+
+            ' Stagger: launch in ascending BootStartDelaySeconds (stable
+            ' on ties — list order is snapshot-table order). Each row
+            ' waits until its delay has elapsed since the pass began,
+            ' so delays are absolute offsets from boot, not gaps.
+            pending.Sort(Function(a, b) a.BootStartDelaySeconds.CompareTo(b.BootStartDelaySeconds))
+
+            _logger.LogInformation(
+                "Boot-resurrect: {Count} instance(s) queued; resurrection pass starting in background (stagger: {Delays})",
+                pending.Count,
+                String.Join(", ", pending.Select(Function(p) $"{p.InstanceId}@{p.BootStartDelaySeconds}s")))
+
+            Task.Run(Function() ResurrectPassAsync(pending))
+        End Sub
+
+        Private Async Function ResurrectPassAsync(pending As List(Of InstanceSnapshotRow)) As Task
+            ' Small settle delay: lets app.Run() bind listeners and the
+            ' startup logs flush before game spawns begin. Not load-bearing.
+            Try
+                Await Task.Delay(TimeSpan.FromSeconds(2)).ConfigureAwait(False)
+            Catch
+            End Try
+
+            Dim passStarted As DateTime = DateTime.UtcNow
+
+            For Each snapshot In pending
+                Dim id = snapshot.InstanceId
+                Try
+                    ' Boot stagger (BootStartDelaySeconds): wait until the
+                    ' row's offset from pass start has elapsed. Rows are
+                    ' pre-sorted ascending, so each wait only covers the
+                    ' gap to the previous launch. Checked BEFORE dedup so
+                    ' an early Manager start during the wait still wins.
+                    If snapshot.BootStartDelaySeconds > 0 Then
+                        Dim remaining = TimeSpan.FromSeconds(snapshot.BootStartDelaySeconds) -
+                                        (DateTime.UtcNow - passStarted)
+                        If remaining > TimeSpan.Zero Then
+                            _logger.LogInformation(
+                                "Boot-resurrect: {Id} staggered — waiting {Sec:0}s (offset {Offset}s from boot)",
+                                id, remaining.TotalSeconds, snapshot.BootStartDelaySeconds)
+                            Try
+                                Await Task.Delay(remaining).ConfigureAwait(False)
+                            Catch
+                            End Try
+                        End If
+                    End If
+
+                    ' Dedup: adopted (snapshot pass), sweep-adopted, or already
+                    ' started by an early Manager request — never double-start.
+                    If _instances.ContainsKey(id) Then
+                        _logger.LogInformation(
+                            "Boot-resurrect: {Id} is already tracked — skipping", id)
+                        Continue For
+                    End If
+
+                    ' Flap guard: consecutive boot-window attempts suppress.
+                    Dim guard = _database.GetBootResurrectAttempt(id)
+                    Dim inWindow = guard.LastAttemptUtc <> DateTime.MinValue AndAlso
+                                   (DateTime.UtcNow - guard.LastAttemptUtc) < BootResurrectFlapWindow
+                    Dim attemptCount = If(inWindow, guard.Count, 0)
+                    If attemptCount >= BootResurrectMaxAttempts Then
+                        _logger.LogWarning(
+                            "Boot-resurrect: {Id} suppressed — {Count} attempts within {Window} minutes " &
+                            "(node/instance restart loop?). Start it manually to clear.",
+                            id, attemptCount, BootResurrectFlapWindow.TotalMinutes)
+                        EmitLifecycle(id, ParsedEventKind.Custom,
+                                      New Dictionary(Of String, String) From {
+                                          {"Event", "boot-resurrect-suppressed"},
+                                          {"Attempts", attemptCount.ToString()}
+                                      })
+                        Continue For
+                    End If
+                    _database.RecordBootResurrectAttempt(id, attemptCount + 1)
+
+                    ' Stream visibility BEFORE the start so History shows WHY
+                    ' the ProcessStarted that follows happened. Custom is an
+                    ' unowned kind — first-come-append.
+                    EmitLifecycle(id, ParsedEventKind.Custom,
+                                  New Dictionary(Of String, String) From {
+                                      {"Event", "boot-resurrect"},
+                                      {"DeadPid", snapshot.Pid.ToString()},
+                                      {"Mode", If(snapshot.ExecutionMode = CInt(ExecutionMode.Shim), "Shim", "Direct")},
+                                      {"Trigger", If(String.Equals(snapshot.State, InstanceState.Stopped.ToString(), StringComparison.OrdinalIgnoreCase), "autostart", "recover")},
+                                      {"Attempt", (attemptCount + 1).ToString()}
+                                  })
+
+                    Dim request = BuildResurrectionRequest(snapshot)
+                    Dim result = Await StartInstanceAsync(request).ConfigureAwait(False)
+
+                    Dim failed = result Is Nothing OrElse
+                                 Not String.IsNullOrEmpty(result.ErrorMessage) OrElse
+                                 result.CurrentState = InstanceState.Stopped OrElse
+                                 result.CurrentState = InstanceState.Crashed
+                    If failed Then
+                        _logger.LogWarning(
+                            "Boot-resurrect: start FAILED for {Id}: {Err}",
+                            id, If(result IsNot Nothing, result.ErrorMessage, "no response"))
+                        Continue For
+                    End If
+
+                    _logger.LogInformation(
+                        "Boot-resurrect: {Id} restarted (PID {Pid}, attempt {Attempt})",
+                        id, result.Pid, attemptCount + 1)
+
+                    ' Healthy-clear: if the SAME run is still alive after the
+                    ' healthy window, drop the flap-guard row so future boots
+                    ' start from a clean count.
+                    Dim resurrectedPid As Integer = If(result.Pid, 0)
+                    Dim clearTask = Task.Run(Async Function()
+                                                 Await Task.Delay(BootResurrectHealthyAfter).ConfigureAwait(False)
+                                                 Try
+                                                     Dim cur As ManagedInstance = Nothing
+                                                     If _instances.TryGetValue(id, cur) AndAlso
+                                                        cur IsNot Nothing AndAlso
+                                                        cur.State = InstanceState.Running AndAlso
+                                                        cur.Pid = resurrectedPid Then
+                                                         _database.ClearBootResurrectAttempt(id)
+                                                         _logger.LogDebug(
+                                                             "Boot-resurrect: {Id} healthy for {Min} min — flap guard cleared",
+                                                             id, BootResurrectHealthyAfter.TotalMinutes)
+                                                     End If
+                                                 Catch
+                                                     ' best-effort
+                                                 End Try
+                                             End Function)
+
+                Catch ex As Exception
+                    _logger.LogError(ex, "Boot-resurrect: pass threw for {Id}", id)
+                End Try
+            Next
+        End Function
+
+        ''' <summary>
+        ''' Rebuilds a StartInstanceRequest from a snapshot's recovery
+        ''' payload — the same fields FinalizeStart persisted from the
+        ''' original Manager-driven start, EnvironmentVars included
+        ''' (EnvironmentVarsJson; see the note above). Both
+        ''' boot flags round-trip so the NEXT snapshot keeps the
+        ''' opt-ins, and NeedsPseudoConsole is derived from the
+        ''' persisted Strategy so a ConPTY instance resurrects under
+        ''' ConPTY instead of silently downgrading.
+        ''' </summary>
+        Private Function BuildResurrectionRequest(snapshot As InstanceSnapshotRow) As StartInstanceRequest
+            Dim request As New StartInstanceRequest With {
+                .InstanceId = snapshot.InstanceId,
+                .ExePath = snapshot.ExePath,
+                .Arguments = snapshot.Arguments,
+                .WorkingDirectory = snapshot.WorkingDirectory,
+                .StdoutIsLog = snapshot.StdoutIsLog,
+                .RequiresConsoleIsolation = snapshot.RequiresConsoleIsolation,
+                .NeedsPseudoConsole = (snapshot.Strategy = CInt(SpawnStrategy.ConPty)),
+                .LogTailerStartDelayMs = snapshot.LogTailerStartDelayMs,
+                .ResurrectOnNodeBoot = snapshot.ResurrectOnBoot,
+                .AutoStartOnNodeBoot = snapshot.AutoStartOnBoot,
+                .CrashCountResetAfterSeconds = snapshot.CrashCountResetAfterSeconds,
+                .MinRestartDelayMs = snapshot.MinRestartDelayMs,
+                .BootStartDelaySeconds = snapshot.BootStartDelaySeconds
+            }
+
+            ' Crash policy (the FinalizeStart-serialized shape).
+            If Not String.IsNullOrEmpty(snapshot.CrashPolicyJson) Then
+                Try
+                    Dim policy = JsonSerializer.Deserialize(Of CrashPolicyState)(snapshot.CrashPolicyJson)
+                    If policy IsNot Nothing Then
+                        Dim parsed As CrashRestartPolicy
+                        If [Enum].TryParse(Of CrashRestartPolicy)(policy.Policy, parsed) Then
+                            request.CrashPolicy = parsed
+                        End If
+                        If policy.MaxCrash > 0 Then request.MaxCrashCount = policy.MaxCrash
+                        If policy.WindowMin > 0 Then request.CrashWindowMinutes = policy.WindowMin
+                    End If
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Boot-resurrect: CrashPolicyJson parse failed for {Id}, using defaults",
+                        snapshot.InstanceId)
+                End Try
+            End If
+
+            If Not String.IsNullOrEmpty(snapshot.LogFilePathsJson) Then
+                Try
+                    request.LogFilePaths = JsonSerializer.Deserialize(Of List(Of String))(snapshot.LogFilePathsJson)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Boot-resurrect: LogFilePathsJson parse failed for {Id}, no tailers",
+                        snapshot.InstanceId)
+                End Try
+            End If
+
+            If Not String.IsNullOrEmpty(snapshot.ParseRulesJson) Then
+                Try
+                    request.LogParseRules = JsonSerializer.Deserialize(Of List(Of LogParseRule))(snapshot.ParseRulesJson)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Boot-resurrect: ParseRulesJson parse failed for {Id}, no rules until Manager re-push",
+                        snapshot.InstanceId)
+                End Try
+            End If
+
+            If Not String.IsNullOrEmpty(snapshot.PollSourcesJson) Then
+                Try
+                    request.PollSources = JsonSerializer.Deserialize(Of List(Of ResolvedStatePollSource))(snapshot.PollSourcesJson)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Boot-resurrect: PollSourcesJson parse failed for {Id}, no poller",
+                        snapshot.InstanceId)
+                End Try
+            End If
+
+            If Not String.IsNullOrEmpty(snapshot.EnvironmentVarsJson) Then
+                Try
+                    request.EnvironmentVars = JsonSerializer.Deserialize(Of Dictionary(Of String, String))(snapshot.EnvironmentVarsJson)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Boot-resurrect: EnvironmentVarsJson parse failed for {Id}, launching without plugin env",
+                        snapshot.InstanceId)
+                End Try
+            Else
+                _logger.LogWarning(
+                    "Boot-resurrect: {Id} snapshot predates EnvironmentVarsJson — launching without plugin env; " &
+                    "one Manager-driven start refreshes it",
+                    snapshot.InstanceId)
+            End If
+
+            Return request
         End Function
 
         ' ============================================================
@@ -1328,6 +2172,15 @@ Namespace GSM.Node
             HiddenConsoleDirect = 1
             ''' <summary>Strategy C: same as B but spawning cmd.exe /S /c "&lt;exe&gt; &lt;args&gt;" so the game inherits cmd's hidden console.</summary>
             HiddenConsoleWrapped = 2
+            ''' <summary>
+            ''' Strategy D (ConPTY, EventStream Slice 4): the shim spawns the
+            ''' game under a pseudoconsole (CreatePseudoConsole) and pumps the
+            ''' rendered VT stream to the Node like stdout — for games that
+            ''' write only via WriteConsole (Palworld). Windows + shim-mode
+            ''' only; resolved from StartInstanceRequest.NeedsPseudoConsole.
+            ''' Appended value — snapshots persist this enum as an int.
+            ''' </summary>
+            ConPty = 3
         End Enum
 
         ''' <summary>
@@ -1381,12 +2234,35 @@ Namespace GSM.Node
                 .LogFilePaths = If(managed.LogFilePaths Is Nothing, Nothing, New List(Of String)(managed.LogFilePaths))
             }
 
+            ' ConPTY protocol gate (Slice 4, load-bearing): resolution happens
+            ' before any handshake, so the version check lives HERE — the
+            ' negotiated shim protocol must be >= 2 or a v1 shim's Strategy
+            ' else-branch would silently spawn the ConPty spec as redirected
+            ' stdio (piped, console-less, capture-dark). Only a flat/dev
+            ' deploy hits this (co-located shims ship with the node); the
+            ' mismatch downgrades to HiddenConsoleDirect — yesterday's
+            ' behaviour, capture dark, nothing breaks — stamped back onto
+            ' managed so snapshot/restart stay coherent.
+            Dim requireProto As Integer = If(managed.Strategy = SpawnStrategy.ConPty, 2, 0)
+
             Dim session As ShimSession = CreateShimSession(managed)
-            Dim ok As Boolean = Await session.StartAsync(spec, 15000, CancellationToken.None).ConfigureAwait(False)
+            Dim ok As Boolean = Await session.StartAsync(spec, 15000, CancellationToken.None,
+                                                         requireProtocolVersion:=requireProto).ConfigureAwait(False)
             If Not ok Then
                 Dim detail = If(String.IsNullOrEmpty(session.LastError),
                                 "no detail from shim session", session.LastError)
                 session.Dispose()
+
+                If managed.Strategy = SpawnStrategy.ConPty AndAlso
+                   detail.StartsWith("shim protocol", StringComparison.OrdinalIgnoreCase) Then
+                    _logger.LogWarning(
+                        "Instance {Id}: deployed shim predates ConPTY (protocol < 2) — downgrading to HiddenConsoleDirect (no console capture) and retrying",
+                        managed.InstanceId)
+                    managed.Strategy = SpawnStrategy.HiddenConsoleDirect
+                    managed.CaptureStdout = False
+                    Return Await StartViaShimAsync(managed).ConfigureAwait(False)
+                End If
+
                 Return detail
             End If
 
@@ -1404,7 +2280,12 @@ Namespace GSM.Node
         ''' </summary>
         Private Async Function AdoptViaShimAsync(managed As ManagedInstance, endpoint As String) As Task(Of Boolean)
             Dim session As ShimSession = CreateShimSession(managed)
-            Dim ok As Boolean = Await session.AdoptAsync(endpoint, 8000, CancellationToken.None).ConfigureAwait(False)
+            ' Ring-cursor (v2 additive): tell the shim what we've already
+            ' consumed so it replays only the gap. 0 (no snapshot cursor /
+            ' sweep-adopt) = full replay, the old behaviour; a pre-cursor
+            ' shim ignores the field and full-replays regardless.
+            Dim ok As Boolean = Await session.AdoptAsync(endpoint, 8000, CancellationToken.None,
+                                                         replayAfterSeq:=managed.ShimRingCursor).ConfigureAwait(False)
             If Not ok Then
                 session.Dispose()
                 Return False
@@ -1422,6 +2303,16 @@ Namespace GSM.Node
         ''' session is created but not yet started/adopted.
         ''' </summary>
         Private Function CreateShimSession(managed As ManagedInstance) As ShimSession
+            ' ConPTY (EventStream Slice 4): a pty session gets the node-side
+            ' VT filter and its parse hits enter the canonical stream as
+            ' SourceId "conpty" — through the SAME ProcessLine parameter the
+            ' tailer uses ("tailer"). That one argument is the entire
+            ' ingestion change: replay dedup, authority (pal-rest owns
+            ' join/leave -> conpty duplicates suppressed with counters),
+            ' folds, /events, Manager sync are all already SourceId-generic.
+            Dim isConPty As Boolean = (managed.Strategy = SpawnStrategy.ConPty)
+            Dim sourceId As String = If(isConPty, "conpty", "stdout")
+
             ' onLine mirrors AttachProcessHandlers.OutputDataReceived: forward
             ' stdout lines to the buffer + EventStore only when CaptureStdout is
             ' set; stderr is drain-only (parity with the direct path).
@@ -1437,7 +2328,7 @@ Namespace GSM.Node
                             .Text = clean,
                             .IsError = False
                         })
-                    _eventStore.ProcessLine(managed.InstanceId, ts, clean)
+                    _eventStore.ProcessLine(managed.InstanceId, ts, clean, sourceId:=sourceId)
                 End Sub
 
             ' onExited mirrors the Process.Exited handler: record the code and
@@ -1455,7 +2346,8 @@ Namespace GSM.Node
                     End Try
                 End Sub
 
-            Return New ShimSession(managed.InstanceId, _shimSocketDir, onLine, onExited, _logger)
+            Return New ShimSession(managed.InstanceId, _shimSocketDir, onLine, onExited, _logger,
+                                   filterVt:=isConPty)
         End Function
 
         ''' <summary>
@@ -1492,6 +2384,12 @@ Namespace GSM.Node
                     strategyName = "A:RedirectedStdio"
                 Case SpawnStrategy.HiddenConsoleWrapped
                     strategyName = "C:CmdWrappedConsole"
+                Case SpawnStrategy.ConPty
+                    ' Defensive: ConPty never reaches the Direct spawn (the
+                    ' DisableShim downgrade rewrites it at resolve time), but
+                    ' if it ever does, the Else-branch below spawns it as a
+                    ' plain hidden console — game runs, capture dark.
+                    strategyName = "D:ConPty(direct-fallback=B)"
                 Case Else
                     strategyName = "B:HiddenConsole"
             End Select
@@ -1586,9 +2484,16 @@ Namespace GSM.Node
         ''' </summary>
         Private Shared Function ResolveStrategy(stdoutIsLog As Boolean,
                                                  requiresConsoleIsolation As Boolean,
-                                                 logFilePaths As IList(Of String)) As SpawnStrategy
+                                                 logFilePaths As IList(Of String),
+                                                 Optional needsPseudoConsole As Boolean = False) As SpawnStrategy
             If Not OperatingSystem.IsWindows() Then Return SpawnStrategy.StdoutCapture
             If stdoutIsLog Then Return SpawnStrategy.StdoutCapture
+            ' ConPTY (Strategy D): the plugin declared its game writes only
+            ' via the console API — give it a pseudoconsole AND capture it.
+            ' Sits below StdoutIsLog (the "stdio capture wins" rule) and
+            ' above everything console-shaped. Windows-only by nature
+            ' (guarded by the IsWindows early-return above).
+            If needsPseudoConsole Then Return SpawnStrategy.ConPty
             If requiresConsoleIsolation Then Return SpawnStrategy.HiddenConsoleWrapped
             Dim hasFileLogs = logFilePaths IsNot Nothing AndAlso logFilePaths.Count > 0
             If hasFileLogs Then Return SpawnStrategy.HiddenConsoleDirect
@@ -2684,7 +3589,7 @@ Namespace GSM.Node
                 .Text = text,
                 .IsError = False
             })
-            _eventStore.ProcessLine(instanceId, ts, text)
+            _eventStore.ProcessLine(instanceId, ts, text, sourceId:="tailer")
         End Sub
 
         ' ============================================================
@@ -2730,12 +3635,291 @@ Namespace GSM.Node
         End Function
 
         ' ============================================================
+        '  Lifecycle event emission (EventStream Slice 1)
+        '
+        '  ProcessManager is the node's own ingestion source for
+        '  lifecycle facts: it appends ProcessStarted / exit /
+        '  crash-policy / adoption events into the same canonical
+        '  stream the parse rules feed, under SourceId "lifecycle".
+        '  This is what makes crash-restart cycles VISIBLE — during
+        '  the July Palworld incident the node silently restarted a
+        '  crashing server five times and the only record was the
+        '  Windows event log. Best-effort by design: stream trouble
+        '  must never break process management (node autonomy).
+        ' ============================================================
+
+        ' ============================================================
+        '  Orphan reaping (incident follow-up #4)
+        ' ============================================================
+
+        ''' <summary>
+        ''' Builds the reap scope roots for an instance: the game
+        ''' executable's directory + the working directory. Wrapper
+        ''' values that aren't rooted paths ("setsid", "cmd.exe")
+        ''' are skipped rather than resolved.
+        ''' </summary>
+        Private Function BuildReapRoots(exePath As String,
+                                        workingDirectory As String) As List(Of String)
+            Dim result As New List(Of String)
+            Try
+                If Not String.IsNullOrWhiteSpace(exePath) AndAlso Path.IsPathRooted(exePath) Then
+                    Dim dir = Path.GetDirectoryName(exePath)
+                    If Not String.IsNullOrEmpty(dir) Then result.Add(dir)
+                End If
+            Catch
+            End Try
+            Try
+                If Not String.IsNullOrWhiteSpace(workingDirectory) AndAlso
+                   Path.IsPathRooted(workingDirectory) Then
+                    result.Add(workingDirectory)
+                End If
+            Catch
+            End Try
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Every pid the node currently owns or tracks as alive —
+        ''' game pids, shim supervisors, metrics processes — across
+        ''' ALL managed instances. The reaper protects these AND
+        ''' their live descendants, which is what keeps a sibling
+        ''' instance of the same installation (tracked cmd wrapper,
+        ''' untracked game child) safe from a reap triggered by its
+        ''' neighbour's crash.
+        ''' </summary>
+        Private Function CollectProtectedPids() As List(Of Integer)
+            Dim pids As New List(Of Integer)
+            For Each kvp In _instances
+                Dim m = kvp.Value
+                Try
+                    If m.Pid > 0 Then pids.Add(m.Pid)
+                    If m.ShimPid > 0 Then pids.Add(m.ShimPid)
+                    If m.Process IsNot Nothing Then
+                        Try
+                            If Not m.Process.HasExited Then pids.Add(m.Process.Id)
+                        Catch
+                        End Try
+                    End If
+                    If m.MetricsProcess IsNot Nothing Then
+                        Try
+                            If Not m.MetricsProcess.HasExited Then pids.Add(m.MetricsProcess.Id)
+                        Catch
+                        End Try
+                    End If
+                Catch
+                End Try
+            Next
+            Return pids
+        End Function
+
+        ''' <summary>
+        ''' One reap pass for an instance (crash-restart and halt
+        ''' paths). Logs what it did and appends a Custom
+        ''' "orphan-reap" event to the instance's stream when
+        ''' anything was killed or a port stayed busy — so the fact
+        ''' is visible in History-side diagnostics, not just node
+        ''' logs. Best-effort by design: never throws.
+        ''' </summary>
+        Private Sub ReapOrphansForInstance(managed As ManagedInstance, context As String)
+            Try
+                If Not OperatingSystem.IsWindows() Then Return
+                Dim roots = managed.ReapRoots
+                If roots Is Nothing OrElse roots.Count = 0 Then Return
+
+                ' The dead instance's own last-known pids must NOT
+                ' be protected (they're the orphan tree's origin) —
+                ' CollectProtectedPids naturally skips them because
+                ' the dead pid no longer appears alive, but the
+                ' ManagedInstance's stale Pid value would protect a
+                ' RECYCLED pid. Acceptable: a recycled pid under the
+                ' install root is indistinguishable from a live
+                ' sibling by pid alone, and the next reap pass (or
+                ' manual action) covers the rare miss.
+                Dim report = OrphanReaper.Reap(roots, CollectProtectedPids(), _logger)
+
+                If report.AnyActivity Then
+                    _logger.LogWarning(
+                        "Orphan reap ({Context}) for {Id}: candidates={Candidates} killed=[{Killed}] survivors=[{Survivors}] freedPorts=[{Freed}] busyPorts=[{Busy}]",
+                        context, managed.InstanceId, report.CandidateCount,
+                        String.Join(",", report.KilledPids),
+                        String.Join(",", report.SurvivorPids),
+                        String.Join(",", report.FreedPorts),
+                        String.Join(",", report.BusyPorts))
+                    ' Custom kind (unowned — first-come-append), same
+                    ' "lifecycle" source as the surrounding crash
+                    ' events. Not folded; purely a durable record.
+                    EmitLifecycle(managed.InstanceId, ParsedEventKind.Custom,
+                                  New Dictionary(Of String, String) From {
+                                      {"Custom_OrphanReap", context},
+                                      {"KilledPids", String.Join(",", report.KilledPids)},
+                                      {"SurvivorPids", String.Join(",", report.SurvivorPids)},
+                                      {"FreedPorts", String.Join(",", report.FreedPorts)},
+                                      {"BusyPorts", String.Join(",", report.BusyPorts)}
+                                  })
+                Else
+                    _logger.LogDebug(
+                        "Orphan reap ({Context}) for {Id}: no orphans under [{Roots}]",
+                        context, managed.InstanceId, String.Join("; ", roots))
+                End If
+            Catch ex As Exception
+                _logger.LogWarning(ex, "Orphan reap failed for {Id}", managed.InstanceId)
+            End Try
+        End Sub
+
+        Private Sub EmitLifecycle(instanceId As String,
+                                  kind As ParsedEventKind,
+                                  fields As Dictionary(Of String, String))
+            Try
+                _events.Append(EventScopeType.Instance, instanceId,
+                               DateTime.UtcNow, kind, "lifecycle", fields, Nothing)
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "Failed to append lifecycle event {Kind} for {Id}", kind, instanceId)
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Builds and installs the per-kind source-authority map
+        ''' for an instance from its poll-source declarations
+        ''' (EventStream Slice 2). First declared owner wins on a
+        ''' conflicting claim (logged — a conflict is a plugin
+        ''' bug); EventStreamStore itself forces lifecycle kinds to
+        ''' the node's own emitter regardless of what we pass.
+        ''' Always called — even with no poll sources — so the
+        ''' lifecycle-kind protection is installed for every
+        ''' instance.
+        ''' </summary>
+        ''' <summary>Fallback cadence for a PARTIALLY demoted poll source
+        ''' (some of its claimed kinds still console-less). A FULLY demoted
+        ''' source isn't polled at all — see InstallAuthority.</summary>
+        Private Const FallbackPollIntervalSeconds As Integer = 60
+
+        ''' <returns>The poll sources that should actually run — callers
+        ''' pass this to StartPollers instead of managed.PollSources.
+        ''' managed.PollSources itself is NOT mutated structurally (the
+        ''' full list still persists in the snapshot for later starts).</returns>
+        Private Function InstallAuthority(managed As ManagedInstance) As List(Of ResolvedStatePollSource)
+            ' Console-first authority (C4b flip, 2026-08-11): when the
+            ' instance has a live line-capture source AND a parse rule for a
+            ' kind, the CONSOLE owns that kind; a poll source claiming it is
+            ' demoted to FALLBACK — its copies suppress (observable in
+            ' /events/sources) and its cadence stretches to reconciliation
+            ' speed. Operator rationale from the live Palworld run: console
+            ' lines survive node downtime via the shim ring (poller-
+            ' synthesized events during downtime are simply lost), and an
+            ' authoritative poller floods the game's console with its own
+            ' request-log chatter every few seconds. Instances with no
+            ' capture source or no rule for the kind keep the old behaviour
+            ' (the poll source's claim stands).
+            Dim lineSource As String = Nothing
+            If managed.Strategy = SpawnStrategy.ConPty Then
+                lineSource = "conpty"
+            ElseIf managed.CaptureStdout Then
+                lineSource = "stdout"
+            ElseIf managed.LogFilePaths IsNot Nothing AndAlso managed.LogFilePaths.Count > 0 Then
+                lineSource = "tailer"
+            End If
+
+            Dim ruleKinds As New HashSet(Of ParsedEventKind)
+            If lineSource IsNot Nothing AndAlso managed.ParseRules IsNot Nothing Then
+                For Each r In managed.ParseRules
+                    If r IsNot Nothing Then ruleKinds.Add(r.Kind)
+                Next
+            End If
+
+            Dim owners As New Dictionary(Of ParsedEventKind, String)
+            Dim pollable As New List(Of ResolvedStatePollSource)
+            If managed.PollSources IsNot Nothing Then
+                For Each src In managed.PollSources
+                    If src Is Nothing OrElse String.IsNullOrWhiteSpace(src.SourceId) Then Continue For
+                    If src.AuthoritativeKinds Is Nothing OrElse src.AuthoritativeKinds.Count = 0 Then
+                        ' No authority claims: its events are unowned/
+                        ' first-come — poll as always.
+                        pollable.Add(src)
+                        Continue For
+                    End If
+                    Dim demotedKinds As List(Of ParsedEventKind) = Nothing
+                    For Each k In src.AuthoritativeKinds
+                        If ruleKinds.Contains(k) Then
+                            ' Console rules cover this kind — the capture
+                            ' source owns it; this poll source's copies
+                            ' would be suppressed at append.
+                            If Not owners.ContainsKey(k) Then owners(k) = lineSource
+                            If demotedKinds Is Nothing Then demotedKinds = New List(Of ParsedEventKind)
+                            demotedKinds.Add(k)
+                            Continue For
+                        End If
+                        Dim existing As String = Nothing
+                        If owners.TryGetValue(k, existing) Then
+                            If Not String.Equals(existing, src.SourceId, StringComparison.Ordinal) Then
+                                _logger.LogWarning(
+                                    "Conflicting authority claim for {Kind} on {Id}: '{First}' keeps it, '{Second}' ignored",
+                                    k, managed.InstanceId, existing, src.SourceId)
+                            End If
+                        Else
+                            owners(k) = src.SourceId
+                        End If
+                    Next
+                    If demotedKinds Is Nothing Then
+                        pollable.Add(src)
+                    ElseIf demotedKinds.Count = src.AuthoritativeKinds.Count Then
+                        ' FULLY demoted: every event this source exists to
+                        ' synthesize would be authority-suppressed on
+                        ' append — polling would be pure overhead (plus
+                        ' console chatter for games that log REST access).
+                        ' Don't run it at all. Trade-off: no more
+                        ' "not answering/recovered" liveness warnings for
+                        ' this source; REST health surfaces at stop-flow
+                        ' time instead. The source stays in
+                        ' managed.PollSources/the snapshot, so a later
+                        ' start without console rules brings it back.
+                        _logger.LogInformation(
+                            "Poll source '{Src}' for {Id} not started — console ({Line}) owns all its kinds ({Kinds}); REST is stop-flow only now",
+                            src.SourceId, managed.InstanceId, lineSource,
+                            String.Join(",", demotedKinds))
+                    Else
+                        ' PARTIALLY demoted: still authoritative for some
+                        ' kinds — keep polling, but at fallback cadence.
+                        Dim oldInterval = src.IntervalSeconds
+                        If src.IntervalSeconds < FallbackPollIntervalSeconds Then
+                            src.IntervalSeconds = FallbackPollIntervalSeconds
+                        End If
+                        _logger.LogInformation(
+                            "Poll source '{Src}' for {Id} partially demoted — console ({Line}) owns {Kinds}; poll interval {Old}s → {New}s",
+                            src.SourceId, managed.InstanceId, lineSource,
+                            String.Join(",", demotedKinds), oldInterval, src.IntervalSeconds)
+                        pollable.Add(src)
+                    End If
+                Next
+            End If
+            _events.SetAuthority(EventScopeType.Instance, managed.InstanceId, owners)
+            Return pollable
+        End Function
+
+        Private Function DeserializePollSources(snapshot As InstanceSnapshotRow,
+                                                id As String) As IList(Of ResolvedStatePollSource)
+            If String.IsNullOrEmpty(snapshot.PollSourcesJson) Then Return Nothing
+            Try
+                Return JsonSerializer.Deserialize(Of List(Of ResolvedStatePollSource))(snapshot.PollSourcesJson)
+            Catch ex As Exception
+                _logger.LogWarning(ex,
+                    "Snapshot {Id}: PollSourcesJson parse failed — polling off until the next full start", id)
+                Return Nothing
+            End Try
+        End Function
+
+        ' ============================================================
         '  Crash handling
         ' ============================================================
 
         Private Sub HandleProcessExited(managed As ManagedInstance)
             ' Always stop file tailers when the process exits.
             StopFileTailers(managed)
+
+            ' Stop state pollers with the run they belong to — each
+            ' game run gets a fresh poller set (FinalizeStart), which
+            ' is what makes the restart-debounce baseline work.
+            _pollers.StopPollers(managed.InstanceId)
 
             ' Clear parsed in-memory state (chat history persists in SQLite)
             _eventStore.UnregisterInstance(managed.InstanceId)
@@ -2785,12 +3969,21 @@ Namespace GSM.Node
                 ' Intentional stop — don't treat as crash
                 managed.State = InstanceState.Stopped
                 managed.StateChangedAt = DateTime.UtcNow
-                _database.RemoveInstanceSnapshot(managed.InstanceId)
+                ClearOrParkSnapshot(managed)
+                EmitLifecycle(managed.InstanceId, ParsedEventKind.ProcessExited,
+                              New Dictionary(Of String, String) From {
+                                  {"ExitCode", exitCode.ToString()}
+                              })
                 Return
             End If
 
             _logger.LogWarning("Instance {InstanceId} exited unexpectedly (code {ExitCode})",
                                managed.InstanceId, exitCode)
+
+            EmitLifecycle(managed.InstanceId, ParsedEventKind.ProcessExitedUnexpectedly,
+                          New Dictionary(Of String, String) From {
+                              {"ExitCode", exitCode.ToString()}
+                          })
 
             ' Evaluate restart policy
             Dim decision = EvaluateRestartPolicy(managed, exitCode)
@@ -2805,6 +3998,16 @@ Namespace GSM.Node
                     managed.StateChangedAt = DateTime.UtcNow
                     managed.CrashCount += 1
 
+                    ' Incident follow-up #3: "restarted N/5" is now a
+                    ' stream fact instead of node-private state.
+                    EmitLifecycle(managed.InstanceId, ParsedEventKind.CrashRestartScheduled,
+                                  New Dictionary(Of String, String) From {
+                                      {"ExitCode", exitCode.ToString()},
+                                      {"CrashCount", managed.CrashCount.ToString()},
+                                      {"MaxCrashCount", managed.MaxCrashCount.ToString()},
+                                      {"DelayMs", decision.DelayMs.ToString()}
+                                  })
+
                     ' Schedule delayed restart. Re-check StopIntentPending
                     ' after the backoff so a Stop request issued during the
                     ' Crashed window (between exit and the next spawn)
@@ -2816,13 +4019,19 @@ Namespace GSM.Node
                     ' queued task fires and resurrects the process anyway,
                     ' clearing StopIntentPending in FinalizeStart.
                     Task.Run(Async Function()
+                                 ' Orphan reaping (incident follow-up #4):
+                                 ' kill ex-children of the dead process
+                                 ' BEFORE the backoff delay, so the ports
+                                 ' they held are demonstrably free by the
+                                 ' time the fresh spawn tries to bind.
+                                 ReapOrphansForInstance(managed, "crash-restart")
                                  If decision.DelayMs > 0 Then
                                      Await Task.Delay(decision.DelayMs)
                                  End If
                                  If managed.StopIntentPending Then
                                      managed.State = InstanceState.Stopped
                                      managed.StateChangedAt = DateTime.UtcNow
-                                     _database.RemoveInstanceSnapshot(managed.InstanceId)
+                                     ClearOrParkSnapshot(managed)
                                      _logger.LogInformation(
                                          "Restart cancelled for {Id}: stop requested during backoff",
                                          managed.InstanceId)
@@ -2836,6 +4045,17 @@ Namespace GSM.Node
                     managed.StateChangedAt = DateTime.UtcNow
                     _logger.LogError("Instance {InstanceId} entered CrashLoopHalted: {Reason}",
                                      managed.InstanceId, decision.Reason)
+                    EmitLifecycle(managed.InstanceId, ParsedEventKind.CrashLoopHalted,
+                                  New Dictionary(Of String, String) From {
+                                      {"ExitCode", exitCode.ToString()},
+                                      {"Reason", If(decision.Reason, "")}
+                                  })
+
+                    ' Orphan reaping on the halt path too (incident
+                    ' follow-up #4 — the July survivor held its ports
+                    ' through exactly this transition). Off-thread:
+                    ' we're inside the process-exit continuation.
+                    Task.Run(Sub() ReapOrphansForInstance(managed, "crash-loop-halt"))
 
                 Case Else
                     managed.State = InstanceState.Stopped
@@ -2895,6 +4115,10 @@ Namespace GSM.Node
                 managed.StateChangedAt = DateTime.UtcNow
                 _logger.LogError("Cannot restart instance {InstanceId}: StartInfo missing",
                                  managed.InstanceId)
+                EmitLifecycle(managed.InstanceId, ParsedEventKind.CrashLoopHalted,
+                              New Dictionary(Of String, String) From {
+                                  {"Reason", "Cannot restart: StartInfo missing (lean-adopted instance)"}
+                              })
                 Return
             End If
 
@@ -2902,11 +4126,27 @@ Namespace GSM.Node
                 If managed.ExecutionMode = ExecutionMode.Shim Then
                     ' Shim mode: the old shim was torn down on exit
                     ' (HandleProcessExited). Launch a fresh supervisor.
-                    Dim shimOk As Boolean = Await StartViaShimAsync(managed).ConfigureAwait(False)
-                    If Not shimOk Then
+                    '
+                    ' NOTE (fixed in EventStream Slice 1, 2026-08-02):
+                    ' StartViaShimAsync returns a STRING — Nothing on
+                    ' success, the failure detail otherwise (matching
+                    ' the StartInstanceAsync call site). This line
+                    ' previously read the result into a Boolean, which
+                    ' under Option Strict Off coerced the success value
+                    ' (Nothing) to False — so every successful shim
+                    ' crash-restart was mislabelled a failure and the
+                    ' instance went CrashLoopHalted while its fresh
+                    ' game process kept running unsupervised.
+                    Dim shimErr As String = Await StartViaShimAsync(managed).ConfigureAwait(False)
+                    If shimErr IsNot Nothing Then
                         managed.State = InstanceState.CrashLoopHalted
                         managed.StateChangedAt = DateTime.UtcNow
-                        _logger.LogError("Failed to restart shim instance {InstanceId}", managed.InstanceId)
+                        _logger.LogError("Failed to restart shim instance {InstanceId}: {Detail}",
+                                         managed.InstanceId, shimErr)
+                        EmitLifecycle(managed.InstanceId, ParsedEventKind.CrashLoopHalted,
+                                      New Dictionary(Of String, String) From {
+                                          {"Reason", "Shim restart failed: " & shimErr}
+                                      })
                         Return
                     End If
                     FinalizeStart(managed, Nothing)
@@ -2923,6 +4163,10 @@ Namespace GSM.Node
                         managed.State = InstanceState.CrashLoopHalted
                         managed.StateChangedAt = DateTime.UtcNow
                         _logger.LogError("Failed to restart instance {InstanceId}", managed.InstanceId)
+                        EmitLifecycle(managed.InstanceId, ParsedEventKind.CrashLoopHalted,
+                                      New Dictionary(Of String, String) From {
+                                          {"Reason", "Restart spawn failed"}
+                                      })
                         Return
                     End If
 
@@ -2932,6 +4176,10 @@ Namespace GSM.Node
                 managed.State = InstanceState.CrashLoopHalted
                 managed.StateChangedAt = DateTime.UtcNow
                 _logger.LogError(ex, "Exception restarting instance {InstanceId}", managed.InstanceId)
+                EmitLifecycle(managed.InstanceId, ParsedEventKind.CrashLoopHalted,
+                              New Dictionary(Of String, String) From {
+                                  {"Reason", "Restart threw: " & ex.Message}
+                              })
             End Try
 
             ' Async is kept on the signature for consistency with the
@@ -3064,6 +4312,16 @@ Namespace GSM.Node
             managed.StateChangedAt = DateTime.UtcNow
             managed.StopIntentPending = False
 
+            ' Lifecycle stream: every (re)start lands here — fresh
+            ' starts and crash-restarts alike — so ProcessStarted is
+            ' emitted from the one chokepoint both paths share.
+            EmitLifecycle(managed.InstanceId, ParsedEventKind.ProcessStarted,
+                          New Dictionary(Of String, String) From {
+                              {"Pid", managed.Pid.ToString()},
+                              {"Mode", managed.ExecutionMode.ToString()},
+                              {"Strategy", managed.Strategy.ToString()}
+                          })
+
             ' Register parse rules with the event store so it can
             ' track players / server state from log lines. The
             ' matching UnregisterInstance call lives in
@@ -3103,6 +4361,12 @@ Namespace GSM.Node
                 StartFileTailers(managed, managed.LogFilePaths)
             End If
 
+            ' Slice 2: install the source-authority map (dedupe
+            ' opt-in; lifecycle kinds always node-owned) and start
+            ' the state pollers for this run. Both are per-run so a
+            ' crash-restart re-baselines cleanly.
+            _pollers.StartPollers(managed.InstanceId, InstallAuthority(managed))
+
             ' Persist everything needed for re-adoption on next
             ' node startup. See ProcessManager.AdoptSnapshots for
             ' the read path. Serialization wrapped in try-catch
@@ -3127,6 +4391,28 @@ Namespace GSM.Node
                 Catch ex As Exception
                     _logger.LogWarning(ex,
                         "Failed to serialize ParseRules for snapshot of {Id}",
+                        managed.InstanceId)
+                End Try
+            End If
+
+            Dim pollSourcesJson As String = Nothing
+            If managed.PollSources IsNot Nothing AndAlso managed.PollSources.Count > 0 Then
+                Try
+                    pollSourcesJson = JsonSerializer.Serialize(managed.PollSources)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Failed to serialize PollSources for snapshot of {Id}",
+                        managed.InstanceId)
+                End Try
+            End If
+
+            Dim envVarsJson As String = Nothing
+            If managed.EnvironmentVars IsNot Nothing AndAlso managed.EnvironmentVars.Count > 0 Then
+                Try
+                    envVarsJson = JsonSerializer.Serialize(managed.EnvironmentVars)
+                Catch ex As Exception
+                    _logger.LogWarning(ex,
+                        "Failed to serialize EnvironmentVars for snapshot of {Id}",
                         managed.InstanceId)
                 End Try
             End If
@@ -3166,7 +4452,15 @@ Namespace GSM.Node
                 managed.ShimEndpoint,
                 managed.ShimPid,
                 managed.ShimProtocolVersion,
-                CInt(managed.ExecutionMode))
+                CInt(managed.ExecutionMode),
+                pollSourcesJson,
+                managed.ResurrectOnBoot,
+                managed.AutoStartOnBoot,
+                If(managed.Shim IsNot Nothing, managed.Shim.ConsumedRingSeq, managed.ShimRingCursor),
+                envVarsJson,
+                managed.CrashCountResetAfterSeconds,
+                managed.MinRestartDelayMs,
+                managed.BootStartDelaySeconds)
 
             ' If the instance stays up long enough, clear CrashCount
             ' so the next crash starts from a clean backoff baseline.
@@ -3338,9 +4632,38 @@ Namespace GSM.Node
         ''' </summary>
         Public Property MinRestartDelayMs As Integer = 0
 
+        ''' <summary>Plugin launch env overrides from the original
+        ''' StartInstanceRequest, persisted to the snapshot so a
+        ''' boot-resurrect launches identically to a Manager start.</summary>
+        Public Property EnvironmentVars As Dictionary(Of String, String)
+
         Public Property StopIntentPending As Boolean
         Public Property CrashCount As Integer
         Public Property LastExitCode As Integer?
+
+        ''' <summary>
+        ''' Node-boot resurrection opt-in, from
+        ''' StartInstanceRequest.ResurrectOnNodeBoot. Persisted on the
+        ''' snapshot (FinalizeStart) so the boot-resurrection pass can
+        ''' see it when the adopt finds the process dead.
+        ''' </summary>
+        Public Property ResurrectOnBoot As Boolean
+
+        ''' <summary>
+        ''' Unconditional node-boot autostart ("Auto start with node"),
+        ''' from StartInstanceRequest.AutoStartOnNodeBoot. Persisted on
+        ''' the snapshot; stops PARK the snapshot (State=Stopped)
+        ''' instead of deleting it so every node boot can start the
+        ''' instance from the parked payload.
+        ''' </summary>
+        Public Property AutoStartOnBoot As Boolean
+
+        ''' <summary>
+        ''' Boot stagger from StartInstanceRequest.BootStartDelaySeconds;
+        ''' persisted on the snapshot so the resurrection pass can
+        ''' order and space launches. Not consulted by Manager starts.
+        ''' </summary>
+        Public Property BootStartDelaySeconds As Integer
 
         ' ---- Shim execution (Phase 8-1) ----
 
@@ -3358,6 +4681,12 @@ Namespace GSM.Node
 
         ''' <summary>The shim's pipe/socket endpoint (for adoption in slice 3).</summary>
         Public Property ShimEndpoint As String
+
+        ''' <summary>Ring-cursor (v2 additive): last shim ring-frame seq known
+        ''' persisted for this instance. Loaded from the snapshot before adopt
+        ''' (becomes Hello.ReplayAfterSeq), advanced by the periodic cursor
+        ''' persist so DB writes only happen when the value moved.</summary>
+        Public Property ShimRingCursor As Long
 
         ''' <summary>Negotiated shim protocol version.</summary>
         Public Property ShimProtocolVersion As Integer
@@ -3403,6 +4732,15 @@ Namespace GSM.Node
         ''' player/state tracking goes dark after any crash-restart.
         ''' </summary>
         Public Property ParseRules As IList(Of LogParseRule)
+
+        ''' <summary>Resolved state-poll sources for this run
+        ''' (EventStream Slice 2); Nothing/empty = no poller.</summary>
+        Public Property PollSources As IList(Of ResolvedStatePollSource)
+
+        ''' <summary>Directories whose processes belong to this
+        ''' instance for orphan-reaping purposes (game exe dir +
+        ''' working dir; pre-wrap values). See OrphanReaper.</summary>
+        Public Property ReapRoots As List(Of String)
 
         ''' <summary>
         ''' Whether stdout/stderr should be written to the ring

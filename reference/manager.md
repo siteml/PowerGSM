@@ -1726,3 +1726,77 @@ the idle binary (no bounce, no auto-revert), shim = versioned install at commit
 `GSM.Manager\Core\NodeReleaseSource.vb` (`target` arg + `LocateTargetBinary`).
 No `GSM.Contracts` change — `StageBinaryAsync` / `ApplyUpdateAsync` already took
 an arbitrary target + version.
+
+**Picker input (2026-10):** one self-contained single-file binary per target,
+from `publish-drop\<version>\` — never the plain-Build apphost stub (see
+`build-and-project.md`). CtrlCSender is not a target yet.
+
+---
+
+## HTTPS onboarding, node security actions (0.7.0 — live via 0.6.x, Oct 2026)
+
+Design: `docs/plans/HTTPS_SinglePort_Plan.md`. Node side: `node.md`.
+
+**Trust model.** `NodeHttpClient.CreateHandler()` is the single trust point:
+with `UseTls` the handler's validation callback compares the presented cert's
+SHA-256 against `NodeEntity.PinnedCertFingerprint` (`FixedTimeEquals`); chain
+and hostname are ignored. `NodeTlsSettings.IsUsable = UseTls AndAlso pin`
+(port not required); `EffectivePort` = `TlsPort` if > 0 else the listen port.
+`NodeHttpClientFactory.GetClient` rebuilds on the current transport; a
+resolver failure never downgrades to HTTP.
+
+**Exception classification** (`WrapException`, 0.6.3): only a *pin rejection*
+(the callback sets `_pinRejected`) maps to `NodeCertificateException`. Any
+other `AuthenticationException` — above all "unexpected packet format" from
+dialling HTTPS at a listener still speaking plaintext (node mid-restart) — is
+`NodeConnectionException`. Before this fix every fresh enable aborted at
+verify as a false MITM. Status codes still map to `NodeApiException`.
+
+**`TlsOnboardingService`** (`Core\`), all methods return `Nothing` or an
+operator-readable error:
+
+| Method | Does |
+|---|---|
+| `ProbeAsync` | DB short-circuit (`UseTls`+Active → `ActiveHere`) else `/api/version` → NotSupported / SupportedNotEnabled / EnabledNotAdopted |
+| `EnableTlsAsync` | `POST /api/tls/enable` over authed HTTP (TOFU: the reply's fingerprint is the pin, `TlsPort` as reported), then `VerifyAndActivateAsync` |
+| `VerifyAndActivateAsync` | polls pinned HTTPS ≤ 90 s; authenticated `/api/tls/status` confirms; flips `UseTls`/Active, evicts client. Pin rejection → `FingerprintMismatch`, abort |
+| `AdoptExistingTlsAsync` | pin from HTTP `/api/tls/status`, then verify |
+| `MoveTlsToSharedPortAsync` | alt-port node → `enable {TlsPort=0}` over the pinned alt-port channel; fingerprint must equal the pin; `TlsPort` = listen port; re-verify |
+| `GetHttpModeAsync` / `SetHttpModeAsync` | over pinned HTTPS; `Set` waits for the node to come back. `Get` marks `FingerprintMismatch` on a pin failure |
+| `RotateTokenAsync` | **stores the new 64-hex token locally first**, sends over pinned HTTPS; refusal/404 → revert; lost reply → probe both tokens after restart and keep the one the node answers to |
+| `SecureNodeAsync(nodeId, progress, ct, rotateToken)` | probe → enable / adopt / port-move → HTTP `Disabled` → rotate. Idempotent per step; each step is also a panel link |
+| `GetReportedFingerprintAsync` | HTTP status first, else unpinned HTTPS handshake (`ProbePresentedFingerprintAsync`) — so re-trust works with HTTP off |
+| `RollbackToHttp` / `MarkMismatch` / `RetrustAsync` | as named; rollback is refused by the panel while `HttpMode ≠ Open` |
+
+**NodePanel** (`UiPanels.vb`). Status row: "Restart node…", "Shut down
+node…" (double-confirm, default No — the node will not come back on its own),
+"Rotate auth token…". TLS row by state: SupportedNotEnabled → **"Secure this
+node…"** + "Advanced: enable HTTPS only…"; EnabledNotAdopted → "Trust
+certificate…"; Enabling → "Verify HTTPS now"; Mismatch → "Re-trust
+certificate…"; Active → "Switch back to HTTP" + HTTP-mode link (Restrict /
+Re-open) + third slot "Move HTTPS to shared port…" or "Turn HTTP off…". The
+Active branch renders from the DB and only dials for `HttpMode`; an empty
+result re-reads the entity so a real pin failure surfaces as Mismatch, else
+it says "HTTP mode unknown" rather than guessing. `NodeControlFailureHint`
+maps 404 (old node) / 429 (lockout) / 401 (token) on the control dialogs.
+
+**Fleet:** Nodes → "Secure All Nodes (HTTPS)…" (`SecureNodesForm`): lists
+nodes not fully secured (Active + HTTP off + shared port) — or every Active
+node when "Rotate auth tokens" is ticked (default) — with a Running count;
+rows with running instances start unticked; sequential
+`SecureNodeAsync`, per-row result, failures don't stop the run.
+
+**Add/Edit Node** (`NodeSetupForm`): optional "Cert SHA-256". Add with a
+fingerprint → row created `UseTls=True, Active, TlsPort=0` and Test
+Connection runs pinned on the typed port (fresh node never speaks plaintext;
+needs slice 2 for the node to have a cert pre-enable). Edit shows the pin
+read-only and tests on the recorded `TlsPort`.
+
+**Long-lived clients after rotation (0.6.5 fix):** anything that captures a
+`NodeHttpClient` for the life of a loop must re-resolve it on every
+reconnect/pull — `EventSyncService` did not, kept the old token after
+`RotateTokenAsync` evicted the cache, and the node's `AuthFailureTracker`
+locked the Manager's IP (every call 429) until the Manager was restarted.
+Audit any new holder for the same pattern.
+
+**Diagnostics** probe grid TLS column: `n/a` / `off` / `shared` / `alt :N`.

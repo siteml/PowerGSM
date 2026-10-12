@@ -1,5 +1,5 @@
-' <plugin id="palworld" name="Palworld Dedicated Server" version="0.2.0" author="siteml" requiresContracts="3">
-' <RequiresContracts: 3>
+' <plugin id="palworld" name="Palworld Dedicated Server" version="0.3.0" author="siteml" requiresContracts="4">
+' <RequiresContracts: 4>
 Imports System
 Imports System.Collections.Concurrent
 Imports System.Collections.Generic
@@ -72,6 +72,7 @@ Public Class PalworldPlugin
     Implements IInstanceFileEditorProvider
     Implements IManagedDirectoriesProvider
     Implements IRemoteControlProvider
+    Implements IStatePollProvider
 
     Public ReadOnly Property GameId As String = "palworld" Implements IGamePlugin.GameId
     Public ReadOnly Property DisplayName As String = "Palworld" Implements IGamePlugin.DisplayName
@@ -205,6 +206,20 @@ Public Class PalworldPlugin
             args.Add($"-port={port}")
         End If
 
+        ' Steam query port (2026-08-29). UNDOCUMENTED by Pocketpair
+        ' but widely confirmed (Steam forums, LinuxGSM users): the
+        ' server initialises Steam GameServer on 27015/UDP and there
+        ' is no INI key for it. Two instances on one host without
+        ' this both fight for 27015 — the loser spams
+        ' "CreateBoundSocket: ::bind couldn't find an open port
+        ' between 27015 and 27015" every few ms (live-observed
+        ' 08-28 with Palworld 1 + Palworld - stream up together).
+        ' Blank/0 = don't pass the flag (game default 27015).
+        Dim queryPort As Integer
+        If Integer.TryParse(GetField(fields, "QueryPort"), queryPort) AndAlso queryPort > 0 Then
+            args.Add($"-queryport={queryPort}")
+        End If
+
         Dim publicLobby As Boolean
         If Boolean.TryParse(GetField(fields, "PublicLobby"), publicLobby) AndAlso publicLobby Then
             args.Add("-publiclobby")
@@ -214,10 +229,15 @@ Public Class PalworldPlugin
     End Function
 
     Public Function ValidateConfig(config As InstanceConfig) As IReadOnlyList(Of String) Implements IGamePlugin.ValidateConfig
-        ' Slice 1's only instance field is a bool the schema already
-        ' constrains. Cross-field rules (e.g. -publiclobby without a
-        ' PublicIP) arrive with the Slice 2/3 fields.
-        Return New List(Of String)
+        Dim errors As New List(Of String)
+        Dim fields = If(config IsNot Nothing, config.CustomFields, Nothing)
+        Dim port, queryPort As Integer
+        If Integer.TryParse(GetField(fields, "Port"), port) AndAlso
+           Integer.TryParse(GetField(fields, "QueryPort"), queryPort) AndAlso
+           port > 0 AndAlso queryPort > 0 AndAlso port = queryPort Then
+            errors.Add("Steam query port must differ from the game port.")
+        End If
+        Return errors
     End Function
 
     ' ============================================================
@@ -241,6 +261,16 @@ Public Class PalworldPlugin
                 .Description = "The port the server listens on (-port=). Forward this UDP port on your router. PowerGSM allocates and clash-checks it across all instances on the node. Note: this is the real bind port — the PublicPort setting in PalWorldSettings.ini is only the advertised port for the community browser.",
                 .FieldType = ConfigFieldType.IntegerField,
                 .DefaultValue = "8211",
+                .MinValue = 1024,
+                .MaxValue = 65535,
+                .IsPort = True
+            },
+            New ConfigFieldDescriptor With {
+                .Key = "QueryPort",
+                .Label = "Steam query port (UDP)",
+                .Description = "Steam server-browser/query port (-queryport=). Palworld defaults to 27015 and does NOT expose this in PalWorldSettings.ini; every Palworld instance on the same node needs its own value or the second one floods its console with 'CreateBoundSocket: ::bind couldn't find an open port between 27015 and 27015'. Undocumented switch, but confirmed working by the community. PowerGSM allocates and clash-checks it across all instances on the node.",
+                .FieldType = ConfigFieldType.IntegerField,
+                .DefaultValue = "27015",
                 .MinValue = 1024,
                 .MaxValue = 65535,
                 .IsPort = True
@@ -306,14 +336,21 @@ Public Class PalworldPlugin
         ' Palworld writes NO file log (mod required). Stdout capture
         ' on Windows yields NOTHING useful — UE writes its log via
         ' the console API (WriteConsole), not the stdout handle, so
-        ' a redirected pipe only sees stray CRT/stderr output (the
-        ' only captured lines were Steamworks tier0 thread-
-        ' termination asserts at shutdown). Graceful stop stayed
-        ' fast with capture on, so no harm — just no signal.
+        ' a redirected pipe only sees stray CRT/stderr output.
         '
-        ' Windows: inert file source (path never exists) — keeps the
-        '   hidden-console direct spawn; observability arrives with
-        '   Slice 4's REST client (/players, /info, /metrics).
+        ' ConPTY (0.3.0, EventStream Slice 4): Windows capture now
+        ' comes from the pseudoconsole spawn — GetLaunchOptions sets
+        ' NeedsPseudoConsole, the node gives the game a console it
+        ' can ALSO read, and the console text flows into the log
+        ' buffer + parse pipeline as SourceId "conpty". The OLD
+        ' Windows entry here — an inert FileLogSource whose path
+        ' never exists — existed purely to force the hidden-console
+        ' spawn; it is DELETED because (a) NeedsPseudoConsole now
+        ' states that intent directly, and (b) a declared file log
+        ' would switch CaptureStdout off under the node's
+        ' capture rule, silencing the pty text.
+        '
+        ' Windows: no sources — the ConPTY stream is the log surface.
         ' Linux: stdout capture — no console/stdio split there, the
         '   server's output goes to real stdout. VERIFY on the
         '   linux-test node with the Linux run.
@@ -323,15 +360,72 @@ Public Class PalworldPlugin
                     New StdoutLogSource()
                 }
             Case Else
-                Return New ILogSource() {
-                    New FileLogSource("pal", "{InstallPath}/Pal/Saved/Logs/Pal.log")
-                }
+                Return New ILogSource() {}
         End Select
     End Function
 
     Public Function GetLogParseRules() As IReadOnlyList(Of LogParseRule) Implements IGamePlugin.GetLogParseRules
-        ' Later slice — blocked on live captures.
-        Return New LogParseRule() {}
+        ' C4b (2026-08-11): authored from LIVE ConPTY captures. PalServer's
+        ' console (post spawn-fix) logs everything player-shaped:
+        '
+        '   [2026-08-11 21:06:07] [LOG] site_ml 98.215.196.176 connected the server. (User id: steam_76561198198302619)
+        '   [LOG] Etise joined the server. (User id: steam_76561198198302619, Player id: C4409177000000000000000000000000)
+        '   [CHAT] <Etise> testing
+        '   [LOG] Etise left the server. (User id: steam_76561198198302619)
+        '
+        ' The [YYYY-MM-DD hh:mm:ss] prefix is PALWORLD'S OWN (boot lines
+        ' lack it; [LOG]/[CHAT] lines carry it) — the optional leading
+        ' group tolerates both. (First live run failed on exactly this:
+        ' the prefix was misread as viewer decoration in the captures.)
+        '
+        ' Two-stage join, mapped onto the EventStore's progressive-
+        ' enrichment fold: the CONNECT line carries the platform persona +
+        ' IP + platform user id, the JOINED line adds the character
+        ' DisplayName + CharacterId. The JOINED line CREATES the session
+        ' (kind=PlayerJoin — exactly one Join event/History row per
+        ' player); the CONNECT line is kind=PlayerIdentity (double-Join
+        ' fix, 2026-08-13): enrich-or-stash only — its persona/IP/
+        ' platform stash by PlatformUserId and drain into the session
+        ' when pal-join creates it. A client that connects but never
+        ' completes join produces no session and no Join event (by
+        ' design). Leave correlates by PlatformUserId (strong key). Chat
+        ' carries the character name — FindExistingSession resolves via
+        ' DisplayName.
+        '
+        ' These rules fire on the conpty stream on Windows and the stdout
+        ' stream on Linux (same console text, different capture source).
+        ' With console rules present, the node demotes pal-rest to FALLBACK
+        ' authority (console-first flip, same date) — see GetStatePollSources.
+        '
+        ' Platform split (2026-08-12): Palworld's console User id is
+        ' "steam_7656..." / "xbox_..." — the rules split the prefix into
+        ' a Platform capture and keep the BARE id as PlatformUserId,
+        ' matching the pal-rest poller's PlatformPrefixField semantics
+        ' (so console and REST eras key sessions identically, and the
+        ' Manager's Platform column populates). The prefix group is
+        ' optional: an unprefixed id lands whole in PlatformUserId.
+        Return New LogParseRule() {
+            New LogParseRule With {
+                .Name = "pal-connect",
+                .Kind = ParsedEventKind.PlayerIdentity,
+                .Pattern = "^\s*(?:\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*)?\[LOG\]\s+(?<PlatformPersona>.+?)\s+(?<RemoteAddress>\d{1,3}(?:\.\d{1,3}){3})\s+connected the server\.\s+\(User id:\s*(?:(?<Platform>[A-Za-z][A-Za-z0-9]*)_)?(?<PlatformUserId>[^)]+)\)"
+            },
+            New LogParseRule With {
+                .Name = "pal-join",
+                .Kind = ParsedEventKind.PlayerJoin,
+                .Pattern = "^\s*(?:\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*)?\[LOG\]\s+(?<DisplayName>.+?)\s+joined the server\.\s+\(User id:\s*(?:(?<Platform>[A-Za-z][A-Za-z0-9]*)_)?(?<PlatformUserId>[^,)]+),\s*Player id:\s*(?<CharacterId>[^)]+)\)"
+            },
+            New LogParseRule With {
+                .Name = "pal-leave",
+                .Kind = ParsedEventKind.PlayerLeave,
+                .Pattern = "^\s*(?:\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*)?\[LOG\]\s+(?<DisplayName>.+?)\s+left the server\.\s+\(User id:\s*(?:(?<Platform>[A-Za-z][A-Za-z0-9]*)_)?(?<PlatformUserId>[^)]+)\)"
+            },
+            New LogParseRule With {
+                .Name = "pal-chat",
+                .Kind = ParsedEventKind.ChatMessage,
+                .Pattern = "^\s*(?:\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*)?\[CHAT\]\s+<(?<DisplayName>[^>]+)>\s(?<Message>.*)$"
+            }
+        }
     End Function
 
     ' ============================================================
@@ -401,7 +495,8 @@ Public Class PalworldPlugin
 
     Public Function GetLaunchOptions(config As InstanceConfig) As LaunchOptions Implements ILaunchOptionsProvider.GetLaunchOptions
         Return New LaunchOptions With {
-            .GracefulShutdownTimeoutMs = 60000
+            .GracefulShutdownTimeoutMs = 60000,
+            .NeedsPseudoConsole = True
         }
     End Function
 
@@ -444,6 +539,7 @@ Public Class PalworldPlugin
     ' ============================================================
 
     Private Const SettingsEditorKey As String = "palworld-settings"
+    Private Const WorldEditorKey As String = "palworld-world"
     Private Const OptionSettingsPrefix As String = "OptionSettings=("
     Private Const SettingsSectionHeader As String = "[/Script/Pal.PalGameWorldSettings]"
 
@@ -455,10 +551,38 @@ Public Class PalworldPlugin
 
     ' Managed keys and how each serialises back into the tuple.
     ' Quoted = Text/Password (write wrapped in double quotes);
-    ' everything else writes bare (ints, True/False).
+    ' Float = written as a fixed 6-decimal number (the format the
+    ' game itself writes); everything else writes bare (ints,
+    ' True/False, enum tokens).
     Private Shared ReadOnly QuotedKeys As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase) From {
-        "ServerName", "ServerDescription", "AdminPassword", "ServerPassword", "PublicIP"
+        "ServerName", "ServerDescription", "AdminPassword", "ServerPassword", "PublicIP", "RandomizerSeed"
     }
+
+    ' Rate/multiplier keys. There is no float ConfigFieldType, so
+    ' these render as Text and are validated here on save
+    ' (invariant-culture decimal, written as F6). An unparseable
+    ' entry is left at its existing value rather than corrupting
+    ' the tuple.
+    Private Shared ReadOnly FloatKeys As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase) From {
+        "DayTimeSpeedRate", "NightTimeSpeedRate", "ExpRate", "PalCaptureRate", "PalSpawnNumRate",
+        "PalDamageRateAttack", "PalDamageRateDefense", "PlayerDamageRateAttack", "PlayerDamageRateDefense",
+        "PlayerStomachDecreaceRate", "PlayerStaminaDecreaceRate", "PlayerAutoHPRegeneRate", "PlayerAutoHpRegeneRateInSleep",
+        "PalStomachDecreaceRate", "PalStaminaDecreaceRate", "PalAutoHPRegeneRate", "PalAutoHpRegeneRateInSleep",
+        "BuildObjectHpRate", "BuildObjectDamageRate", "BuildObjectDeteriorationDamageRate",
+        "CollectionDropRate", "CollectionObjectHpRate", "CollectionObjectRespawnSpeedRate", "EnemyDropItemRate",
+        "PalEggDefaultHatchingTime", "WorkSpeedRate", "ItemWeightRate", "AutoSaveSpan", "DropItemAliveMaxHours",
+        "AutoResetGuildTimeNoOnlinePlayers", "EquipmentDurabilityDamageRate",
+        "ItemCorruptionMultiplier", "MonsterFarmActionSpeedRate", "BlockRespawnTime",
+        "RespawnPenaltyDurationThreshold", "RespawnPenaltyTimeScale", "ServerReplicatePawnCullDistance"
+    }
+
+    ''' <summary>Both editor schemas keyed by editor key.</summary>
+    Private Shared Function SchemaForEditor(editorKey As String) As IReadOnlyList(Of ConfigFieldDescriptor)
+        If String.Equals(editorKey, WorldEditorKey, StringComparison.OrdinalIgnoreCase) Then
+            Return BuildWorldSchema()
+        End If
+        Return BuildSettingsSchema()
+    End Function
 
     Public Function GetInstanceFileEditors(config As InstanceConfig) _
             As IReadOnlyList(Of InstanceFileEditor) _
@@ -467,6 +591,11 @@ Public Class PalworldPlugin
         Dim relPath = If(isLinux,
             "Pal/Saved/Config/LinuxServer/PalWorldSettings.ini",
             "Pal/Saved/Config/WindowsServer/PalWorldSettings.ini")
+        ' Two tabs, ONE file. Each tab manages only its own schema's
+        ' keys and round-trips everything else untouched, so the
+        ' splices compose. The Manager's editor panel re-reads the
+        ' file right before each save (2026-08-29) so saving one tab
+        ' after the other never reverts the first tab's keys.
         Return New InstanceFileEditor() {
             New InstanceFileEditor With {
                 .Key = SettingsEditorKey,
@@ -474,15 +603,21 @@ Public Class PalworldPlugin
                 .RelativePath = relPath,
                 .Schema = BuildSettingsSchema(),
                 .RequiresExistingFile = False
+            },
+            New InstanceFileEditor With {
+                .Key = WorldEditorKey,
+                .TabTitle = "World Settings",
+                .RelativePath = relPath,
+                .Schema = BuildWorldSchema(),
+                .RequiresExistingFile = False
             }
         }
     End Function
 
     Private Shared Function BuildSettingsSchema() As IReadOnlyList(Of ConfigFieldDescriptor)
-        ' Initial curated management set. The full ~110-key tuple
-        ' (rates, gameplay toggles) stays unknown-round-trip for
-        ' now; add batches later. Official per-key reference:
-        ' docs.palworldgame.com/settings-and-operation/configuration.
+        ' Server/admin management set. Gameplay/world tuning lives on
+        ' the World Settings tab (BuildWorldSchema). Official per-key
+        ' reference: docs.palworldgame.com/settings-and-operation/configuration.
         ' Note: double quotes are stripped from text values on save
         ' (the tuple format cannot escape them).
         Return New ConfigFieldDescriptor() {
@@ -572,6 +707,161 @@ Public Class PalworldPlugin
         }
     End Function
 
+    ' Small builders keep BuildWorldSchema readable.
+    Private Shared Function Rate(key As String, label As String, Optional desc As String = Nothing, Optional def As String = "1.000000") As ConfigFieldDescriptor
+        Return New ConfigFieldDescriptor With {
+            .Key = key, .Label = label, .Description = desc,
+            .FieldType = ConfigFieldType.Text, .DefaultValue = def,
+            .ValidationRegex = "^-?\d+(\.\d+)?$"
+        }
+    End Function
+
+    Private Shared Function Flag(key As String, label As String, def As Boolean, Optional desc As String = Nothing) As ConfigFieldDescriptor
+        Return New ConfigFieldDescriptor With {
+            .Key = key, .Label = label, .Description = desc,
+            .FieldType = ConfigFieldType.BooleanField,
+            .DefaultValue = If(def, "true", "false")
+        }
+    End Function
+
+    Private Shared Function IntField(key As String, label As String, def As Integer, min As Integer, max As Integer, Optional desc As String = Nothing) As ConfigFieldDescriptor
+        Return New ConfigFieldDescriptor With {
+            .Key = key, .Label = label, .Description = desc,
+            .FieldType = ConfigFieldType.IntegerField,
+            .DefaultValue = def.ToString(), .MinValue = min, .MaxValue = max
+        }
+    End Function
+
+    Private Shared Function Section(title As String, body As String) As ConfigFieldDescriptor
+        Return New ConfigFieldDescriptor With {
+            .Key = "notice-" & title.ToLowerInvariant().Replace(" ", "-"),
+            .Label = title, .Description = body,
+            .FieldType = ConfigFieldType.Notice
+        }
+    End Function
+
+    ''' <summary>
+    ''' World Settings tab: the gameplay/tuning half of OptionSettings
+    ''' (rates, PvP, guilds, building, hardcore, randomizer, QoL
+    ''' toggles). Every key here is written bare except the quoted
+    ''' RandomizerSeed; rates are validated as decimals on save. A
+    ''' server restart is required for changes to apply — the game
+    ''' reads the INI once at boot.
+    ''' </summary>
+    Private Shared Function BuildWorldSchema() As IReadOnlyList(Of ConfigFieldDescriptor)
+        Return New ConfigFieldDescriptor() {
+            Section("Restart required",
+                    "Palworld reads PalWorldSettings.ini once at boot. Save here, then restart the instance for changes to take effect. Rates are multipliers (1.0 = default)."),
+            Section("Progression rates", "Multipliers for player and pal growth."),
+            Rate("ExpRate", "EXP rate"),
+            Rate("PalCaptureRate", "Pal capture rate"),
+            Rate("PalSpawnNumRate", "Pal spawn count rate"),
+            Rate("WorkSpeedRate", "Work speed rate"),
+            Rate("PalEggDefaultHatchingTime", "Egg hatching time (hours)", "Base incubation time for the largest eggs; smaller eggs scale down. 0 = instant."),
+            Rate("ItemWeightRate", "Item weight rate"),
+            Rate("EnemyDropItemRate", "Enemy drop rate"),
+            Rate("CollectionDropRate", "Gathering drop rate"),
+            Rate("CollectionObjectHpRate", "Gatherable object HP rate"),
+            Rate("CollectionObjectRespawnSpeedRate", "Gatherable respawn speed rate"),
+            Rate("MonsterFarmActionSpeedRate", "Ranch production speed rate", "Item production speed multiplier from grazing pals."),
+            Section("Day / night", "Time-of-day speed."),
+            Rate("DayTimeSpeedRate", "Day speed rate"),
+            Rate("NightTimeSpeedRate", "Night speed rate"),
+            Section("Damage & survival", "Combat and hunger/stamina tuning."),
+            Rate("PlayerDamageRateAttack", "Player damage dealt"),
+            Rate("PlayerDamageRateDefense", "Player damage taken"),
+            Rate("PalDamageRateAttack", "Pal damage dealt"),
+            Rate("PalDamageRateDefense", "Pal damage taken"),
+            Rate("PlayerStomachDecreaceRate", "Player hunger rate"),
+            Rate("PlayerStaminaDecreaceRate", "Player stamina drain rate"),
+            Rate("PlayerAutoHPRegeneRate", "Player HP regen rate"),
+            Rate("PlayerAutoHpRegeneRateInSleep", "Player HP regen rate (sleeping)"),
+            Rate("PalStomachDecreaceRate", "Pal hunger rate"),
+            Rate("PalStaminaDecreaceRate", "Pal stamina drain rate"),
+            Rate("PalAutoHPRegeneRate", "Pal HP regen rate"),
+            Rate("PalAutoHpRegeneRateInSleep", "Pal HP regen rate (sleeping)"),
+            Rate("EquipmentDurabilityDamageRate", "Equipment durability loss rate"),
+            Rate("ItemCorruptionMultiplier", "Food spoilage rate", "Item corruption (food decay) speed multiplier. Lower = food lasts longer; 0 disables spoilage."),
+            Flag("bEnableInvaderEnemy", "Enable raids on bases", True),
+            Flag("EnablePredatorBossPal", "Enable predator boss pals", True),
+            Section("Death & PvP", "What happens on death, and player-versus-player rules."),
+            New ConfigFieldDescriptor With {
+                .Key = "DeathPenalty",
+                .Label = "Death penalty",
+                .Description = "None = keep everything; Item = drop items except equipment; ItemAndEquipment = drop items and equipment; All = drop items, equipment and pals.",
+                .FieldType = ConfigFieldType.[Enum],
+                .EnumValues = New List(Of String) From {"None", "Item", "ItemAndEquipment", "All"},
+                .DefaultValue = "Item"
+            },
+            Flag("bIsPvP", "PvP mode", False),
+            Flag("bEnablePlayerToPlayerDamage", "Player-to-player damage", False),
+            Flag("bEnableFriendlyFire", "Friendly fire", False),
+            Flag("bCanPickupOtherGuildDeathPenaltyDrop", "Others can loot death drops", False, "Allow players outside the guild to pick up another player's death-penalty drop."),
+            Flag("bEnableDefenseOtherGuildPlayer", "Pals defend against other guilds", False),
+            Flag("bEnableNonLoginPenalty", "Non-login penalty", True),
+            Rate("BlockRespawnTime", "Respawn cooldown (seconds)", "Cooldown before you can respawn after death.", "5.000000"),
+            Rate("RespawnPenaltyDurationThreshold", "Respawn penalty threshold (seconds)", "Dying again within this window scales the cooldown by the factor below. 0 = off.", "0.000000"),
+            Rate("RespawnPenaltyTimeScale", "Respawn penalty scale", Nothing, "2.000000"),
+            Section("Hardcore", "Permadeath-style rules. bPalLost applies with or without hardcore."),
+            Flag("bHardcore", "Hardcore mode", False, "Characters are deleted on death."),
+            Flag("bPalLost", "Pals are lost on death", False),
+            Flag("bCharacterRecreateInHardcore", "Allow re-creating a character after hardcore death", False),
+            Section("Building & bases", "Base and structure limits."),
+            IntField("BaseCampMaxNum", "Max bases on the server", 128, 1, 4096),
+            IntField("BaseCampMaxNumInGuild", "Max bases per guild", 4, 1, 64),
+            IntField("BaseCampWorkerMaxNum", "Max working pals per base", 15, 1, 50),
+            IntField("MaxBuildingLimitNum", "Max buildings per player (0 = unlimited)", 0, 0, 100000),
+            Flag("bBuildAreaLimit", "Restrict building near bases/structures", False),
+            Rate("BuildObjectHpRate", "Structure HP rate"),
+            Rate("BuildObjectDamageRate", "Structure damage taken rate"),
+            Rate("BuildObjectDeteriorationDamageRate", "Structure decay rate"),
+            Flag("bInvisibleOtherGuildBaseCampAreaFX", "Hide other guilds' base-area effects", False),
+            Flag("bEnableBuildingPlayerUIdDisplay", "Show builder name on structures", False),
+            Section("Guilds", "Guild membership and cleanup."),
+            IntField("GuildPlayerMaxNum", "Max players per guild", 20, 1, 100),
+            IntField("CoopPlayerMaxNum", "Co-op player limit", 4, 1, 32, "Only meaningful for co-op sessions; dedicated servers use Max players on the Server Settings tab."),
+            IntField("GuildRejoinCooldownMinutes", "Guild rejoin cooldown (minutes)", 0, 0, 100000),
+            Flag("bAutoResetGuildNoOnlinePlayers", "Auto-reset guilds with no online players", False),
+            Rate("AutoResetGuildTimeNoOnlinePlayers", "Guild auto-reset after (hours)", Nothing, "72.000000"),
+            Section("Items & world", "Dropped items, saving, supply drops."),
+            IntField("DropItemMaxNum", "Max dropped items in world", 3000, 0, 100000),
+            Rate("DropItemAliveMaxHours", "Dropped items despawn after (hours)"),
+            Rate("AutoSaveSpan", "Auto-save interval (seconds)", Nothing, "30.000000"),
+            IntField("SupplyDropSpan", "Supply drop interval (minutes)", 180, 1, 100000),
+            Rate("ServerReplicatePawnCullDistance", "Pal sync distance (cm)", "How far from players pals are replicated. 5000–15000.", "15000.000000"),
+            Flag("bExistPlayerAfterLogout", "Keep player body in world after logout", False),
+            Flag("bEnableFastTravel", "Enable fast travel", True),
+            Flag("bEnableFastTravelOnlyBaseCamp", "Fast travel only to bases", False),
+            Flag("bIsStartLocationSelectByMap", "Choose start location on map", False),
+            Flag("bAllowGlobalPalboxExport", "Allow global Palbox export", True),
+            Flag("bAllowGlobalPalboxImport", "Allow global Palbox import", False),
+            Flag("bAllowClientMod", "Allow client mods", True),
+            Flag("bEnableVoiceChat", "Enable proximity voice chat", False),
+            IntField("ChatPostLimitPerMinute", "Chat posts per minute limit", 30, 1, 1000),
+            Section("Stat enhancement", "Which stats players may raise with stat points."),
+            Flag("bAllowEnhanceStat_Health", "Allow HP enhancement", True),
+            Flag("bAllowEnhanceStat_Attack", "Allow attack enhancement", True),
+            Flag("bAllowEnhanceStat_Stamina", "Allow stamina enhancement", True),
+            Flag("bAllowEnhanceStat_Weight", "Allow weight enhancement", True),
+            Flag("bAllowEnhanceStat_WorkSpeed", "Allow work-speed enhancement", True),
+            Section("Randomizer", "Pal-spawn randomizer. Changing type or seed on an existing world changes what spawns."),
+            New ConfigFieldDescriptor With {
+                .Key = "RandomizerType",
+                .Label = "Randomizer type",
+                .FieldType = ConfigFieldType.[Enum],
+                .EnumValues = New List(Of String) From {"None", "Region", "All"},
+                .DefaultValue = "None"
+            },
+            New ConfigFieldDescriptor With {
+                .Key = "RandomizerSeed",
+                .Label = "Randomizer seed",
+                .Description = "Blank = random seed each start.",
+                .FieldType = ConfigFieldType.Text
+            },
+            Flag("bIsRandomizerPalLevelRandom", "Randomize pal levels", False)
+        }
+    End Function
+
     Public Function ReadFileToValues(editorKey As String, fileText As String) _
             As Dictionary(Of String, String) _
             Implements IInstanceFileEditorProvider.ReadFileToValues
@@ -583,28 +873,30 @@ Public Class PalworldPlugin
         Dim payload = ExtractTuplePayload(fileText)
         If payload Is Nothing Then payload = DefaultOptionSettings
 
+        ' Schema-driven: only this editor's keys are surfaced, typed
+        ' by the descriptor (quoted text unwrapped, booleans
+        ' lower-cased for the form, everything else verbatim).
+        Dim schema As New Dictionary(Of String, ConfigFieldDescriptor)(StringComparer.OrdinalIgnoreCase)
+        For Each fld In SchemaForEditor(editorKey)
+            If fld Is Nothing OrElse fld.FieldType = ConfigFieldType.Notice OrElse String.IsNullOrEmpty(fld.Key) Then Continue For
+            schema(fld.Key) = fld
+        Next
+
         Dim entries = SplitTupleEntries(payload)
         For Each entry In entries
             Dim eq = entry.IndexOf("="c)
             If eq <= 0 Then Continue For
             Dim key = entry.Substring(0, eq).Trim()
             Dim raw = entry.Substring(eq + 1).Trim()
-            Select Case True
-                Case key.Equals("ServerName", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("ServerDescription", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("AdminPassword", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("ServerPassword", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("PublicIP", StringComparison.OrdinalIgnoreCase)
-                    values(key) = Unquote(raw)
-                Case key.Equals("ServerPlayerMaxNum", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("PublicPort", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("RESTAPIPort", StringComparison.OrdinalIgnoreCase)
-                    values(key) = raw
-                Case key.Equals("RESTAPIEnabled", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("bShowPlayerList", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("bIsShowJoinLeftMessage", StringComparison.OrdinalIgnoreCase),
-                     key.Equals("bIsUseBackupSaveData", StringComparison.OrdinalIgnoreCase)
-                    values(key) = raw.ToLowerInvariant()
+            Dim fld As ConfigFieldDescriptor = Nothing
+            If Not schema.TryGetValue(key, fld) Then Continue For
+            Select Case fld.FieldType
+                Case ConfigFieldType.Text, ConfigFieldType.Password
+                    values(fld.Key) = If(QuotedKeys.Contains(key), Unquote(raw), raw)
+                Case ConfigFieldType.BooleanField
+                    values(fld.Key) = raw.ToLowerInvariant()
+                Case Else
+                    values(fld.Key) = raw
             End Select
         Next
 
@@ -617,13 +909,23 @@ Public Class PalworldPlugin
             Implements IInstanceFileEditorProvider.WriteValuesToFile
 
         ' Base tuple: the live file's when present (all unknown keys
-        ' + operator hand-edits preserved in original order), the
-        ' embedded default otherwise (blank-file build).
+        ' + operator hand-edits + the OTHER tab's keys preserved in
+        ' original order), the embedded default otherwise (blank-
+        ' file build).
         Dim basePayload = ExtractTuplePayload(existingText)
         Dim buildingFresh = basePayload Is Nothing
         If buildingFresh Then basePayload = DefaultOptionSettings
 
         Dim entries = SplitTupleEntries(basePayload)
+
+        ' Only THIS editor's keys are managed on this save; a value
+        ' the form didn't submit (or that fails validation) leaves
+        ' the existing entry alone.
+        Dim schema As New Dictionary(Of String, ConfigFieldDescriptor)(StringComparer.OrdinalIgnoreCase)
+        For Each fld In SchemaForEditor(editorKey)
+            If fld Is Nothing OrElse fld.FieldType = ConfigFieldType.Notice OrElse String.IsNullOrEmpty(fld.Key) Then Continue For
+            schema(fld.Key) = fld
+        Next
 
         ' Rewrite managed keys in place, preserving position.
         Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
@@ -631,18 +933,20 @@ Public Class PalworldPlugin
             Dim eq = entries(i).IndexOf("="c)
             If eq <= 0 Then Continue For
             Dim key = entries(i).Substring(0, eq).Trim()
-            Dim newRaw = RenderManagedValue(key, values)
+            Dim fld As ConfigFieldDescriptor = Nothing
+            If Not schema.TryGetValue(key, fld) Then Continue For
+            Dim newRaw = RenderManagedValue(fld, values)
             If newRaw IsNot Nothing Then
                 entries(i) = key & "=" & newRaw
-                seen.Add(key)
             End If
+            seen.Add(key)
         Next
 
         ' Any managed key missing from the base tuple (older default,
         ' hand-pruned file) is appended at the end.
-        For Each fld In BuildSettingsSchema()
+        For Each fld In schema.Values
             If Not seen.Contains(fld.Key) Then
-                Dim newRaw = RenderManagedValue(fld.Key, values)
+                Dim newRaw = RenderManagedValue(fld, values)
                 If newRaw IsNot Nothing Then entries.Add(fld.Key & "=" & newRaw)
             End If
         Next
@@ -663,31 +967,52 @@ Public Class PalworldPlugin
 
     ''' <summary>
     ''' Render the tuple-side value for a managed key from the form
-    ''' values, or Nothing when the key isn't managed / wasn't
-    ''' submitted. Text values get embedded double quotes stripped
-    ''' (no escape syntax exists) then wrapped; booleans normalise
-    ''' to True/False; ints validate-or-skip.
+    ''' values, or Nothing when the key wasn't submitted or fails
+    ''' validation (the existing entry is then kept). Text values
+    ''' get embedded double quotes stripped (no escape syntax exists)
+    ''' then wrapped; rates parse as invariant decimals and write as
+    ''' F6; booleans normalise to True/False; ints validate-or-skip;
+    ''' enums must be one of the declared values.
     ''' </summary>
-    Private Shared Function RenderManagedValue(key As String,
+    Private Shared Function RenderManagedValue(fld As ConfigFieldDescriptor,
                                                 values As Dictionary(Of String, String)) As String
-        If values Is Nothing OrElse Not values.ContainsKey(key) Then Return Nothing
-        Dim raw = If(values(key), "")
+        If fld Is Nothing OrElse values Is Nothing OrElse Not values.ContainsKey(fld.Key) Then Return Nothing
+        Dim raw = If(values(fld.Key), "").Trim()
 
-        If QuotedKeys.Contains(key) Then
+        If QuotedKeys.Contains(fld.Key) Then
             Return """" & raw.Replace("""", "") & """"
         End If
 
-        Dim boolVal As Boolean
-        If Boolean.TryParse(raw, boolVal) Then
-            Return If(boolVal, "True", "False")
+        If FloatKeys.Contains(fld.Key) Then
+            Dim dbl As Double
+            If Double.TryParse(raw, Globalization.NumberStyles.Float,
+                               Globalization.CultureInfo.InvariantCulture, dbl) Then
+                Return dbl.ToString("F6", Globalization.CultureInfo.InvariantCulture)
+            End If
+            Return Nothing
         End If
 
-        Dim intVal As Integer
-        If Integer.TryParse(raw, intVal) Then
-            Return intVal.ToString()
-        End If
-
-        Return Nothing ' unparseable — leave the existing value alone
+        Select Case fld.FieldType
+            Case ConfigFieldType.BooleanField
+                Dim boolVal As Boolean
+                If Boolean.TryParse(raw, boolVal) Then Return If(boolVal, "True", "False")
+                Return Nothing
+            Case ConfigFieldType.IntegerField
+                Dim intVal As Integer
+                If Integer.TryParse(raw, intVal) Then Return intVal.ToString()
+                Return Nothing
+            Case ConfigFieldType.[Enum]
+                If fld.EnumValues IsNot Nothing Then
+                    For Each v In fld.EnumValues
+                        If String.Equals(v, raw, StringComparison.OrdinalIgnoreCase) Then Return v
+                    Next
+                    Return Nothing
+                End If
+                Return raw
+            Case Else
+                ' Unquoted free text (none today) — write bare.
+                Return raw
+        End Select
     End Function
 
     ''' <summary>
@@ -863,12 +1188,33 @@ Public Class PalworldPlugin
             Return cached.Item2
         End If
 
-        Dim isLinux = ctx.Config IsNot Nothing AndAlso ctx.Config.Platform = NodePlatform.Linux
+        Dim result = Await ReadRestSettingsCoreAsync(ctx.Config, ctx.FetchInstanceFile)
+
+        If cacheKey.Length > 0 Then
+            _restSettingsCache(cacheKey) = Tuple.Create(DateTime.UtcNow, result)
+        End If
+        Return result
+    End Function
+
+    ''' <summary>
+    ''' Uncached fetch+parse of RESTAPIEnabled / RESTAPIPort /
+    ''' AdminPassword from the live settings file. Shared by the
+    ''' remote-control path (30s-cached wrapper above, polled by the
+    ''' UI) and the state-poll declaration (called once per instance
+    ''' start — no cache wanted: a stale negative there would cost a
+    ''' whole game run of polling).
+    ''' </summary>
+    Private Shared Async Function ReadRestSettingsCoreAsync(config As InstanceConfig,
+                                                            fetchFile As Func(Of String, Task(Of String))) _
+            As Task(Of RestSettings)
+        If fetchFile Is Nothing Then Return Nothing
+
+        Dim isLinux = config IsNot Nothing AndAlso config.Platform = NodePlatform.Linux
         Dim relPath = If(isLinux,
             "Pal/Saved/Config/LinuxServer/PalWorldSettings.ini",
             "Pal/Saved/Config/WindowsServer/PalWorldSettings.ini")
 
-        Dim text = Await ctx.FetchInstanceFile(relPath)
+        Dim text = Await fetchFile(relPath)
         Dim payload = ExtractTuplePayload(text)
 
         Dim result As RestSettings = Nothing
@@ -888,11 +1234,82 @@ Public Class PalworldPlugin
                 End If
             Next
         End If
-
-        If cacheKey.Length > 0 Then
-            _restSettingsCache(cacheKey) = Tuple.Create(DateTime.UtcNow, result)
-        End If
         Return result
+    End Function
+
+    ' ============================================================
+    '  IStatePollProvider — node-side player polling (EventStream
+    '  Slice 2)
+    '
+    '  Declares the pal-rest source: the NODE polls
+    '  /v1/api/players on loopback every 5s, diffs snapshots, and
+    '  synthesizes PlayerJoin/PlayerLeave into the canonical event
+    '  stream — Palworld player tracking with log capture still
+    '  dark (UE console output is invisible to piped stdio until
+    '  ConPTY lands). Field semantics identical to GetPlayersAsync
+    '  above (verified live 13 Jul 2026): name = character name,
+    '  accountName = Steam persona, playerId = character id,
+    '  userId = "steam_<SteamID64>" (split into Platform + id via
+    '  PlatformPrefixField), iP = remote address (erratic casing —
+    '  the node matches payload keys case-insensitively).
+    '
+    '  pal-rest OWNS PlayerJoin/PlayerLeave (AuthoritativeKinds):
+    '  poll diffing is steadier than log text across game patches —
+    '  Pocketpair can reword a log line any Tuesday; the REST
+    '  payload is a stable contract. When ConPTY log capture lands,
+    '  its parsed joins get suppressed at append (observable in
+    '  /events/sources) instead of double-counting.
+    '
+    '  Declining is cheap and normal: REST disabled, no password,
+    '  or unreadable settings file → Nothing → no poller — the
+    '  operator enables RESTAPIEnabled + AdminPassword (settings
+    '  editor) and restarts the instance to light it up.
+    ' ============================================================
+
+    Public Async Function GetStatePollSourcesAsync(context As StatePollResolveContext) _
+            As Task(Of IReadOnlyList(Of GSM.Node.Api.ResolvedStatePollSource)) _
+            Implements IStatePollProvider.GetStatePollSourcesAsync
+
+        If context Is Nothing OrElse context.FetchInstanceFile Is Nothing Then Return Nothing
+
+        Dim settings = Await ReadRestSettingsCoreAsync(context.Config, context.FetchInstanceFile)
+        If settings Is Nothing OrElse Not settings.Enabled OrElse
+           String.IsNullOrEmpty(settings.AdminPassword) Then
+            Return Nothing ' REST off/unconfigured — no poller this run
+        End If
+
+        ' Console-first flip (0.3.0 / C4b): the AuthoritativeKinds claims
+        ' below are now the FALLBACK. With console parse rules present for
+        ' the same kinds, the node hands authority to the capture source
+        ' (conpty/stdout) and demotes this poller to reconciliation cadence
+        ' — REST is the backup, not the default. On an instance with no
+        ' console capture (or a pre-0.3.0 rule set) these claims take
+        ' effect exactly as before.
+        Return New GSM.Node.Api.ResolvedStatePollSource() {
+            New GSM.Node.Api.ResolvedStatePollSource With {
+                .SourceId = "pal-rest",
+                .Url = $"http://127.0.0.1:{settings.Port}/v1/api/players",
+                .AuthKind = GSM.Node.Api.PollAuthKind.Basic,
+                .AuthUsername = "admin",
+                .AuthPassword = settings.AdminPassword,
+                .IntervalSeconds = 5,
+                .PayloadShape = GSM.Node.Api.PollPayloadShape.PlayerArray,
+                .PlayersArrayPath = "players",
+                .KeyField = "PlatformUserId",
+                .PlatformPrefixField = "PlatformUserId",
+                .FieldMap = New Dictionary(Of String, String) From {
+                    {"name", "DisplayName"},
+                    {"accountName", "PlatformPersona"},
+                    {"playerId", "CharacterId"},
+                    {"userId", "PlatformUserId"},
+                    {"ip", "RemoteAddress"}
+                },
+                .AuthoritativeKinds = New List(Of ParsedEventKind) From {
+                    ParsedEventKind.PlayerJoin,
+                    ParsedEventKind.PlayerLeave
+                }
+            }
+        }
     End Function
 
     Private Shared Function BuildRestRequest(method As HttpMethod,

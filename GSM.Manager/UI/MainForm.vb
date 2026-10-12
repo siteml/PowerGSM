@@ -92,6 +92,14 @@ Namespace GSM.Manager.UI
         Private _statusRefreshTimer As Timer
         Private Const StatusRefreshIntervalMs As Integer = 2000
 
+        ' ---- Player counts (2026-10-11) ----
+        ' tag -> online players, refreshed on the status tick from
+        ' InstanceManager's tracked roster; instances carry their own
+        ' count, installations the subtree sum. Drawn after the caption
+        ' by TreeView_DrawNode as a green person glyph + number.
+        Private ReadOnly _playerCounts As New Dictionary(Of String, Integer)(StringComparer.Ordinal)
+        Private _playerGlyph As Bitmap
+
         ''' <summary>
         ''' Semantic colour for a status badge. Per-kind shape
         ''' (circle / folder / server) is decided separately by
@@ -609,10 +617,14 @@ Namespace GSM.Manager.UI
                 Sub(s, e) OnNewInstallation())
             Dim updateNodesItem As New ToolStripMenuItem("&Update Nodes...", Nothing,
                 Sub(s, e) OnUpdateNodes())
+            ' HTTPS_SinglePort_Plan slice 4: fleet-wide guided hardening.
+            Dim secureNodesItem As New ToolStripMenuItem("&Secure All Nodes (HTTPS)...", Nothing,
+                Sub(s, e) OnSecureAllNodes())
             nodesMenu.DropDownItems.Add(addNodeItem)
             nodesMenu.DropDownItems.Add(newInstallItem)
             nodesMenu.DropDownItems.Add(New ToolStripSeparator())
             nodesMenu.DropDownItems.Add(updateNodesItem)
+            nodesMenu.DropDownItems.Add(secureNodesItem)
 
             Dim toolsMenu As New ToolStripMenuItem("&Tools")
             Dim historyItem As New ToolStripMenuItem("&History...", Nothing,
@@ -635,7 +647,10 @@ Namespace GSM.Manager.UI
                 Sub(s, e) OnDiscordBotClicked(s, e))
             Dim settingsItem As New ToolStripMenuItem("S&ettings...", Nothing,
                 Sub(s, e) OnSettings())
+            Dim diagnosticsItem As New ToolStripMenuItem("&Diagnostics...", Nothing,
+                Sub(s, e) OnOpenDiagnostics())
             toolsMenu.DropDownItems.Add(historyItem)
+            toolsMenu.DropDownItems.Add(diagnosticsItem)
             toolsMenu.DropDownItems.Add(purgeRebuildItem)
             toolsMenu.DropDownItems.Add(New ToolStripSeparator())
             toolsMenu.DropDownItems.Add(reloadPluginsItem)
@@ -745,6 +760,19 @@ Namespace GSM.Manager.UI
             _treeView.ShowRootLines = True
             _treeView.Font = New Font("Segoe UI", 9.5F)
             AddHandler _treeView.NodeMouseClick, AddressOf TreeView_NodeMouseClick
+
+            ' Owner-drawn captions (2026-10-11): the node text is drawn by
+            ' TreeView_DrawNode so a player glyph + count can follow the
+            ' caption without being part of Text (keeps Text = plain name
+            ' for the tag/expansion/selection logic and the panels).
+            _treeView.DrawMode = TreeViewDrawMode.OwnerDrawText
+            AddHandler _treeView.DrawNode, AddressOf TreeView_DrawNode
+            ' The custom-drawn width is wider than the native text bounds
+            ' the control invalidates on selection change, so repaint the
+            ' whole tree — cheap, and avoids highlight remnants past the
+            ' caption.
+            AddHandler _treeView.AfterSelect, Sub(s, e) _treeView.Invalidate()
+            _playerGlyph = MakePlayerGlyph()
 
             ' Status badges. ImageList must be assigned before any
             ' TreeNode's ImageIndex is set; the badge values
@@ -1044,7 +1072,8 @@ Namespace GSM.Manager.UI
                         ' tree. Gets reapplied on every
                         ' RefreshNodeTree call so toggling
                         ' attach/detach updates immediately.
-                        If Not nodeEntity.IsEnabled Then
+                        Dim nodeDetached = Not nodeEntity.IsEnabled
+                        If nodeDetached Then
                             nodeTreeNode.Text = nodeTreeNode.Text & "  [detached]"
                             nodeTreeNode.ForeColor = Color.Gray
                         End If
@@ -1057,6 +1086,14 @@ Namespace GSM.Manager.UI
                         For Each installEntity In installations
                             Dim installTreeNode As New TreeNode($"{installEntity.DisplayName} ({installEntity.GameId})")
                             installTreeNode.Tag = $"installation:{installEntity.InstallationId}"
+                            ' Name = base caption; the status tick appends the
+                            ' live player count to Text (see
+                            ' WalkAndApplyStatusIcons) without losing it.
+                            installTreeNode.Name = installTreeNode.Text
+                            ' Children of a detached node inherit the grey:
+                            ' nothing under it is being polled, so their
+                            ' state is unknown by definition (2026-10-11).
+                            If nodeDetached Then installTreeNode.ForeColor = Color.Gray
 
                             ' Load instances for this installation. Order
                             ' by SortOrder so the tree mirrors the
@@ -1073,6 +1110,8 @@ Namespace GSM.Manager.UI
                             For Each instanceEntity In instances
                                 Dim instanceTreeNode As New TreeNode(instanceEntity.DisplayName)
                                 instanceTreeNode.Tag = $"instance:{instanceEntity.InstanceId}"
+                                instanceTreeNode.Name = instanceEntity.DisplayName
+                                If nodeDetached Then instanceTreeNode.ForeColor = Color.Gray
                                 installTreeNode.Nodes.Add(instanceTreeNode)
                             Next
 
@@ -1666,6 +1705,26 @@ Namespace GSM.Manager.UI
         ''' launches with a pre-built filter to narrow to the
         ''' current instance's session and recent time.
         ''' </summary>
+        ''' <summary>
+        ''' Tools → Diagnostics (2026-08-14). Non-modal, same
+        ''' ownerless-show rationale as the History window.
+        ''' </summary>
+        Public Sub OnOpenDiagnostics()
+            Dim win As New DiagnosticsWindow()
+            win.Show()
+        End Sub
+
+        ''' <summary>
+        ''' Nodes → Secure All Nodes (HTTPS_SinglePort_Plan slice 4).
+        ''' Modal: it bounces nodes, so the operator should be watching.
+        ''' </summary>
+        Private Sub OnSecureAllNodes()
+            Using dlg As New SecureNodesForm()
+                dlg.ShowDialog(Me)
+            End Using
+            RefreshNodeTree()
+        End Sub
+
         Public Sub OnOpenHistory(filter As GSM.Manager.Core.HistoryFilter)
             Dim win As New HistoryWindow(filter)
             ' Show without owner so the window can survive MainForm
@@ -1912,11 +1971,35 @@ Namespace GSM.Manager.UI
             RefreshNodeTree()
         End Sub
 
-        Private Sub OnDeleteNode(nodeId As String)
+        Private Async Sub OnDeleteNode(nodeId As String)
             Dim confirm = MessageBox.Show(
                 "Delete this node and all its installations and instances?",
                 "Confirm Delete", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
             If confirm <> DialogResult.Yes Then Return
+
+            ' Best-effort node-side cleanup of every instance's boot
+            ' state BEFORE the local rows disappear: the node service
+            ' keeps running after we forget about it, and parked
+            ' "Auto start with node" snapshots would keep starting
+            ' deleted instances at every boot of that machine.
+            Dim instMgrCleanup = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If instMgrCleanup IsNot Nothing Then
+                Dim doomedIds As List(Of String)
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    Dim cleanupInstallIds = db.Installations.
+                        Where(Function(i) i.NodeId = nodeId).
+                        Select(Function(i) i.InstallationId).
+                        ToList()
+                    doomedIds = db.Instances.
+                        Where(Function(i) cleanupInstallIds.Contains(i.InstallationId)).
+                        Select(Function(i) i.InstanceId).
+                        ToList()
+                End Using
+                For Each doomedId In doomedIds
+                    Await instMgrCleanup.ForgetInstanceOnNodeAsync(doomedId)
+                Next
+            End If
 
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
@@ -2213,6 +2296,23 @@ Namespace GSM.Manager.UI
                     End Try
                 End If
 
+                ' Node-side per-instance cleanup (snapshot + boot
+                ' flap-guard rows) BEFORE the local delete, so parked
+                ' "Auto start with node" rows can't keep starting
+                ' deleted instances at future node boots. Best-effort:
+                ' an unreachable node already produced the file-cleanup
+                ' warning above; don't stack more dialogs.
+                Dim instMgrCleanup = ManagerProgram.Services.GetService(Of InstanceManager)()
+                Dim doomedIds = db.Instances.
+                    Where(Function(i) i.InstallationId = installationId).
+                    Select(Function(i) i.InstanceId).
+                    ToList()
+                If instMgrCleanup IsNot Nothing Then
+                    For Each doomedId In doomedIds
+                        Await instMgrCleanup.ForgetInstanceOnNodeAsync(doomedId)
+                    Next
+                End If
+
                 ' Delete from local DB
                 Dim instances = db.Instances.
                     Where(Function(i) i.InstallationId = installationId).
@@ -2268,7 +2368,7 @@ Namespace GSM.Manager.UI
             End Using
         End Sub
 
-        Private Sub OnDeleteInstance(instanceId As String)
+        Private Async Sub OnDeleteInstance(instanceId As String)
             ' Two-stage confirmation: if the instance has an
             ' associated restart rule (the typical case for any
             ' instance the user has scheduled), we make it explicit
@@ -2301,6 +2401,31 @@ Namespace GSM.Manager.UI
                 message,
                 "Confirm Delete", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
             If confirm <> DialogResult.Yes Then Return
+
+            ' Node-side cleanup FIRST, while the node association still
+            ' exists locally: the node keeps a snapshot for the boot
+            ' flags (a parked "Auto start with node" row would keep
+            ' starting this instance at every node boot after it's
+            ' deleted here). Refused = the node still sees it running;
+            ' unreachable = ask before leaving a possible leftover.
+            Dim instMgr = ManagerProgram.Services.GetService(Of InstanceManager)()
+            If instMgr IsNot Nothing Then
+                Dim forgetResult = Await instMgr.ForgetInstanceOnNodeAsync(instanceId)
+                If forgetResult IsNot Nothing AndAlso forgetResult.Refused Then
+                    MessageBox.Show(
+                        "The node reports this instance is still running. Stop it before deleting.",
+                        "Delete Instance", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                    Return
+                End If
+                If forgetResult Is Nothing Then
+                    Dim proceed = MessageBox.Show(
+                        "The node can't be reached to clear this instance's boot-start state." & Environment.NewLine &
+                        "If 'Auto start with node' or 'Recover state on node restart' was enabled, the node may keep starting it at boot until that's cleaned up there." & Environment.NewLine & Environment.NewLine &
+                        "Delete anyway?",
+                        "Node Unreachable", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
+                    If proceed <> DialogResult.Yes Then Return
+                End If
+            End If
 
             Using scope = ManagerProgram.Services.CreateScope()
                 Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
@@ -2718,23 +2843,146 @@ Namespace GSM.Manager.UI
         Private Const InstallationIconBase As Integer = 6  ' slots 7..12 — folders
         Private Const NodeIconBase As Integer = 12         ' slots 13..18 — servers
 
+        ''' <summary>
+        ''' 12×15 ARGB person silhouette (head + shoulders) in the
+        ''' Running green, drawn with GDI+ so it matches the status
+        ''' dots and never depends on an emoji font. Geometry agreed
+        ''' 2026-10-11: head r=2.5 at (6,5.5), shoulders half-ellipse
+        ''' 1.5..10.5 × 9..17 clipped at the bottom edge.
+        ''' </summary>
+        Private Function MakePlayerGlyph() As Bitmap
+            Dim bmp As New Bitmap(12, 15)
+            Using g = Graphics.FromImage(bmp)
+                g.SmoothingMode = Drawing2D.SmoothingMode.AntiAlias
+                g.Clear(Color.Transparent)
+                Using b As New SolidBrush(Color.FromArgb(60, 180, 75))
+                    g.FillEllipse(b, 3.5F, 3.0F, 5.0F, 5.0F)
+                    g.FillPie(b, 1.5F, 9.0F, 9.0F, 8.0F, 180.0F, 180.0F)
+                End Using
+            End Using
+            Return bmp
+        End Function
+
+        ''' <summary>
+        ''' OwnerDrawText handler: caption as the TreeView would draw it
+        ''' (selection highlight, grey ForeColor for detached subtrees,
+        ''' focus rectangle), then " [glyph] N" when _playerCounts has a
+        ''' non-zero entry for the node's tag.
+        ''' </summary>
+        Private Sub TreeView_DrawNode(sender As Object, e As DrawTreeNodeEventArgs)
+            Dim n = e.Node
+            If n Is Nothing Then Return
+            Dim g = e.Graphics
+            Dim font = If(n.NodeFont, _treeView.Font)
+            Dim selected = (e.State And TreeNodeStates.Selected) <> 0
+            Dim focused = (e.State And TreeNodeStates.Focused) <> 0
+
+            Dim count As Integer = 0
+            If n.Tag IsNot Nothing Then _playerCounts.TryGetValue(n.Tag.ToString(), count)
+
+            Const flags As TextFormatFlags = TextFormatFlags.VerticalCenter Or TextFormatFlags.NoPadding Or TextFormatFlags.SingleLine
+            Dim caption = If(n.Text, "")
+            Dim captionSize = TextRenderer.MeasureText(g, caption, font, Size.Empty, flags)
+            Dim countText = If(count > 0, count.ToString(), "")
+            Dim countSize = If(count > 0, TextRenderer.MeasureText(g, countText, font, Size.Empty, flags), Size.Empty)
+            Const gapBefore As Integer = 6, gapAfter As Integer = 3, pad As Integer = 2
+            Dim extra = If(count > 0, gapBefore + _playerGlyph.Width + gapAfter + countSize.Width, 0)
+
+            Dim rect As New Rectangle(e.Bounds.X, e.Bounds.Y, captionSize.Width + pad * 2 + extra, e.Bounds.Height)
+
+            ' Background: highlight when selected (HideSelection=False keeps
+            ' it when the tree loses focus), tree BackColor otherwise.
+            Dim backBrush = If(selected, SystemBrushes.Highlight, Nothing)
+            If backBrush IsNot Nothing Then
+                g.FillRectangle(backBrush, rect)
+            Else
+                Using bb As New SolidBrush(_treeView.BackColor)
+                    g.FillRectangle(bb, rect)
+                End Using
+            End If
+
+            Dim fore As Color
+            If selected Then
+                fore = SystemColors.HighlightText
+            ElseIf n.ForeColor.IsEmpty Then
+                fore = _treeView.ForeColor
+            Else
+                fore = n.ForeColor
+            End If
+
+            Dim x = rect.X + pad
+            TextRenderer.DrawText(g, caption, font, New Rectangle(x, rect.Y, captionSize.Width, rect.Height), fore, flags)
+            x += captionSize.Width
+
+            If count > 0 Then
+                x += gapBefore
+                Dim gy = rect.Y + (rect.Height - _playerGlyph.Height) \ 2
+                g.DrawImageUnscaled(_playerGlyph, x, gy)
+                x += _playerGlyph.Width + gapAfter
+                TextRenderer.DrawText(g, countText, font, New Rectangle(x, rect.Y, countSize.Width, rect.Height), fore, flags)
+            End If
+
+            If focused AndAlso selected Then
+                ControlPaint.DrawFocusRectangle(g, rect, fore, SystemColors.Highlight)
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Detached (IsEnabled=False) node IDs, refreshed each tick so
+        ''' the subtree under a detached node is forced Gray — the
+        ''' Manager does not poll those instances, so any cached live
+        ''' state is stale and must not light the dots (2026-10-11).
+        ''' </summary>
+        Private Function LoadDetachedNodeIds() As HashSet(Of String)
+            Dim result As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            Try
+                Using scope = ManagerProgram.Services.CreateScope()
+                    Dim db = scope.ServiceProvider.GetRequiredService(Of GsmDbContext)()
+                    For Each id In db.Nodes.Where(Function(x) Not x.IsEnabled).Select(Function(x) x.NodeId).ToList()
+                        result.Add(id)
+                    Next
+                End Using
+            Catch
+            End Try
+            Return result
+        End Function
+
         Private Sub WalkAndApplyStatusIcons(nodes As TreeNodeCollection)
+            WalkAndApplyStatusIcons(nodes, LoadDetachedNodeIds(), False)
+        End Sub
+
+        ''' <summary>
+        ''' Returns the summed online-player count of the subtree it
+        ''' walked (instances report their own count; installations
+        ''' and nodes roll up) so callers can caption parents.
+        ''' </summary>
+        Private Function WalkAndApplyStatusIcons(nodes As TreeNodeCollection,
+                                                 detachedNodes As HashSet(Of String),
+                                                 parentDetached As Boolean) As Integer
+            Dim instMgr = ManagerProgram.Services.GetService(Of InstanceManager)()
+            Dim total As Integer = 0
             For Each n As TreeNode In nodes
                 Dim slotIdx As Integer = 0   ' default to StatusIcon.None — transparent blank
+                Dim detached As Boolean = parentDetached
+                Dim kind As String = Nothing
+                Dim id As String = Nothing
                 If n.Tag IsNot Nothing Then
                     Dim parts = n.Tag.ToString().Split(":"c, 2)
                     If parts.Length = 2 Then
+                        kind = parts(0)
+                        id = parts(1)
+                        If kind = "node" AndAlso detachedNodes.Contains(id) Then detached = True
                         Dim color As StatusIcon = StatusIcon.None
                         Dim baseOffset As Integer = -1
-                        Select Case parts(0)
+                        Select Case kind
                             Case "instance"
-                                color = ResolveInstanceIcon(parts(1))
+                                color = If(detached, StatusIcon.Gray, ResolveInstanceIcon(id))
                                 baseOffset = InstanceIconBase
                             Case "installation"
-                                color = ResolveInstallationIcon(parts(1))
+                                color = If(detached, StatusIcon.Gray, ResolveInstallationIcon(id))
                                 baseOffset = InstallationIconBase
                             Case "node"
-                                color = ResolveNodeIcon(parts(1))
+                                color = ResolveNodeIcon(id)
                                 baseOffset = NodeIconBase
                         End Select
                         ' baseOffset stays -1 for unrecognised
@@ -2749,9 +2997,41 @@ Namespace GSM.Manager.UI
                 End If
                 If n.ImageIndex <> slotIdx Then n.ImageIndex = slotIdx
                 If n.SelectedImageIndex <> slotIdx Then n.SelectedImageIndex = slotIdx
-                If n.Nodes.Count > 0 Then WalkAndApplyStatusIcons(n.Nodes)
+
+                ' Player counts (2026-10-11): instances show their own
+                ' online count, installations the sum, so the tree itself
+                ' says where the activity is. Stored per tag and painted by
+                ' TreeView_DrawNode; nothing for 0 or detached subtrees.
+                Dim subtreeCount As Integer = 0
+                If n.Nodes.Count > 0 Then
+                    subtreeCount = WalkAndApplyStatusIcons(n.Nodes, detachedNodes, detached)
+                End If
+                Dim ownCount As Integer = 0
+                If kind = "instance" AndAlso Not detached AndAlso instMgr IsNot Nothing Then
+                    Dim live = instMgr.GetLiveState(id)
+                    If live IsNot Nothing AndAlso live.CurrentState = InstanceState.Running Then
+                        ownCount = instMgr.GetActivePlayerCount(id)
+                    End If
+                End If
+                Dim shown As Integer = If(kind = "instance", ownCount, subtreeCount)
+                If (kind = "instance" OrElse kind = "installation") AndAlso n.Tag IsNot Nothing Then
+                    Dim tagKey = n.Tag.ToString()
+                    Dim desired = If(detached, 0, shown)
+                    Dim current As Integer = 0
+                    _playerCounts.TryGetValue(tagKey, current)
+                    If current <> desired Then
+                        If desired = 0 Then _playerCounts.Remove(tagKey) Else _playerCounts(tagKey) = desired
+                        ' Repaint this row (widened to cover a count that
+                        ' just disappeared).
+                        Dim rb = n.Bounds
+                        rb.Width += 80
+                        _treeView.Invalidate(rb)
+                    End If
+                End If
+                total += If(kind = "instance", ownCount, subtreeCount)
             Next
-        End Sub
+            Return total
+        End Function
 
     End Class
 

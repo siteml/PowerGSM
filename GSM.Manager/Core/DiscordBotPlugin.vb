@@ -321,9 +321,15 @@ Namespace GSM.Manager.Core
             Return New RemoteCommandDescriptor() {}
         End Function
 
-        Public Async Function InitialiseAsync(config As Dictionary(Of String, String),
-                                               handler As IRemoteCommandHandler,
-                                               cancellation As CancellationToken) As Task _
+        ' Deliberately NOT an Async method (BC42356): everything in
+        ' here is synchronous by design — the actual Discord connect
+        ' is fire-and-forget into ReconnectLoopAsync (see the comment
+        ' below for why awaiting it inline would hang MainForm). A
+        ' plain Task-returning method states that intent instead of
+        ' carrying an async state machine with nothing to await.
+        Public Function InitialiseAsync(config As Dictionary(Of String, String),
+                                        handler As IRemoteCommandHandler,
+                                        cancellation As CancellationToken) As Task _
                 Implements INotificationPlugin.InitialiseAsync
             ' 'config' is unused — bot config lives in
             ' DiscordBotConfigEntity (encrypted token) and
@@ -367,6 +373,7 @@ Namespace GSM.Manager.Core
             _reconnectLoopTask = ReconnectLoopAsync(_reconnectCts.Token)
 
             StartRefreshLoop()
+            Return Task.CompletedTask
         End Function
 
         ''' <summary>

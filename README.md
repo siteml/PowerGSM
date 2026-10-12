@@ -16,7 +16,7 @@ PowerGSM is split into two cooperating programs:
 - **Manager** — a Windows desktop application (WinForms, .NET 8). This is
   the thing you sit in front of. It holds the database, runs the plugins,
   drives automation and notifications, and talks to one or more Nodes over
-  HTTP.
+  pinned HTTPS (plain HTTP optional, off by default on a secured node).
 - **Node** — a small headless service (ASP.NET Core, .NET 8) that runs on
   each host machine. It actually starts the game processes, installs games
   via SteamCMD, tails logs, and reports player/server state back. It runs
@@ -33,7 +33,10 @@ Supporting components (you rarely interact with these directly):
 - **GSM.Shim** — a per-instance supervisor that owns the game process's
   I/O, so a Node can be restarted, updated, or crash without disturbing a
   running game.
-- **GSM.NodeSetup** — a small utility for configuring a Node.
+- **GSM.NodeSetup** — a small utility for configuring a Node: generates
+  the auth token and the TLS certificate, prints the fingerprint to paste
+  into the Manager, installs the service, and acts as the survivor for
+  Node self-updates.
 - **GSM.CtrlCSender** — a Windows helper for delivering clean shutdown
   signals.
 
@@ -43,7 +46,7 @@ Supporting components (you rarely interact with these directly):
                 |  (plugins, DB,    |   "interprets"
                 |   automation)     |
                 +---------+---------+
-                          |  HTTP + auth token
+                          |  HTTPS (pinned cert) + auth token
           +---------------+----------------+
           |               |                |
    +------v-----+  +-------v------+  +------v------+
@@ -117,7 +120,7 @@ so you do **not** need to install .NET to run PowerGSM. You only need the
 | **Manager** | Windows 10 / 11 or Windows Server (x64). No separate runtime install needed. |
 | **Node** | Windows (x64) **or** Linux (x64, glibc — e.g. Ubuntu/Debian). No separate runtime install needed. |
 | **Hosting Steam games** | SteamCMD (the Node uses it to install/update Steam-based servers). On Windows, Visual C++ redistributables — the Node installs these automatically from a game's bundled redist folder (needs Administrator). |
-| **Network** | The Node listens on a TCP port (default **8765**). The Manager reaches each Node over HTTP with a shared auth token. Open that port between them. |
+| **Network** | The Node listens on one TCP port (default **8765**) that serves HTTPS and, if you allow it, plain HTTP. The Manager pins the Node's self-signed certificate fingerprint (shown by NodeSetup) and authenticates with a shared token. Open that one port between them. |
 
 Full details, including per-game specifics and how to obtain SteamCMD, are
 in [Prerequisites](docs/user/prerequisites.md).
@@ -173,7 +176,7 @@ and [`VERSIONING.md`](VERSIONING.md).
 
 ## Version
 
-Current release: **0.4.2**. PowerGSM is pre-1.0; minor releases may
+Current release: **0.7.0**. PowerGSM is pre-1.0; minor releases may
 introduce breaking changes, always called out in
 [`CHANGELOG.md`](CHANGELOG.md). Manager and Node negotiate a **protocol
 version** on connect and degrade gracefully rather than refusing to talk,

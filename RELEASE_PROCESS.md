@@ -344,6 +344,63 @@ to v2), they'll be notified directly.
 
 ---
 
+## Hand-deploying an interim build (no GitHub release)
+
+Added 2026-10-11 after the `0.6.1`…`0.6.5` interim deploys. Use this when
+production needs a fix before the next tagged release.
+
+### What to build
+
+In Visual Studio: Rebuild Solution, then **Publish** (not Build) in this
+order:
+
+1. `GSM.NodeSetup` → `Win64` / `Linux64` profile
+2. `GSM.Node` → `winx64` / `linux64` profile (its `PublishShim` target
+   builds and bundles `GSM.Shim` itself — no separate shim publish)
+3. `GSM.Manager` → `FolderProfile`
+
+A plain Build — Debug **or Release** — produces a framework-dependent
+apphost stub next to `GSM.Node.dll`. Pushed to a node it dies on launch
+with nothing in `nodesetup-apply.log` (2026-10-10, every Windows node).
+Only the Publish profiles produce the self-contained single-file exe.
+
+If a Node publish fails with "could not find …\win-x64\ref\
+GSM.Shim.Protocol.dll", publish `GSM.Shim.Protocol` once with its
+`win-x64` / `linux-x64` profile (regenerates the RID `obj` slot) and retry.
+
+### Where the files land
+
+`Directory.Build.targets` collects the deployable set after each RID
+publish into `publish-drop\<version>\` (gitignored). The publish fails
+hard if the profile was not SelfContained + PublishSingleFile.
+
+| Folder | Contents | Use |
+|---|---|---|
+| `publish-drop\<ver>\` | `GSM.Node[.exe]`, `GSM.Shim[.exe]`, `GSM.NodeSetup[.exe]` (both RIDs side by side — names don't clash) | Nodes → Update Nodes, manual pick |
+| `publish-drop\<ver>\node-fresh-<rid>\` | the above + `e_sqlite3.dll` and other loose natives, `GSM.CtrlCSender.exe`, `GSM.Shim\<ver>\`, `nodesettings.json` template | a brand-new node box (copy, run NodeSetup, start) |
+| `publish-drop\<ver>\Manager\` | `GSM.Manager.exe`, `GSM.Watchdog.exe`, loose DLLs (`GSM.Contracts` — changes with every Contracts edit, `e_sqlite3`, `WebView2Loader`, `*_cor3`), `runtimes\`, `Plugins\`, `watchdogsettings.json` | copy over a Manager install (never contains `gsm.db`, logs or `.updates\`) |
+
+### Deploying
+
+- **Nodes:** Manager → Nodes → Update Nodes, "Update all components",
+  pick from `publish-drop\<ver>\`. NodeSetup, Shim and (Windows only,
+  0.6.6+) CtrlCSender go in first, then the node bounces via the survivor; a secured node (HTTP off) is
+  health-checked over HTTPS (0.6.5+). Linux/systemd nodes swap via
+  `ExecStartPre`.
+- **Manager:** close the Manager (and watchdog), copy
+  `publish-drop\<ver>\Manager\*` over the install, start
+  `GSM.Watchdog.exe` (not the Manager directly) so supervision applies.
+- **Stamping:** bump `Directory.Build.props` for every build that
+  changes node-side code so Update Nodes can tell which nodes got it;
+  record what each stamp carried in the TEMP comment there. Keep the
+  stamp **below** the next real release so that release still shows as an
+  upgrade. Revert to the real version before tagging.
+- **CtrlCSender** (0.6.6+) is the 4th Update Nodes target — Windows nodes
+  only, in-place swap, no bounce. `publish-drop\<ver>\GSM.CtrlCSender.exe`
+  is produced by a **Windows Node publish** (not a CtrlCSender publish).
+
+---
+
 ## Watchdog logon task (manual setup)
 
 The Manager's **Settings → Startup** toggle installs the per-user Task

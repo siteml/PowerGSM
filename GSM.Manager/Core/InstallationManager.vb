@@ -499,6 +499,24 @@ Namespace GSM.Manager.Core
                         _logger.LogInformation("{Op} completed for {Id}",
                                                If(isUpdate, "Update", "Install"), installationId)
 
+                        ' Redist visibility (incident follow-up #6):
+                        ' surface the node's _CommonRedist outcome so
+                        ' "did the redists run?" is answerable from
+                        ' the Manager log — the July Palworld DirectX
+                        ' gap was invisible precisely because redist
+                        ' execution left no Manager-side trace. A
+                        ' failed/timed-out installer logs as WARNING.
+                        Dim redistSummary = DescribeRedistOutcome(progress)
+                        If redistSummary IsNot Nothing Then
+                            If redistSummary.AnyProblem Then
+                                _logger.LogWarning("Redists for {Id}: {Summary}",
+                                                   installationId, redistSummary.Text)
+                            Else
+                                _logger.LogInformation("Redists for {Id}: {Summary}",
+                                                       installationId, redistSummary.Text)
+                            End If
+                        End If
+
                         ' Fire UpdateCompleted — consumers don't care
                         ' whether it was a fresh install or an update,
                         ' both boil down to "installation is now ready".
@@ -728,6 +746,64 @@ Namespace GSM.Manager.Core
             End If
 
             Return $"installed ({timestamp})"
+        End Function
+
+        ''' <summary>
+        ''' Summary shape for DescribeRedistOutcome — text plus a
+        ''' problem flag so the caller can pick the log level.
+        ''' </summary>
+        Private Class RedistSummary
+            Public Text As String
+            Public AnyProblem As Boolean
+        End Class
+
+        ''' <summary>
+        ''' Renders the final progress response's redist fields
+        ''' (incident follow-up #6) into one log-friendly line.
+        ''' Nothing when the node predates the fields (absent →
+        ''' RedistStatus deserializes to Nothing) or never reached
+        ''' the redist phase.
+        ''' </summary>
+        Private Shared Function DescribeRedistOutcome(progress As InstallProgressResponse) As RedistSummary
+            If progress Is Nothing OrElse String.IsNullOrEmpty(progress.RedistStatus) Then
+                Return Nothing
+            End If
+            Select Case progress.RedistStatus
+                Case "disabled"
+                    Return New RedistSummary With {
+                        .Text = "not run (disabled in installation settings)",
+                        .AnyProblem = False}
+                Case "no-folder"
+                    Return New RedistSummary With {
+                        .Text = "not run (no _CommonRedist folder in the install)",
+                        .AnyProblem = False}
+                Case "not-applicable"
+                    Return New RedistSummary With {
+                        .Text = "not run (non-Windows node)",
+                        .AnyProblem = False}
+                Case "ran"
+                    If progress.RedistResults Is Nothing OrElse progress.RedistResults.Count = 0 Then
+                        Return New RedistSummary With {
+                            .Text = "ran; no installer executables found under _CommonRedist",
+                            .AnyProblem = False}
+                    End If
+                    Dim parts As New List(Of String)
+                    Dim problem = False
+                    For Each r In progress.RedistResults
+                        If r Is Nothing Then Continue For
+                        Dim code = If(r.ExitCode.HasValue, r.ExitCode.Value.ToString(), "-")
+                        parts.Add($"{r.Installer}={r.Outcome}({code})")
+                        If r.Outcome = "failed" OrElse r.Outcome = "timeout" OrElse r.Outcome = "error" Then
+                            problem = True
+                        End If
+                    Next
+                    Return New RedistSummary With {
+                        .Text = String.Join(", ", parts),
+                        .AnyProblem = problem}
+                Case Else
+                    Return New RedistSummary With {
+                        .Text = progress.RedistStatus, .AnyProblem = False}
+            End Select
         End Function
 
         ''' <summary>

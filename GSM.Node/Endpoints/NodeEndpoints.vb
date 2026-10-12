@@ -1,6 +1,7 @@
 Imports System
 Imports System.IO
 Imports System.Reflection
+Imports System.Text.Json.Nodes
 Imports Microsoft.AspNetCore.Builder
 Imports Microsoft.AspNetCore.Http
 Imports Microsoft.AspNetCore.Http.Features
@@ -41,9 +42,18 @@ Namespace GSM.Node.Endpoints
             ' InformationalVersion when SourceRevisionId is set, so
             ' the wire format stays clean for matching across builds.
             app.MapGet("/api/version",
-                Function() As IResult
+                Function(config As NodeConfiguration,
+                         tls As TlsCertificateService) As IResult
                     Dim asm = GetType(ProcessManager).Assembly
                     Dim build As String = ReadBuildVersion(asm)
+                    ' TLS advertisement (0.7.0): fingerprint only included
+                    ' when TLS is actually enabled — it is public info under
+                    ' the pinning trust model (the *pin* is obtained over the
+                    ' authenticated enable call, not from here).
+                    Dim fingerprint As String = Nothing
+                    If config.EnableTls Then
+                        fingerprint = tls.TryGetFingerprint(config.NodeId)
+                    End If
                     Return Results.Ok(New With {
                         .application = "PowerGSM.Node",
                         .version = build,
@@ -52,7 +62,185 @@ Namespace GSM.Node.Endpoints
                         .contractsVersion = NodeApiContract.ContractsVersion,
                         .runtime = System.Runtime.InteropServices.
                             RuntimeInformation.FrameworkDescription,
-                        .platform = ProcessManager.ResolveNodePlatform()
+                        .platform = ProcessManager.ResolveNodePlatform(),
+                        .tlsSupported = True,
+                        .tlsEnabled = config.EnableTls,
+                        .tlsPort = If(config.EnableTls, config.EffectiveTlsPort, 0),
+                        .singlePort = config.UsesSinglePort,
+                        .certFingerprintSha256 = fingerprint,
+                        .eventStreamSupported = True
+                    })
+                End Function)
+
+            ' ---- TLS onboarding (0.7.0) ----
+            ' Both authenticated by the standard bearer middleware (only
+            ' /api/version and /api/auth are exempt).
+
+            app.MapGet("/api/tls/status",
+                Function(config As NodeConfiguration,
+                         tls As TlsCertificateService) As IResult
+                    Dim resp As New TlsStatusResponse With {
+                        .TlsSupported = True,
+                        .TlsEnabled = config.EnableTls,
+                        .TlsPort = If(config.EnableTls, config.EffectiveTlsPort, 0),
+                        .SinglePort = config.UsesSinglePort
+                    }
+                    resp.HttpMode = config.HttpMode
+                    If config.EnableTls Then
+                        Try
+                            Dim cert = tls.GetOrCreateCertificate(config.NodeId)
+                            resp.CertFingerprintSha256 = TlsCertificateService.FingerprintSha256(cert)
+                            resp.CertNotAfterUtc = cert.NotAfter.ToUniversalTime()
+                        Catch
+                        End Try
+                    End If
+                    Return Results.Ok(resp)
+                End Function)
+
+            ' Change the plain-HTTP listener policy (0.7.0 hardening).
+            ' Persists Node.HttpMode and restarts so Kestrel rebinds.
+            ' "Disabled" requires TLS on — a node must always keep at
+            ' least one reachable listener. Sent by the Manager over
+            ' pinned HTTPS once TLS is active (sending it over HTTP
+            ' works too and is the recovery path for re-opening HTTP).
+            app.MapPost("/api/tls/http-mode",
+                Function(request As SetHttpModeRequest,
+                         config As NodeConfiguration,
+                         selfUpdate As SelfUpdateService,
+                         lifetime As IHostApplicationLifetime,
+                         nodeLogger As ILogger(Of SelfUpdateService)) As IResult
+
+                    Dim mode = If(request?.HttpMode, "").Trim()
+                    Dim valid = mode.Equals("Open", StringComparison.OrdinalIgnoreCase) OrElse
+                                mode.Equals("LoopbackOnly", StringComparison.OrdinalIgnoreCase) OrElse
+                                mode.Equals("Disabled", StringComparison.OrdinalIgnoreCase)
+                    If Not valid Then
+                        Return Results.BadRequest(New With {
+                            .error = "httpMode must be Open, LoopbackOnly, or Disabled"})
+                    End If
+                    If mode.Equals("Disabled", StringComparison.OrdinalIgnoreCase) AndAlso
+                       Not config.EnableTls Then
+                        Return Results.Conflict(New With {
+                            .error = "Cannot disable HTTP while TLS is not enabled — the node would become unreachable."})
+                    End If
+
+                    Try
+                        NodeSettingsFile.WriteHttpMode(mode)
+                    Catch ex As Exception
+                        Return Results.Problem(
+                            title:="Could not persist HttpMode to nodesettings.json",
+                            detail:=ex.Message, statusCode:=500)
+                    End Try
+
+                    If Not selfUpdate.RequestRestart() Then
+                        Try
+                            NodeSettingsFile.WriteHttpMode(config.HttpMode)
+                        Catch
+                        End Try
+                        Return Results.Conflict(New With {
+                            .error = "No restart mechanism available; HttpMode unchanged."})
+                    End If
+
+                    nodeLogger.LogInformation("HttpMode change accepted: {Mode}; restarting.", mode)
+                    selfUpdate.ScheduleStop(lifetime)
+                    Return Results.Ok(New With {.httpMode = mode, .restartRequired = True})
+                End Function)
+
+            ' Enable HTTPS: generate/load the cert NOW (so the fingerprint
+            ' in the response is exactly what the listener will present),
+            ' persist EnableTls + TlsPort into nodesettings.json, reply,
+            ' then restart via the self-update relauncher machinery so
+            ' Kestrel comes back with the HTTPS listener bound.
+            app.MapPost("/api/tls/enable",
+                Function(request As EnableTlsRequest,
+                         config As NodeConfiguration,
+                         tls As TlsCertificateService,
+                         selfUpdate As SelfUpdateService,
+                         lifetime As IHostApplicationLifetime,
+                         nodeLogger As ILogger(Of SelfUpdateService)) As IResult
+
+                    ' Single-port semantics (HTTPS_SinglePort_Plan): 0 / omitted /
+                    ' = ListenPort → HTTPS shares ListenPort (persisted as 0).
+                    ' Any other port → dedicated HTTPS listener there. A 0.7.0
+                    ' Manager sends an empty request and therefore lands on
+                    ' the shared port; it then connects to the TlsPort we
+                    ' advertise back (= ListenPort), which just works.
+                    Dim requestedPort As Integer = 0
+                    If request IsNot Nothing AndAlso request.TlsPort > 0 AndAlso
+                       request.TlsPort <> config.ListenPort Then
+                        requestedPort = request.TlsPort
+                    End If
+                    Dim advertisedPort As Integer = If(requestedPort > 0, requestedPort, config.ListenPort)
+
+                    ' Already enabled: same effective port → nothing to do
+                    ' (Conflict, as before). Different port → a PORT MOVE:
+                    ' same certificate, persist the new TlsPort, restart. This
+                    ' is how nodes onboarded on a dedicated alternate port
+                    ' (pre-slice-1) migrate to the shared listen port without
+                    ' anyone touching nodesettings.json / NodeSetup
+                    ' (2026-10-10). The Manager calls it over its current
+                    ' pinned HTTPS channel, then re-verifies on the new port.
+                    Dim isPortMove As Boolean = False
+                    Dim previousPort As Integer = 0
+                    If config.EnableTls Then
+                        If advertisedPort = config.EffectiveTlsPort Then
+                            Return Results.Conflict(New With {
+                                .error = "TLS already enabled",
+                                .errorCode = NodeErrorCodes.TlsAlreadyEnabled
+                            })
+                        End If
+                        isPortMove = True
+                        previousPort = config.TlsPort
+                    End If
+
+                    Dim cert As System.Security.Cryptography.X509Certificates.X509Certificate2
+                    Try
+                        cert = tls.GetOrCreateCertificate(config.NodeId)
+                    Catch ex As Exception
+                        Return Results.Problem(
+                            title:="Certificate generation failed",
+                            detail:=ex.Message,
+                            statusCode:=500)
+                    End Try
+
+                    Try
+                        NodeSettingsFile.WriteTlsSettings(True, requestedPort)
+                    Catch ex As Exception
+                        Return Results.Problem(
+                            title:="Could not persist TLS settings to nodesettings.json",
+                            detail:=ex.Message,
+                            statusCode:=500)
+                    End Try
+
+                    ' Restart vehicle check BEFORE replying: if there is no
+                    ' way to come back up, revert the config write and refuse
+                    ' rather than leaving the node down or the config lying.
+                    If Not selfUpdate.RequestRestart() Then
+                        Try
+                            ' Revert: a port move keeps TLS on at the old port.
+                            NodeSettingsFile.WriteTlsSettings(isPortMove, If(isPortMove, previousPort, 0))
+                        Catch
+                        End Try
+                        Return Results.Conflict(New With {
+                            .error = If(isPortMove,
+                                        "No restart mechanism available (GSM.NodeSetup missing?); HTTPS port unchanged.",
+                                        "No restart mechanism available (GSM.NodeSetup missing?); TLS not enabled.")
+                        })
+                    End If
+
+                    nodeLogger.LogInformation(
+                        "TLS {Verb} accepted: port={Port} singlePort={Single} fingerprint={Fp}; restarting.",
+                        If(isPortMove, "port move", "enable"),
+                        advertisedPort, requestedPort = 0, TlsCertificateService.FingerprintSha256(cert))
+
+                    selfUpdate.ScheduleStop(lifetime)
+
+                    Return Results.Ok(New EnableTlsResponse With {
+                        .TlsPort = advertisedPort,
+                        .SinglePort = (requestedPort = 0),
+                        .CertFingerprintSha256 = TlsCertificateService.FingerprintSha256(cert),
+                        .CertNotAfterUtc = cert.NotAfter.ToUniversalTime(),
+                        .RestartRequired = True
                     })
                 End Function)
 
@@ -61,6 +249,56 @@ Namespace GSM.Node.Endpoints
                 Function(pm As ProcessManager,
                          config As NodeConfiguration) As IResult
                     Return Results.Ok(pm.GetNodeStatus(config))
+                End Function)
+
+            ' Token rotation (2026-10-10, HTTPS_SinglePort_Plan slice 4's
+            ' "Rotate token" step). HTTPS ONLY: the sniffing listener sets
+            ' ITlsConnectionFeature so Request.IsHttps is truthful on the
+            ' shared port; a plaintext caller gets 403 and nothing is written.
+            ' The Manager generates the token (it must hold it before we
+            ' restart). We persist, reply, restart; the old token works until
+            ' the restart because NodeConfiguration is bound once at startup.
+            app.MapPost("/api/auth/rotate",
+                Function(request As RotateTokenRequest,
+                         context As HttpContext,
+                         selfUpdate As SelfUpdateService,
+                         lifetime As IHostApplicationLifetime,
+                         nodeLogger As ILogger(Of SelfUpdateService)) As IResult
+
+                    If Not context.Request.IsHttps Then
+                        Return Results.Json(New With {
+                            .error = "Token rotation is only accepted over HTTPS."}, statusCode:=403)
+                    End If
+                    Dim newToken = If(request?.NewToken, "").Trim()
+                    If newToken.Length < 32 Then
+                        Return Results.BadRequest(New With {
+                            .error = "newToken must be at least 32 characters."})
+                    End If
+
+                    ' Restart vehicle BEFORE persisting: a token the node can't
+                    ' restart into would lock the Manager out of nothing yet,
+                    ' but would desync the file from the live config.
+                    If Not selfUpdate.RequestRestart() Then
+                        Return Results.Conflict(New With {
+                            .error = "No restart mechanism available (GSM.NodeSetup missing?); token unchanged."})
+                    End If
+
+                    Try
+                        NodeSettingsFile.WriteAuthToken(newToken)
+                    Catch ex As Exception
+                        ' RequestRestart already armed the survivor; it will
+                        ' relaunch us with the OLD token (file unchanged), which
+                        ' is the safe outcome. Tell the Manager so it reverts.
+                        nodeLogger.LogError(ex, "Token rotation: could not persist new token; restarting with the old one.")
+                        selfUpdate.ScheduleStop(lifetime)
+                        Return Results.Problem(
+                            title:="Could not persist the new token to nodesettings.json",
+                            detail:=ex.Message, statusCode:=500)
+                    End Try
+
+                    nodeLogger.LogWarning("Auth token rotated by Manager over HTTPS; restarting to apply.")
+                    selfUpdate.ScheduleStop(lifetime)
+                    Return Results.Ok(New RotateTokenResponse With {.Accepted = True, .RestartRequired = True})
                 End Function)
 
             ' Auth handshake — manager calls this to establish session
@@ -144,6 +382,42 @@ Namespace GSM.Node.Endpoints
                     Return Results.Json(r.Payload, statusCode:=r.Code)
                 End Function)
 
+            ' ---- Process control (2026-10-10) ----
+            ' For user-mode nodes (no service, no systemd) there was no way to
+            ' stop or bounce the node from the Manager. Both authenticated.
+            '
+            ' restart: same vehicle as a TLS-enable / HttpMode bounce — NodeSetup
+            ' survivor relaunches us (service: sc start; bare: direct launch,
+            ' with a console if we had one). Shims detach and are re-adopted.
+            '
+            ' shutdown: exit cleanly with NO survivor. Under a Windows service
+            ' the SCM sees a stopped service; under systemd Restart=on-failure
+            ' does NOT fire on exit 0, so it stays down there too. The node
+            ' will not answer again until someone starts it on that machine —
+            ' the Manager's confirm dialog says so in bold.
+            app.MapPost("/api/system/restart",
+                Function(selfUpdate As SelfUpdateService,
+                         lifetime As IHostApplicationLifetime,
+                         nodeLogger As ILogger(Of SelfUpdateService)) As IResult
+                    If Not selfUpdate.RequestRestart() Then
+                        Return Results.Conflict(New With {
+                            .error = "No restart mechanism available (GSM.NodeSetup missing?); node left running."})
+                    End If
+                    nodeLogger.LogInformation("Restart requested by Manager; exiting for relaunch.")
+                    selfUpdate.ScheduleStop(lifetime)
+                    Return Results.Accepted(Nothing, New With {.accepted = True, .restarting = True})
+                End Function)
+
+            app.MapPost("/api/system/shutdown",
+                Function(selfUpdate As SelfUpdateService,
+                         lifetime As IHostApplicationLifetime,
+                         nodeLogger As ILogger(Of SelfUpdateService)) As IResult
+                    nodeLogger.LogWarning("Shutdown requested by Manager; exiting WITHOUT relaunch. " &
+                                          "The node must be started manually on this machine.")
+                    selfUpdate.ScheduleStop(lifetime)
+                    Return Results.Accepted(Nothing, New With {.accepted = True, .restarting = False})
+                End Function)
+
             app.MapPost("/api/system/apply-update",
                 Function(target As String,
                          selfUpdate As SelfUpdateService,
@@ -205,6 +479,91 @@ Namespace GSM.Node.Endpoints
 
             Return "0.0.0"
         End Function
+
+    End Module
+
+    ''' <summary>
+    ''' Read-modify-write of nodesettings.json for the TLS enable flow
+    ''' (0.7.0). The file lives beside the node binary (the same file the
+    ''' host loads via AddJsonFile with the content root pinned to the
+    ''' binary directory by UseWindowsService/UseSystemd). Preserves every
+    ''' other key: the JSON is parsed as a mutable JsonNode tree, only
+    ''' Node.EnableTls / Node.TlsPort are touched, then the whole document
+    ''' is rewritten (write-temp + replace so a crash never leaves a torn
+    ''' half-written config).
+    ''' </summary>
+    Friend Module NodeSettingsFile
+
+        Private ReadOnly _gate As New Object()
+
+        Public Sub WriteTlsSettings(enableTls As Boolean, tlsPort As Integer)
+            SyncLock _gate
+                Dim path As String = IO.Path.Combine(AppContext.BaseDirectory, "nodesettings.json")
+                Dim root As JsonNode
+                If File.Exists(path) Then
+                    root = JsonNode.Parse(File.ReadAllText(path))
+                Else
+                    root = New JsonObject()
+                End If
+                If root Is Nothing Then root = New JsonObject()
+
+                Dim nodeSection = TryCast(root("Node"), JsonObject)
+                If nodeSection Is Nothing Then
+                    nodeSection = New JsonObject()
+                    root("Node") = nodeSection
+                End If
+
+                nodeSection("EnableTls") = JsonValue.Create(enableTls)
+                nodeSection("TlsPort") = JsonValue.Create(tlsPort)
+
+                SaveDocument(path, root)
+            End SyncLock
+        End Sub
+
+        ''' <summary>Persist only Node.AuthToken (token rotation).</summary>
+        Public Sub WriteAuthToken(authToken As String)
+            SyncLock _gate
+                Dim path As String = IO.Path.Combine(AppContext.BaseDirectory, "nodesettings.json")
+                Dim root As JsonNode = Nothing
+                If File.Exists(path) Then root = JsonNode.Parse(File.ReadAllText(path))
+                If root Is Nothing Then root = New JsonObject()
+
+                Dim nodeSection = TryCast(root("Node"), JsonObject)
+                If nodeSection Is Nothing Then
+                    nodeSection = New JsonObject()
+                    root("Node") = nodeSection
+                End If
+
+                nodeSection("AuthToken") = JsonValue.Create(authToken)
+                SaveDocument(path, root)
+            End SyncLock
+        End Sub
+
+        ''' <summary>Persist only Node.HttpMode (0.7.0 hardening).</summary>
+        Public Sub WriteHttpMode(httpMode As String)
+            SyncLock _gate
+                Dim path As String = IO.Path.Combine(AppContext.BaseDirectory, "nodesettings.json")
+                Dim root As JsonNode = Nothing
+                If File.Exists(path) Then root = JsonNode.Parse(File.ReadAllText(path))
+                If root Is Nothing Then root = New JsonObject()
+
+                Dim nodeSection = TryCast(root("Node"), JsonObject)
+                If nodeSection Is Nothing Then
+                    nodeSection = New JsonObject()
+                    root("Node") = nodeSection
+                End If
+
+                nodeSection("HttpMode") = JsonValue.Create(httpMode)
+                SaveDocument(path, root)
+            End SyncLock
+        End Sub
+
+        Private Sub SaveDocument(path As String, root As JsonNode)
+            Dim opts As New Text.Json.JsonSerializerOptions With {.WriteIndented = True}
+            Dim tmp = path & ".tmp"
+            File.WriteAllText(tmp, root.ToJsonString(opts))
+            File.Move(tmp, path, overwrite:=True)
+        End Sub
 
     End Module
 

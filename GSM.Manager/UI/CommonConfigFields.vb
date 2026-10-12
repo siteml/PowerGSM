@@ -77,6 +77,29 @@ Namespace GSM.Manager.UI
                     .DefaultValue = "",
                     .MinValue = 100,
                     .MaxValue = 300000
+                },
+                New ConfigFieldDescriptor With {
+                    .Key = "ResurrectOnNodeBoot",
+                    .Label = "Recover state on node restart",
+                    .Description = "Only applies if this instance was RUNNING when the node went down: at node start, if its process is found dead (host reboot, or node and game killed together), it is restarted from its last-known launch settings. A stopped instance stays stopped — use 'Auto start with node' below for that. Works with the Manager offline. Applied to the node immediately on save when it's reachable; otherwise from this instance's next start. A restart loop is suppressed after 3 rapid attempts. Distinct from Auto-start (which is Manager-start-scoped).",
+                    .FieldType = ConfigFieldType.BooleanField,
+                    .DefaultValue = ""
+                },
+                New ConfigFieldDescriptor With {
+                    .Key = "AutoStartOnNodeBoot",
+                    .Label = "Auto start with node",
+                    .Description = "Start this instance whenever the node service starts — even if it was cleanly stopped beforehand (like a Windows service set to Automatic). Works with the Manager offline. Applied to the node immediately on save when it's reachable — a stopped instance is armed by storing its launch settings on the node without starting it. The node keeps launch settings across stops once armed. A restart loop is suppressed after 3 rapid attempts. Distinct from Auto-start (Manager-start-scoped) and from 'Recover state on node restart' (which only restarts instances that were running).",
+                    .FieldType = ConfigFieldType.BooleanField,
+                    .DefaultValue = ""
+                },
+                New ConfigFieldDescriptor With {
+                    .Key = "BootStartDelaySeconds",
+                    .Label = "Node-boot start delay (seconds)",
+                    .Description = "Stagger for the two node-boot options above: at node start, instances launch in ascending delay, each waiting until this many seconds have passed since the boot pass began (e.g. 0 / 30 / 60 brings three servers up a minute apart instead of all at once). Does not affect starts from the Manager. Applied to the node immediately on save when it's reachable. Leave blank or 0 for no delay.",
+                    .FieldType = ConfigFieldType.IntegerField,
+                    .DefaultValue = "",
+                    .MinValue = 0,
+                    .MaxValue = 3600
                 }
             }
         End Function

@@ -26,7 +26,7 @@ The Manager is a Windows desktop application.
 | OS | Windows 10, Windows 11, or Windows Server, 64-bit. |
 | Runtime | None to install — the release build bundles its own .NET 8 runtime. (Only building from source needs the .NET 8 SDK.) |
 | Disk | The application is small. The SQLite database it creates grows slowly with history; budget a few hundred MB to be safe. |
-| Network | Outbound HTTP to each Node's address and port. Outbound HTTPS to GitHub for update checks and plugin downloads (optional but recommended). |
+| Network | Outbound HTTPS to each Node's address and port (pinned self-signed certificate — no CA needed; plain HTTP only if you allow it on the Node). Outbound HTTPS to GitHub for update checks and plugin downloads (optional but recommended). |
 | Privileges | A normal user account is fine. Administrator is **not** required to run the Manager. |
 
 The Manager stores its database, credentials, plugins, and logs next to its
@@ -49,7 +49,7 @@ actually run game servers. It runs on Windows or Linux.
 | Runtime | None to install — the release build is self-contained. |
 | SteamCMD | **Not required in advance.** The Node downloads SteamCMD automatically the first time it installs a Steam-based game, and keeps it up to date. |
 | Disk | Enough for the game servers you host. Dedicated servers range from a few hundred MB to tens of GB each; plan generously. |
-| Network — inbound | The port the Node listens on (default **8765**) must be reachable from the Manager. |
+| Network — inbound | The one port the Node listens on (default **8765**) must be reachable from the Manager. HTTPS and (optionally) plain HTTP share it. |
 | Network — outbound | The Node downloads SteamCMD, game files, and (on Windows) redistributables. Allow outbound HTTP/HTTPS. |
 | Network — game ports | Each game server needs its own inbound ports (game, query, RCON, etc.) reachable from players. These are per-game — see the [plugin setup guide](plugins.md). |
 
@@ -78,16 +78,31 @@ actually run game servers. It runs on Windows or Linux.
 
 ---
 
-## Authentication between Manager and Node
+## Security between Manager and Node
 
-The Manager authenticates to each Node with a **shared secret (auth token)**.
-You set this token in the Node's `nodesettings.json` before the Node's first
-run, and enter the same token in the Manager when you add the Node.
+Two things protect the link:
 
-- The token defaults to `CHANGE_ME_BEFORE_FIRST_RUN` — change it.
-- Generate a strong token, for example: `openssl rand -base64 36`.
+**Encryption + identity (HTTPS, pinned).** Each Node has its own self-signed
+certificate, created by `GSM.NodeSetup` (or by the Node on first start). The
+Manager doesn't use a certificate authority; it **pins the certificate's
+SHA-256 fingerprint** the way SSH pins host keys. NodeSetup prints the
+fingerprint next to the auth token — enter both when adding the Node and the
+first connection is already verified. If the certificate ever changes, the
+Manager blocks the Node and asks you to re-trust it explicitly. Plain HTTP is
+off by default on a new Node (`HttpMode: Disabled`); you can allow it from
+localhost only or from anywhere if you need to.
+
+**Authentication (auth token).** The Manager authenticates to each Node with
+a **shared secret**. `GSM.NodeSetup` generates it; enter the same token in the
+Manager when you add the Node.
+
+- Never leave the placeholder `CHANGE_ME_BEFORE_FIRST_RUN` in place.
 - Anyone with the token and network access to the Node can control the games
-  on it. Treat it like a password; use a different token per Node if you like.
+  on it. Treat it like a password; use a different token per Node.
+- The Manager can **rotate** a Node's token over the pinned HTTPS channel
+  (Node panel → *Rotate auth token…*; also the last step of *Secure this
+  node…*), so a token that was ever typed or sent over plain HTTP can be
+  retired without touching the Node.
 
 The Node also has built-in brute-force protection (failed-attempt lockout and
 per-IP rate limiting), configurable in `nodesettings.json`.
@@ -98,7 +113,7 @@ per-IP rate limiting), configurable in `nodesettings.json`.
 
 | Direction | From → To | Port | Why |
 |---|---|---|---|
-| Manager → Node | control PC → each host | Node port (default 8765/TCP) | All management traffic. |
+| Manager → Node | control PC → each host | Node port (default 8765/TCP) | All management traffic (HTTPS; plain HTTP on the same port only if enabled). |
 | Players → Node | internet → each host | per-game ports | Reaching the game servers themselves. |
 | Node → internet | each host → out | 80/443 | SteamCMD, game downloads, Windows redistributables. |
 | Manager → internet | control PC → out | 443 | GitHub update checks and plugin downloads (optional). |
